@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from handshake.runtime.state import Session, Task
+from handshake.runtime.state import Task
 
 
 class TaskStore(Protocol):
@@ -23,23 +23,3 @@ class TaskStore(Protocol):
     def list_tasks(self, session_id: str | None = None) -> tuple[Task, ...]:
         """List durable tasks, optionally scoped to one session."""
         ...
-
-
-class SessionStore(Protocol):
-    def create_session(self, session: Session) -> None:
-        """Persist a new session."""
-        ...
-
-    def load_session(self, session_id: str) -> Session:
-        """Load one durable session."""
-        ...
-
-    def list_sessions(self) -> tuple[Session, ...]:
-        """List sessions by most recent task activity."""
-        ...
-
-
-class StateStore(TaskStore, SessionStore, Protocol):
-    """Combined persistence boundary used by the CLI application layer."""
-
-    pass

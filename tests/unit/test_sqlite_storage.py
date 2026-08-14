@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from handshake.runtime.errors import ConcurrentTaskUpdateError, TaskNotFoundError
+from handshake.runtime.errors import (
+    ConcurrentTaskUpdateError,
+    StorageError,
+    TaskNotFoundError,
+)
 from handshake.runtime.state import (
     ModelMessage,
     Session,
@@ -55,7 +59,7 @@ def _waiting_task(tmp_path: Path, session_id: str) -> Task:
     return task
 
 
-def test_migration_is_idempotent_and_task_round_trips(tmp_path: Path) -> None:
+def test_schema_initialization_is_idempotent_and_task_round_trips(tmp_path: Path) -> None:
     database = tmp_path / "state" / "handshake.db"
     store = SQLiteStateStore(database)
     session = Session(workspace=tmp_path)
@@ -77,132 +81,13 @@ def test_migration_is_idempotent_and_task_round_trips(tmp_path: Path) -> None:
         store.load_task("missing")
 
 
-def test_v1_database_migrates_to_optimistic_lock_version(tmp_path: Path) -> None:
+def test_incompatible_development_schema_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "handshake.db"
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            """
-            CREATE TABLE tasks (
-                task_id TEXT PRIMARY KEY,
-                goal TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                status TEXT NOT NULL,
-                plan_json TEXT NOT NULL,
-                final_summary TEXT,
-                error TEXT,
-                model_name TEXT NOT NULL,
-                model_turns INTEGER NOT NULL,
-                max_steps INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO tasks VALUES (
-                'legacy-task', 'legacy goal', ?, 'completed', '[]', 'done', NULL,
-                'legacy-model', 3, 10, '2026-01-01', '2026-01-02'
-            )
-            """,
-            (str(tmp_path),),
-        )
-        connection.execute("PRAGMA user_version = 1")
+        connection.execute("PRAGMA user_version = 3")
 
-    SQLiteStateStore(database)
-    SQLiteStateStore(database)
-
-    with sqlite3.connect(database) as connection:
-        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = {
-            row[1]: row for row in connection.execute("PRAGMA table_info(tasks)")
-        }
-        session_count = connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        migrated = connection.execute(
-            "SELECT session_id, sequence, previous_task_id, version FROM tasks"
-        ).fetchone()
-    assert schema_version == 3
-    assert columns["version"][3] == 1
-    assert session_count == 1
-    assert migrated[0]
-    assert migrated[1:] == (1, None, 0)
-
-
-def test_v2_migration_preserves_task_children(tmp_path: Path) -> None:
-    database = tmp_path / "handshake.db"
-    with sqlite3.connect(database) as connection:
-        connection.executescript(
-            """
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE tasks (
-                task_id TEXT PRIMARY KEY, goal TEXT NOT NULL, workspace TEXT NOT NULL,
-                status TEXT NOT NULL, plan_json TEXT NOT NULL, final_summary TEXT,
-                error TEXT, model_name TEXT NOT NULL, model_turns INTEGER NOT NULL,
-                max_steps INTEGER NOT NULL, version INTEGER NOT NULL,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE TABLE messages (
-                task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                sequence INTEGER NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL,
-                PRIMARY KEY (task_id, sequence)
-            );
-            CREATE TABLE work_items (
-                work_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                position INTEGER NOT NULL, description TEXT NOT NULL,
-                tool_call_id TEXT NOT NULL, status TEXT NOT NULL
-            );
-            CREATE TABLE wait_conditions (
-                wait_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                work_id TEXT NOT NULL REFERENCES work_items(work_id) ON DELETE CASCADE,
-                position INTEGER NOT NULL, tool_call_id TEXT NOT NULL, kind TEXT NOT NULL,
-                prompt TEXT NOT NULL, status TEXT NOT NULL, response_text TEXT,
-                created_at TEXT NOT NULL, resolved_at TEXT
-            );
-            CREATE INDEX wait_conditions_task_status
-            ON wait_conditions(task_id, status);
-            PRAGMA user_version = 2;
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO tasks VALUES (
-                'task-v2', 'goal', ?, 'waiting', '[]', NULL, NULL, 'model',
-                2, 10, 4, '2026-01-01', '2026-01-02'
-            )
-            """,
-            (str(tmp_path),),
-        )
-        connection.execute(
-            "INSERT INTO messages VALUES ('task-v2', 0, 'assistant', ?)",
-            ('[{"type":"thinking","thinking":"preserve me"}]',),
-        )
-        connection.execute(
-            """
-            INSERT INTO work_items VALUES (
-                'work-v2', 'task-v2', 0, 'choose', 'call-v2', 'waiting'
-            )
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO wait_conditions VALUES (
-                'wait-v2', 'task-v2', 'work-v2', 0, 'call-v2', 'text',
-                'Choose?', 'open', NULL, '2026-01-01', NULL
-            )
-            """
-        )
-
-    store = SQLiteStateStore(database)
-    task = store.load_task("task-v2")
-
-    assert task.sequence == 1
-    assert task.version == 4
-    assert task.messages[0].content[0]["thinking"] == "preserve me"
-    assert task.work_items[0].work_id == "work-v2"
-    assert task.waits[0].wait_id == "wait-v2"
-    assert store.load_session(task.session_id).workspace == tmp_path
+    with pytest.raises(StorageError, match="incompatible with current development schema"):
+        SQLiteStateStore(database)
 
 
 def test_environment_api_key_is_not_written_to_database(

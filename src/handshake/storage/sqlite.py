@@ -26,7 +26,7 @@ from handshake.runtime.state import (
     WorkItemStatus,
     utc_now,
 )
-from handshake.storage.migrations import initialize_schema
+from handshake.storage.schema import initialize_schema
 
 
 class SQLiteStateStore:
@@ -239,7 +239,6 @@ class SQLiteStateStore:
     ) -> None:
         mutable_values = (
             task.goal,
-            str(task.workspace),
             task.status.value,
             _dump_json(task.plan),
             task.final_summary,
@@ -255,10 +254,10 @@ class SQLiteStateStore:
             connection.execute(
                 """
                 INSERT INTO tasks (
-                    task_id, session_id, sequence, previous_task_id, goal, workspace,
-                    status, plan_json, final_summary, error, model_name, model_turns,
+                    task_id, session_id, sequence, previous_task_id, goal, status,
+                    plan_json, final_summary, error, model_name, model_turns,
                     max_steps, version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -272,9 +271,9 @@ class SQLiteStateStore:
             cursor = connection.execute(
                 """
                 UPDATE tasks SET
-                    goal = ?, workspace = ?, status = ?, plan_json = ?,
-                    final_summary = ?, error = ?, model_name = ?, model_turns = ?,
-                    max_steps = ?, version = ?, created_at = ?, updated_at = ?
+                    goal = ?, status = ?, plan_json = ?, final_summary = ?,
+                    error = ?, model_name = ?, model_turns = ?, max_steps = ?,
+                    version = ?, created_at = ?, updated_at = ?
                 WHERE task_id = ? AND version = ?
                 """,
                 (*mutable_values, task.task_id, expected_version),
@@ -346,7 +345,12 @@ class SQLiteStateStore:
 
     def _load_task(self, connection: sqlite3.Connection, task_id: str) -> Task:
         row = connection.execute(
-            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            """
+            SELECT tasks.*, sessions.workspace AS workspace
+            FROM tasks JOIN sessions USING (session_id)
+            WHERE task_id = ?
+            """,
+            (task_id,),
         ).fetchone()
         if row is None:
             raise TaskNotFoundError(f"Task not found: {task_id}")
