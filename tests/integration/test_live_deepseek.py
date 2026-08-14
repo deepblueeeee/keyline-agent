@@ -31,6 +31,7 @@ def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
     task = Task(
         goal="Implement calculator.add and run the existing tests.",
         workspace=workspace,
+        session_id="live-session",
     )
 
     run_agent(task, model, create_default_registry(lambda _cwd, _argv: True))

@@ -7,7 +7,7 @@ import pytest
 
 import handshake.cli as cli
 from handshake.runtime.state import ModelContext, ModelTurn, TaskStatus, ToolCall
-from handshake.storage.sqlite import SQLiteTaskStore
+from handshake.storage.sqlite import SQLiteStateStore
 
 
 class _TTY:
@@ -51,8 +51,21 @@ class _WaitThenFinishModel:
         )
 
 
-def _store(home: Path) -> SQLiteTaskStore:
-    return SQLiteTaskStore(home / "handshake.db")
+class _RecordingFinishModel:
+    def __init__(self, summary: str) -> None:
+        self.summary = summary
+        self.contexts: list[ModelContext] = []
+
+    def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+        self.contexts.append(context)
+        return ModelTurn(
+            content=({"type": "text", "text": self.summary},),
+            stop_reason="end_turn",
+        )
+
+
+def _store(home: Path) -> SQLiteStateStore:
+    return SQLiteStateStore(home / "handshake.db")
 
 
 def test_demo_runs_without_api_key(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -85,7 +98,10 @@ def test_run_answers_text_wait_and_finishes_in_same_process(
     monkeypatch.setenv("HANDSHAKE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: _WaitThenFinishModel())
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
-    monkeypatch.setattr("builtins.input", lambda _prompt: "navy")
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: "navy" if prompt == "Response: " else "/exit",
+    )
 
     exit_code = cli.main(["run", str(tmp_path), "style the button"])
 
@@ -109,11 +125,13 @@ def test_wait_survives_noninteractive_exit_interrupt_and_resume(
 
     first_exit = cli.main(["run", str(tmp_path), "style the button"])
     task = _store(home).list_tasks()[0]
+    session_id = task.session_id
 
     assert first_exit == 2
     assert task.status is TaskStatus.WAITING
     assert cli.main(["list"]) == 0
-    assert cli.main(["inspect", task.task_id]) == 0
+    assert cli.main(["inspect", session_id]) == 0
+    assert cli.main(["inspect-task", task.task_id]) == 0
     listing = capsys.readouterr().out
     assert task.task_id in listing
     assert "waiting" in listing
@@ -125,11 +143,42 @@ def test_wait_survives_noninteractive_exit_interrupt_and_resume(
         raise KeyboardInterrupt
 
     monkeypatch.setattr("builtins.input", interrupt)
-    assert cli.main(["resume", task.task_id]) == 130
+    assert cli.main(["resume", session_id]) == 130
     assert _store(home).load_task(task.task_id).status is TaskStatus.WAITING
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: "navy")
-    assert cli.main(["resume", task.task_id]) == 0
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: "navy" if prompt == "Response: " else "/exit",
+    )
+    assert cli.main(["resume", session_id]) == 0
     resumed = _store(home).load_task(task.task_id)
     assert resumed.status is TaskStatus.COMPLETED
     assert resumed.messages[-2].content[0]["tool_use_id"] == "ask-color"
+
+
+def test_interactive_session_creates_followup_task_with_sanitized_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "state"
+    first_model = _RecordingFinishModel("first result")
+    second_model = _RecordingFinishModel("second result")
+    models = iter([first_model, second_model])
+    prompts = iter(["second request", "/exit"])
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: next(models))
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(prompts))
+
+    exit_code = cli.main(
+        ["run", str(tmp_path), "first request", "--max-steps", "9"]
+    )
+
+    session = _store(home).list_sessions()[0]
+    tasks = _store(home).list_tasks(session.session_id)
+    assert exit_code == 0
+    assert [task.goal for task in tasks] == ["first request", "second request"]
+    assert tasks[1].previous_task_id == tasks[0].task_id
+    assert tasks[1].max_steps == 9
+    assert tasks[1].model_turns == 1
+    assert second_model.contexts[0].session_history[0].outcome == "first result"
+    assert "first result" in second_model.contexts[0].system_prompt

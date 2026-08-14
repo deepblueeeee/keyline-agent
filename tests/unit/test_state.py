@@ -16,7 +16,7 @@ from handshake.runtime.state import (
 
 
 def test_task_accepts_only_declared_transitions(tmp_path: Path) -> None:
-    task = Task(goal="test", workspace=tmp_path)
+    task = Task(goal="test", workspace=tmp_path, session_id="test-session")
     task.transition(TaskStatus.RUNNING)
     task.transition(TaskStatus.COMPLETED)
 
@@ -34,7 +34,7 @@ def test_tool_run_accepts_only_declared_transitions() -> None:
 
 
 def test_waiting_task_and_bound_work_follow_declared_transitions(tmp_path: Path) -> None:
-    task = Task(goal="test", workspace=tmp_path)
+    task = Task(goal="test", workspace=tmp_path, session_id="test-session")
     work = WorkItem(description="Choose a color", tool_call_id="ask-1")
     wait = WaitCondition(
         work_id=work.work_id,

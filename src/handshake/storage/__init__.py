@@ -1,6 +1,6 @@
-"""Durable task storage."""
+"""Durable session and task storage."""
 
-from handshake.storage.base import TaskStore
-from handshake.storage.sqlite import SQLiteTaskStore
+from handshake.storage.base import SessionStore, StateStore, TaskStore
+from handshake.storage.sqlite import SQLiteStateStore
 
-__all__ = ["SQLiteTaskStore", "TaskStore"]
+__all__ = ["SQLiteStateStore", "SessionStore", "StateStore", "TaskStore"]

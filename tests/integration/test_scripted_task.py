@@ -65,7 +65,7 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
         approvals.append((cwd, argv))
         return True
 
-    task = Task(goal="Implement add", workspace=workspace)
+    task = Task(goal="Implement add", workspace=workspace, session_id="test-session")
     run_agent(task, model, create_default_registry(approve))
 
     assert task.status is TaskStatus.COMPLETED

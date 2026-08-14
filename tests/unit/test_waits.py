@@ -16,7 +16,7 @@ from handshake.runtime.waits import resolve_text_wait
 
 
 def _waiting_task(tmp_path: Path) -> Task:
-    task = Task(goal="选择发布颜色", workspace=tmp_path)
+    task = Task(goal="选择发布颜色", workspace=tmp_path, session_id="test-session")
     task.transition(TaskStatus.RUNNING)
     task.messages.append(
         ModelMessage(

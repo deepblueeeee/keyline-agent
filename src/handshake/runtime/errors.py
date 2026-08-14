@@ -41,8 +41,16 @@ class TaskNotFoundError(StorageError):
     """Raised when a requested durable task does not exist."""
 
 
+class SessionNotFoundError(StorageError):
+    """Raised when a requested durable session does not exist."""
+
+
 class ConcurrentTaskUpdateError(StorageError):
     """Raised when a task snapshot was based on an outdated stored version."""
+
+
+class ConcurrentSessionUpdateError(StorageError):
+    """Raised when a task is appended to an outdated session tail."""
 
 
 class WaitResolutionError(HandshakeError):

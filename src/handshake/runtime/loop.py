@@ -18,6 +18,7 @@ from handshake.runtime.errors import (
 from handshake.runtime.state import (
     ModelContext,
     ModelMessage,
+    SessionHistoryEntry,
     Task,
     TaskStatus,
     ToolCall,
@@ -37,9 +38,15 @@ from handshake.tools.registry import ToolRegistry
 
 EmitCallback = Callable[[str], None]
 
-def _system_prompt(task: Task) -> str:
+def _system_prompt(
+    task: Task, session_history: tuple[SessionHistoryEntry, ...]
+) -> str:
     plan = "\n".join(f"- {step}" for step in task.plan) or "(not set yet)"
+    prior_tasks = _format_session_history(session_history)
     return f"""You are Handshake, a local coding agent operating on one workspace.
+
+Earlier tasks in this session:
+{prior_tasks}
 
 Goal:
 {task.goal}
@@ -66,13 +73,30 @@ Rules:
 """
 
 
-def _context(task: Task) -> ModelContext:
+def _format_session_history(history: tuple[SessionHistoryEntry, ...]) -> str:
+    if not history:
+        return "(none)"
+    lines: list[str] = []
+    for entry in history:
+        outcome = entry.outcome or "(no outcome recorded)"
+        lines.append(
+            f"- Task {entry.sequence} [{entry.status.value}]\n"
+            f"  Goal: {entry.goal}\n"
+            f"  Outcome: {outcome}"
+        )
+    return "\n".join(lines)
+
+
+def _context(
+    task: Task, session_history: tuple[SessionHistoryEntry, ...]
+) -> ModelContext:
     return ModelContext(
-        system_prompt=_system_prompt(task),
+        system_prompt=_system_prompt(task, session_history),
         goal=task.goal,
         workspace=str(task.workspace),
         plan=tuple(task.plan),
         messages=tuple(task.messages),
+        session_history=session_history,
     )
 
 
@@ -197,11 +221,12 @@ def _run_turns(
     registry: ToolRegistry,
     emit: EmitCallback,
     store: TaskStore | None,
+    session_history: tuple[SessionHistoryEntry, ...],
 ) -> Task:
     definitions = (*runtime_tool_definitions(), *registry.definitions())
     while task.model_turns < task.max_steps:
         emit(f"Model turn {task.model_turns + 1}/{task.max_steps}")
-        turn = model.complete(_context(task), definitions)
+        turn = model.complete(_context(task, session_history), definitions)
         task.model_turns += 1
         if not turn.content:
             raise ModelProtocolError("Model returned an empty turn")
@@ -268,9 +293,10 @@ def _run_with_failure_handling(
     registry: ToolRegistry,
     emit: EmitCallback,
     store: TaskStore | None,
+    session_history: tuple[SessionHistoryEntry, ...],
 ) -> Task:
     try:
-        return _run_turns(task, model, registry, emit, store)
+        return _run_turns(task, model, registry, emit, store, session_history)
     except UserCancelledError as exc:
         task.error = str(exc)
         if task.status in {TaskStatus.RUNNING, TaskStatus.WAITING}:
@@ -299,6 +325,7 @@ def run_agent(
     max_steps: int = 50,
     emit: EmitCallback | None = None,
     store: TaskStore | None = None,
+    session_history: tuple[SessionHistoryEntry, ...] = (),
 ) -> Task:
     """Start a task and run until completion, failure, or a durable wait."""
     if max_steps < 1:
@@ -319,7 +346,9 @@ def run_agent(
     if store is not None:
         store.create_task(task)
         output(f"Task created: {task.task_id}")
-    return _run_with_failure_handling(task, model, registry, output, store)
+    return _run_with_failure_handling(
+        task, model, registry, output, store, session_history
+    )
 
 
 def continue_agent(
@@ -329,6 +358,7 @@ def continue_agent(
     *,
     emit: EmitCallback | None = None,
     store: TaskStore | None = None,
+    session_history: tuple[SessionHistoryEntry, ...] = (),
 ) -> Task:
     """Continue a durable task after its text wait has been satisfied."""
     if task.status is not TaskStatus.RUNNING:
@@ -336,4 +366,6 @@ def continue_agent(
     if not task.messages:
         raise AgentLoopError("A resumed task must contain model protocol history")
     output = emit or (lambda _message: None)
-    return _run_with_failure_handling(task, model, registry, output, store)
+    return _run_with_failure_handling(
+        task, model, registry, output, store, session_history
+    )

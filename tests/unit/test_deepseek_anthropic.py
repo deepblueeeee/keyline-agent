@@ -90,7 +90,7 @@ def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
             },
         ]
     )
-    task = Task(goal="inspect", workspace=tmp_path)
+    task = Task(goal="inspect", workspace=tmp_path, session_id="test-session")
 
     run_agent(
         task,

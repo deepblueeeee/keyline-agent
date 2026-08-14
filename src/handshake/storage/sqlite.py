@@ -1,4 +1,4 @@
-"""SQLite-backed durable task snapshots for the Week 2 runtime."""
+"""SQLite-backed durable sessions and task snapshots."""
 
 from __future__ import annotations
 
@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from handshake.runtime.errors import (
+    ConcurrentSessionUpdateError,
     ConcurrentTaskUpdateError,
+    SessionNotFoundError,
     StorageError,
     TaskNotFoundError,
 )
 from handshake.runtime.state import (
     ModelMessage,
+    Session,
     Task,
     TaskStatus,
     WaitCondition,
@@ -23,64 +26,11 @@ from handshake.runtime.state import (
     WorkItemStatus,
     utc_now,
 )
-
-_SCHEMA_VERSION = 2
-
-_SCHEMA = """
-CREATE TABLE tasks (
-    task_id TEXT PRIMARY KEY,
-    goal TEXT NOT NULL,
-    workspace TEXT NOT NULL,
-    status TEXT NOT NULL,
-    plan_json TEXT NOT NULL,
-    final_summary TEXT,
-    error TEXT,
-    model_name TEXT NOT NULL,
-    model_turns INTEGER NOT NULL,
-    max_steps INTEGER NOT NULL,
-    version INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE messages (
-    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-    sequence INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    content_json TEXT NOT NULL,
-    PRIMARY KEY (task_id, sequence)
-);
-
-CREATE TABLE work_items (
-    work_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    description TEXT NOT NULL,
-    tool_call_id TEXT NOT NULL,
-    status TEXT NOT NULL
-);
-
-CREATE TABLE wait_conditions (
-    wait_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-    work_id TEXT NOT NULL REFERENCES work_items(work_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    tool_call_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    status TEXT NOT NULL,
-    response_text TEXT,
-    created_at TEXT NOT NULL,
-    resolved_at TEXT
-);
-
-CREATE INDEX wait_conditions_task_status
-ON wait_conditions(task_id, status);
-"""
+from handshake.storage.migrations import initialize_schema
 
 
-class SQLiteTaskStore:
-    """Persist complete stable task snapshots in a single local database."""
+class SQLiteStateStore:
+    """Persist sessions and complete stable task snapshots in SQLite."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path.expanduser().resolve()
@@ -98,27 +48,93 @@ class SQLiteTaskStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > _SCHEMA_VERSION:
-                raise StorageError(
-                    f"Task database schema {version} is newer than supported "
-                    f"schema {_SCHEMA_VERSION}"
-                )
-            if version == 0:
-                connection.executescript(_SCHEMA)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                version = _SCHEMA_VERSION
-            if version < 2:
+            initialize_schema(connection)
+
+    def create_session(self, session: Session) -> None:
+        try:
+            workspace = session.workspace.expanduser().resolve()
+            with self._connect() as connection:
                 connection.execute(
-                    "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+                    "INSERT INTO sessions VALUES (?, ?, ?)",
+                    (
+                        session.session_id,
+                        str(workspace),
+                        session.created_at,
+                    ),
                 )
-                connection.execute("PRAGMA user_version = 2")
+            session.workspace = workspace
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def load_session(self, session_id: str) -> Session:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                return Session(
+                    session_id=str(row["session_id"]),
+                    workspace=Path(row["workspace"]),
+                    created_at=str(row["created_at"]),
+                )
+        except (OSError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def list_sessions(self) -> tuple[Session, ...]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT sessions.*
+                    FROM sessions
+                    LEFT JOIN tasks USING (session_id)
+                    GROUP BY sessions.session_id
+                    ORDER BY COALESCE(MAX(tasks.updated_at), sessions.created_at) DESC,
+                             sessions.session_id
+                    """
+                ).fetchall()
+                return tuple(
+                    Session(
+                        session_id=str(row["session_id"]),
+                        workspace=Path(row["workspace"]),
+                        created_at=str(row["created_at"]),
+                    )
+                    for row in rows
+                )
+        except (OSError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
 
     def create_task(self, task: Task) -> None:
         try:
             updated_at = utc_now()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                session_row = connection.execute(
+                    "SELECT workspace FROM sessions WHERE session_id = ?",
+                    (task.session_id,),
+                ).fetchone()
+                if session_row is None:
+                    raise SessionNotFoundError(f"Session not found: {task.session_id}")
+                if Path(session_row["workspace"]) != task.workspace:
+                    raise StorageError(
+                        f"Task workspace does not match session {task.session_id}"
+                    )
+                tail = connection.execute(
+                    """
+                    SELECT task_id, sequence FROM tasks
+                    WHERE session_id = ? ORDER BY sequence DESC LIMIT 1
+                    """,
+                    (task.session_id,),
+                ).fetchone()
+                tail_id = None if tail is None else str(tail["task_id"])
+                next_sequence = 1 if tail is None else int(tail["sequence"]) + 1
+                if tail_id != task.previous_task_id or task.sequence != next_sequence:
+                    raise ConcurrentSessionUpdateError(
+                        f"Session {task.session_id} changed before task {task.task_id} "
+                        "could be appended"
+                    )
                 self._write_task(
                     connection,
                     task,
@@ -138,6 +154,7 @@ class SQLiteTaskStore:
             updated_at = utc_now()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                self._validate_existing_task_membership(connection, task)
                 self._write_task(
                     connection,
                     task,
@@ -151,6 +168,35 @@ class SQLiteTaskStore:
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
+    def _validate_existing_task_membership(
+        self, connection: sqlite3.Connection, task: Task
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT tasks.session_id, tasks.sequence, tasks.previous_task_id,
+                   sessions.workspace
+            FROM tasks JOIN sessions USING (session_id)
+            WHERE task_id = ?
+            """,
+            (task.task_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task not found: {task.task_id}")
+        membership = (
+            str(row["session_id"]),
+            int(row["sequence"]),
+            row["previous_task_id"],
+            Path(row["workspace"]),
+        )
+        expected = (
+            task.session_id,
+            task.sequence,
+            task.previous_task_id,
+            task.workspace,
+        )
+        if membership != expected:
+            raise StorageError(f"Task {task.task_id} has invalid session membership")
+
     def load_task(self, task_id: str) -> Task:
         try:
             with self._connect() as connection:
@@ -158,12 +204,25 @@ class SQLiteTaskStore:
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def list_tasks(self) -> tuple[Task, ...]:
+    def list_tasks(self, session_id: str | None = None) -> tuple[Task, ...]:
         try:
             with self._connect() as connection:
-                rows = connection.execute(
-                    "SELECT task_id FROM tasks ORDER BY updated_at DESC, task_id"
-                ).fetchall()
+                if session_id is None:
+                    rows = connection.execute(
+                        "SELECT task_id FROM tasks ORDER BY updated_at DESC, task_id"
+                    ).fetchall()
+                else:
+                    if connection.execute(
+                        "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                    ).fetchone() is None:
+                        raise SessionNotFoundError(f"Session not found: {session_id}")
+                    rows = connection.execute(
+                        """
+                        SELECT task_id FROM tasks
+                        WHERE session_id = ? ORDER BY sequence
+                        """,
+                        (session_id,),
+                    ).fetchall()
                 return tuple(self._load_task(connection, str(row["task_id"])) for row in rows)
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
@@ -178,8 +237,7 @@ class SQLiteTaskStore:
         expected_version: int,
         next_version: int,
     ) -> None:
-        values = (
-            task.task_id,
+        mutable_values = (
             task.goal,
             str(task.workspace),
             task.status.value,
@@ -197,11 +255,18 @@ class SQLiteTaskStore:
             connection.execute(
                 """
                 INSERT INTO tasks (
-                    task_id, goal, workspace, status, plan_json, final_summary, error,
-                    model_name, model_turns, max_steps, version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    task_id, session_id, sequence, previous_task_id, goal, workspace,
+                    status, plan_json, final_summary, error, model_name, model_turns,
+                    max_steps, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                values,
+                (
+                    task.task_id,
+                    task.session_id,
+                    task.sequence,
+                    task.previous_task_id,
+                    *mutable_values,
+                ),
             )
         else:
             cursor = connection.execute(
@@ -212,7 +277,7 @@ class SQLiteTaskStore:
                     max_steps = ?, version = ?, created_at = ?, updated_at = ?
                 WHERE task_id = ? AND version = ?
                 """,
-                (*values[1:], values[0], expected_version),
+                (*mutable_values, task.task_id, expected_version),
             )
             if cursor.rowcount != 1:
                 row = connection.execute(
@@ -330,6 +395,9 @@ class SQLiteTaskStore:
                 raise StorageError(f"Task {task_id} has an invalid stored plan")
             return Task(
                 task_id=str(row["task_id"]),
+                session_id=str(row["session_id"]),
+                sequence=int(row["sequence"]),
+                previous_task_id=row["previous_task_id"],
                 goal=str(row["goal"]),
                 workspace=Path(row["workspace"]),
                 status=TaskStatus(row["status"]),

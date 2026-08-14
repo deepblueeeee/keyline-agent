@@ -97,12 +97,21 @@ class ModelMessage:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionHistoryEntry:
+    sequence: int
+    goal: str
+    status: TaskStatus
+    outcome: str | None
+
+
+@dataclass(slots=True, frozen=True)
 class ModelContext:
     system_prompt: str
     goal: str
     workspace: str
     plan: tuple[str, ...]
     messages: tuple[ModelMessage, ...]
+    session_history: tuple[SessionHistoryEntry, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -188,10 +197,20 @@ class WaitCondition:
 
 
 @dataclass(slots=True)
+class Session:
+    workspace: Path
+    session_id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: str = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
 class Task:
     goal: str
     workspace: Path
+    session_id: str
     task_id: str = field(default_factory=lambda: str(uuid4()))
+    sequence: int = 1
+    previous_task_id: str | None = None
     status: TaskStatus = TaskStatus.CREATED
     plan: list[str] = field(default_factory=list)
     messages: list[ModelMessage] = field(default_factory=list)

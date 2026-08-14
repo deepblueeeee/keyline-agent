@@ -10,9 +10,9 @@ from handshake.runtime.errors import (
     UserCancelledError,
 )
 from handshake.runtime.loop import continue_agent, run_agent
-from handshake.runtime.state import ModelTurn, Task, TaskStatus, ToolCall
+from handshake.runtime.state import ModelTurn, Session, Task, TaskStatus, ToolCall
 from handshake.runtime.waits import resolve_text_wait
-from handshake.storage.sqlite import SQLiteTaskStore
+from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 
 
@@ -50,7 +50,7 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
             final_turn("finished"),
         ]
     )
-    task = Task(goal="copy knowledge", workspace=tmp_path)
+    task = Task(goal="copy knowledge", workspace=tmp_path, session_id="test-session")
 
     run_agent(task, model, create_default_registry(lambda _cwd, _argv: True))
 
@@ -66,7 +66,7 @@ def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) 
     model = ScriptedModel(
         [tool_turn(ToolCall("missing", "not_registered", {})), final_turn()]
     )
-    task = Task(goal="recover", workspace=tmp_path)
+    task = Task(goal="recover", workspace=tmp_path, session_id="test-session")
 
     run_agent(task, model, create_default_registry(lambda _cwd, _argv: True))
 
@@ -82,7 +82,7 @@ def test_mismatched_tool_blocks_fail_task(tmp_path: Path) -> None:
         tool_calls=(ToolCall("b", "read_file", {}),),
         stop_reason="tool_use",
     )
-    task = Task(goal="bad", workspace=tmp_path)
+    task = Task(goal="bad", workspace=tmp_path, session_id="test-session")
 
     with pytest.raises(ModelProtocolError):
         run_agent(
@@ -95,7 +95,7 @@ def test_mismatched_tool_blocks_fail_task(tmp_path: Path) -> None:
 
 
 def test_script_exhaustion_fails_task(tmp_path: Path) -> None:
-    task = Task(goal="bad", workspace=tmp_path)
+    task = Task(goal="bad", workspace=tmp_path, session_id="test-session")
 
     with pytest.raises(ModelProviderError):
         run_agent(
@@ -108,7 +108,7 @@ def test_script_exhaustion_fails_task(tmp_path: Path) -> None:
 
 
 def test_step_limit_fails_task(tmp_path: Path) -> None:
-    task = Task(goal="too long", workspace=tmp_path)
+    task = Task(goal="too long", workspace=tmp_path, session_id="test-session")
     model = ScriptedModel(
         [tool_turn(ToolCall("plan", "update_plan", {"steps": ["continue"]}))]
     )
@@ -128,7 +128,7 @@ def test_cancelled_approval_cancels_task(tmp_path: Path) -> None:
     def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
         raise UserCancelledError("cancelled")
 
-    task = Task(goal="cancel", workspace=tmp_path)
+    task = Task(goal="cancel", workspace=tmp_path, session_id="test-session")
     model = ScriptedModel(
         [tool_turn(ToolCall("shell", "run_shell", {"argv": ["true"]}))]
     )
@@ -161,9 +161,15 @@ def test_text_wait_round_trips_thinking_and_resumes_with_original_call_id(
         ),
         stop_reason="tool_use",
     )
-    store = SQLiteTaskStore(tmp_path / "handshake.db")
+    store = SQLiteStateStore(tmp_path / "handshake.db")
+    session = Session(workspace=tmp_path)
+    store.create_session(session)
     first_model = ScriptedModel([wait_turn])
-    task = Task(goal="style the button", workspace=tmp_path)
+    task = Task(
+        goal="style the button",
+        workspace=tmp_path,
+        session_id=session.session_id,
+    )
 
     run_agent(
         task,
@@ -203,8 +209,10 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
         ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}),
     )
     model = ScriptedModel([mixed, final_turn("corrected")])
-    store = SQLiteTaskStore(tmp_path / "handshake.db")
-    task = Task(goal="safe", workspace=tmp_path)
+    store = SQLiteStateStore(tmp_path / "handshake.db")
+    session = Session(workspace=tmp_path)
+    store.create_session(session)
+    task = Task(goal="safe", workspace=tmp_path, session_id=session.session_id)
 
     run_agent(
         task,
@@ -221,8 +229,10 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
 
 
 def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
-    store = SQLiteTaskStore(tmp_path / "handshake.db")
-    task = Task(goal="ask once", workspace=tmp_path)
+    store = SQLiteStateStore(tmp_path / "handshake.db")
+    session = Session(workspace=tmp_path)
+    store.create_session(session)
+    task = Task(goal="ask once", workspace=tmp_path, session_id=session.session_id)
     model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}))]
     )

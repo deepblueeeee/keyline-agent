@@ -1,1 +1,1 @@
-"""In-memory task runtime."""
+"""Session-aware task runtime."""
