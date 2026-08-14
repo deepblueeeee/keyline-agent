@@ -9,8 +9,9 @@ from handshake.runtime.errors import (
     StepLimitExceededError,
     UserCancelledError,
 )
-from handshake.runtime.loop import run_agent
+from handshake.runtime.loop import continue_agent, run_agent
 from handshake.runtime.state import ModelTurn, Task, TaskStatus, ToolCall
+from handshake.storage.sqlite import SQLiteTaskStore
 from handshake.tools import create_default_registry
 
 
@@ -135,3 +136,108 @@ def test_cancelled_approval_cancels_task(tmp_path: Path) -> None:
         run_agent(task, model, create_default_registry(cancel))
 
     assert task.status is TaskStatus.CANCELLED
+
+
+def test_text_wait_round_trips_thinking_and_resumes_with_original_call_id(
+    tmp_path: Path,
+) -> None:
+    wait_turn = ModelTurn(
+        content=(
+            {"type": "thinking", "thinking": "The repository cannot answer this."},
+            {
+                "type": "tool_use",
+                "id": "ask-color",
+                "name": "wait_for_text",
+                "input": {"prompt": "Which color should the button use?"},
+            },
+        ),
+        tool_calls=(
+            ToolCall(
+                "ask-color",
+                "wait_for_text",
+                {"prompt": "Which color should the button use?"},
+            ),
+        ),
+        stop_reason="tool_use",
+    )
+    store = SQLiteTaskStore(tmp_path / "handshake.db")
+    first_model = ScriptedModel([wait_turn])
+    task = Task(goal="style the button", workspace=tmp_path)
+
+    run_agent(
+        task,
+        first_model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+    )
+
+    assert task.status is TaskStatus.WAITING
+    wait_tool = next(tool for tool in first_model.tool_sets[0] if tool.name == "wait_for_text")
+    assert wait_tool.input_schema["required"] == ["prompt"]
+    assert "API keys" in wait_tool.description
+
+    resumed = store.resolve_text_wait(task.task_id, task.waits[0].wait_id, "navy")
+    second_model = ScriptedModel([final_turn("used navy")])
+    continue_agent(
+        resumed,
+        second_model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+    )
+
+    context = second_model.contexts[0]
+    assert context.messages[-2].content[0]["thinking"] == (
+        "The repository cannot answer this."
+    )
+    assert context.messages[-1].content[0]["tool_use_id"] == "ask-color"
+    assert resumed.status is TaskStatus.COMPLETED
+    assert store.load_task(task.task_id).final_summary == "used navy"
+
+
+def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) -> None:
+    mixed = tool_turn(
+        ToolCall("write", "write_file", {"path": "created.txt", "content": "bad"}),
+        ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}),
+    )
+    model = ScriptedModel([mixed, final_turn("corrected")])
+    store = SQLiteTaskStore(tmp_path / "handshake.db")
+    task = Task(goal="safe", workspace=tmp_path)
+
+    run_agent(
+        task,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+    )
+
+    assert not (tmp_path / "created.txt").exists()
+    assert task.status is TaskStatus.COMPLETED
+    errors = model.contexts[1].messages[-1].content
+    assert len(errors) == 2
+    assert all(block["is_error"] for block in errors)
+
+
+def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
+    store = SQLiteTaskStore(tmp_path / "handshake.db")
+    task = Task(goal="ask once", workspace=tmp_path)
+    model = ScriptedModel(
+        [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}))]
+    )
+    run_agent(
+        task,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+        max_steps=1,
+        store=store,
+    )
+    resumed = store.resolve_text_wait(task.task_id, task.waits[0].wait_id, "A")
+
+    with pytest.raises(StepLimitExceededError):
+        continue_agent(
+            resumed,
+            ScriptedModel([final_turn()]),
+            create_default_registry(lambda _cwd, _argv: True),
+            store=store,
+        )
+
+    assert resumed.status is TaskStatus.FAILED

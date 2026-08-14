@@ -1,8 +1,11 @@
 """Composition root for workspace tools exposed to models."""
 
+from handshake.models.base import ToolDefinition
 from handshake.tools.files import file_tool_bindings
+from handshake.tools.plan import PLAN_TOOL, handle_plan
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.shell import ApprovalCallback, process_tool_bindings
+from handshake.tools.text_wait import TEXT_WAIT_TOOL, prepare_text_wait
 
 
 def create_default_registry(approval: ApprovalCallback) -> ToolRegistry:
@@ -14,4 +17,18 @@ def create_default_registry(approval: ApprovalCallback) -> ToolRegistry:
     return registry
 
 
-__all__ = ["ApprovalCallback", "ToolRegistry", "create_default_registry"]
+def runtime_tool_definitions() -> tuple[ToolDefinition, ...]:
+    """Return tools whose lifecycle is coordinated directly by the runtime."""
+    return (PLAN_TOOL, TEXT_WAIT_TOOL)
+
+
+__all__ = [
+    "ApprovalCallback",
+    "PLAN_TOOL",
+    "TEXT_WAIT_TOOL",
+    "ToolRegistry",
+    "create_default_registry",
+    "handle_plan",
+    "prepare_text_wait",
+    "runtime_tool_definitions",
+]

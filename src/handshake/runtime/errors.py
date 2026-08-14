@@ -31,3 +31,15 @@ class AgentLoopError(HandshakeError):
 
 class UserCancelledError(HandshakeError):
     """Raised when the user interrupts an approval prompt."""
+
+
+class StorageError(HandshakeError):
+    """Raised when durable task state cannot be read or written safely."""
+
+
+class TaskNotFoundError(StorageError):
+    """Raised when a requested durable task does not exist."""
+
+
+class WaitResolutionError(HandshakeError):
+    """Raised when text input cannot satisfy the requested wait condition."""

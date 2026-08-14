@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from handshake.runtime.errors import HandshakeError
 
@@ -33,3 +34,11 @@ def read_deepseek_api_key() -> str:
     if not api_key:
         raise HandshakeError("DEEPSEEK_API_KEY is required for real-model runs")
     return api_key
+
+
+def handshake_home() -> Path:
+    """Return the local durable-state directory without reading any secret."""
+    configured = os.environ.get("HANDSHAKE_HOME")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".handshake").resolve()
