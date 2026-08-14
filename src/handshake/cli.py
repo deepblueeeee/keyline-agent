@@ -18,6 +18,7 @@ from handshake.models.scripted import ScriptedModel
 from handshake.runtime.errors import HandshakeError, UserCancelledError
 from handshake.runtime.loop import continue_agent, run_agent
 from handshake.runtime.state import ModelTurn, Task, TaskStatus, ToolCall, WaitCondition
+from handshake.runtime.waits import resolve_text_wait
 from handshake.storage import SQLiteTaskStore
 from handshake.tools import create_default_registry
 from handshake.tools.registry import ToolRegistry
@@ -112,7 +113,8 @@ def _drive_task(
         if not response.strip():
             print("Response must not be empty; the task is still waiting.")
             continue
-        task = store.resolve_text_wait(task.task_id, wait.wait_id, response)
+        resolve_text_wait(task, wait.wait_id, response)
+        store.checkpoint_task(task)
         print("Input received; resuming task")
         task = continue_agent(task, model, registry, emit=print, store=store)
     if task.status is not TaskStatus.COMPLETED:

@@ -11,6 +11,7 @@ from handshake.runtime.errors import (
 )
 from handshake.runtime.loop import continue_agent, run_agent
 from handshake.runtime.state import ModelTurn, Task, TaskStatus, ToolCall
+from handshake.runtime.waits import resolve_text_wait
 from handshake.storage.sqlite import SQLiteTaskStore
 from handshake.tools import create_default_registry
 
@@ -176,7 +177,9 @@ def test_text_wait_round_trips_thinking_and_resumes_with_original_call_id(
     assert wait_tool.input_schema["required"] == ["prompt"]
     assert "API keys" in wait_tool.description
 
-    resumed = store.resolve_text_wait(task.task_id, task.waits[0].wait_id, "navy")
+    resumed = store.load_task(task.task_id)
+    resolve_text_wait(resumed, resumed.waits[0].wait_id, "navy")
+    store.checkpoint_task(resumed)
     second_model = ScriptedModel([final_turn("used navy")])
     continue_agent(
         resumed,
@@ -230,7 +233,9 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
         max_steps=1,
         store=store,
     )
-    resumed = store.resolve_text_wait(task.task_id, task.waits[0].wait_id, "A")
+    resumed = store.load_task(task.task_id)
+    resolve_text_wait(resumed, resumed.waits[0].wait_id, "A")
+    store.checkpoint_task(resumed)
 
     with pytest.raises(StepLimitExceededError):
         continue_agent(

@@ -23,7 +23,3 @@ class TaskStore(Protocol):
     def list_tasks(self) -> tuple[Task, ...]:
         """List durable tasks, newest first."""
         ...
-
-    def resolve_text_wait(self, task_id: str, wait_id: str, response: str) -> Task:
-        """Atomically satisfy one open text wait and return the resumable task."""
-        ...
