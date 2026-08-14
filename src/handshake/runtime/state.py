@@ -203,6 +203,7 @@ class Task:
     model_name: str = ""
     model_turns: int = 0
     max_steps: int = 50
+    version: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 

@@ -13,7 +13,7 @@ class TaskStore(Protocol):
         ...
 
     def checkpoint_task(self, task: Task) -> None:
-        """Atomically replace the stable state for an existing task."""
+        """Atomically replace a task snapshot if its version is still current."""
         ...
 
     def load_task(self, task_id: str) -> Task:

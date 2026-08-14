@@ -7,7 +7,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from handshake.runtime.errors import StorageError, TaskNotFoundError
+from handshake.runtime.errors import (
+    ConcurrentTaskUpdateError,
+    StorageError,
+    TaskNotFoundError,
+)
 from handshake.runtime.state import (
     ModelMessage,
     Task,
@@ -20,7 +24,7 @@ from handshake.runtime.state import (
     utc_now,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE tasks (
@@ -34,6 +38,7 @@ CREATE TABLE tasks (
     model_name TEXT NOT NULL,
     model_turns INTEGER NOT NULL,
     max_steps INTEGER NOT NULL,
+    version INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -102,22 +107,47 @@ class SQLiteTaskStore:
             if version == 0:
                 connection.executescript(_SCHEMA)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                version = _SCHEMA_VERSION
+            if version < 2:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute("PRAGMA user_version = 2")
 
     def create_task(self, task: Task) -> None:
         try:
+            updated_at = utc_now()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                task.updated_at = utc_now()
-                self._write_task(connection, task, create=True)
+                self._write_task(
+                    connection,
+                    task,
+                    create=True,
+                    updated_at=updated_at,
+                    expected_version=task.version,
+                    next_version=task.version,
+                )
+            task.updated_at = updated_at
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
     def checkpoint_task(self, task: Task) -> None:
         try:
+            expected_version = task.version
+            next_version = expected_version + 1
+            updated_at = utc_now()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                task.updated_at = utc_now()
-                self._write_task(connection, task, create=False)
+                self._write_task(
+                    connection,
+                    task,
+                    create=False,
+                    updated_at=updated_at,
+                    expected_version=expected_version,
+                    next_version=next_version,
+                )
+            task.version = next_version
+            task.updated_at = updated_at
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
@@ -139,7 +169,14 @@ class SQLiteTaskStore:
             raise _storage_error(exc) from None
 
     def _write_task(
-        self, connection: sqlite3.Connection, task: Task, *, create: bool
+        self,
+        connection: sqlite3.Connection,
+        task: Task,
+        *,
+        create: bool,
+        updated_at: str,
+        expected_version: int,
+        next_version: int,
     ) -> None:
         values = (
             task.task_id,
@@ -152,16 +189,17 @@ class SQLiteTaskStore:
             task.model_name,
             task.model_turns,
             task.max_steps,
+            next_version,
             task.created_at,
-            task.updated_at,
+            updated_at,
         )
         if create:
             connection.execute(
                 """
                 INSERT INTO tasks (
                     task_id, goal, workspace, status, plan_json, final_summary, error,
-                    model_name, model_turns, max_steps, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_name, model_turns, max_steps, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -171,13 +209,22 @@ class SQLiteTaskStore:
                 UPDATE tasks SET
                     goal = ?, workspace = ?, status = ?, plan_json = ?,
                     final_summary = ?, error = ?, model_name = ?, model_turns = ?,
-                    max_steps = ?, created_at = ?, updated_at = ?
-                WHERE task_id = ?
+                    max_steps = ?, version = ?, created_at = ?, updated_at = ?
+                WHERE task_id = ? AND version = ?
                 """,
-                (*values[1:], values[0]),
+                (*values[1:], values[0], expected_version),
             )
             if cursor.rowcount != 1:
-                raise TaskNotFoundError(f"Task not found: {task.task_id}")
+                row = connection.execute(
+                    "SELECT version FROM tasks WHERE task_id = ?", (task.task_id,)
+                ).fetchone()
+                if row is None:
+                    raise TaskNotFoundError(f"Task not found: {task.task_id}")
+                raise ConcurrentTaskUpdateError(
+                    f"Task {task.task_id} changed since it was loaded "
+                    f"(expected version {expected_version}, "
+                    f"stored version {int(row['version'])})"
+                )
 
         connection.execute("DELETE FROM wait_conditions WHERE task_id = ?", (task.task_id,))
         connection.execute("DELETE FROM work_items WHERE task_id = ?", (task.task_id,))
@@ -295,6 +342,7 @@ class SQLiteTaskStore:
                 model_name=str(row["model_name"]),
                 model_turns=int(row["model_turns"]),
                 max_steps=int(row["max_steps"]),
+                version=int(row["version"]),
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
             )

@@ -41,5 +41,9 @@ class TaskNotFoundError(StorageError):
     """Raised when a requested durable task does not exist."""
 
 
+class ConcurrentTaskUpdateError(StorageError):
+    """Raised when a task snapshot was based on an outdated stored version."""
+
+
 class WaitResolutionError(HandshakeError):
     """Raised when text input cannot satisfy the requested wait condition."""
