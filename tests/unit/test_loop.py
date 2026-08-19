@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.errors import (
     ModelProtocolError,
@@ -9,8 +10,9 @@ from handshake.runtime.errors import (
     StepLimitExceededError,
     UserCancelledError,
 )
-from handshake.runtime.loop import continue_agent, run_agent
-from handshake.runtime.state import ModelTurn, Session, Task, TaskStatus, ToolCall
+from handshake.runtime.loop import continue_run, start_run
+from handshake.runtime.runs import create_followup_run
+from handshake.runtime.state import Run, RunStatus, Session
 from handshake.runtime.waits import resolve_text_wait
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
@@ -39,6 +41,17 @@ def final_turn(text: str = "done") -> ModelTurn:
     )
 
 
+def _session_run(tmp_path: Path, goal: str, *, max_steps: int = 50) -> tuple[Session, Run]:
+    session = Session(workspace=tmp_path)
+    run = Run(
+        goal=goal,
+        session_id=session.session_id,
+        model_name="scripted",
+        max_steps=max_steps,
+    )
+    return session, run
+
+
 def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("needle", encoding="utf-8")
     model = ScriptedModel(
@@ -50,14 +63,16 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
             final_turn("finished"),
         ]
     )
-    task = Task(goal="copy knowledge", workspace=tmp_path, session_id="test-session")
+    session, run = _session_run(tmp_path, "copy knowledge")
 
-    run_agent(task, model, create_default_registry(lambda _cwd, _argv: True))
+    start_run(session, run, model, create_default_registry(lambda _cwd, _argv: True))
 
-    assert task.status is TaskStatus.COMPLETED
-    assert [run.tool_name for run in task.tool_runs] == ["read_file", "write_file"]
-    second_context = model.contexts[1]
-    tool_results = second_context.messages[-1].content
+    assert run.status is RunStatus.COMPLETED
+    assert [tool_run.tool_name for tool_run in run.tool_runs] == [
+        "read_file",
+        "write_file",
+    ]
+    tool_results = model.contexts[1].messages[-1].content
     assert [block["tool_use_id"] for block in tool_results] == ["read", "write"]
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new"
 
@@ -66,82 +81,160 @@ def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) 
     model = ScriptedModel(
         [tool_turn(ToolCall("missing", "not_registered", {})), final_turn()]
     )
-    task = Task(goal="recover", workspace=tmp_path, session_id="test-session")
+    session, run = _session_run(tmp_path, "recover")
 
-    run_agent(task, model, create_default_registry(lambda _cwd, _argv: True))
+    start_run(session, run, model, create_default_registry(lambda _cwd, _argv: True))
 
-    assert task.status is TaskStatus.COMPLETED
-    assert task.tool_runs[0].result is not None
-    assert not task.tool_runs[0].result.ok
-    assert "Unknown tool" in task.tool_runs[0].result.stderr
+    assert run.status is RunStatus.COMPLETED
+    assert run.tool_runs[0].result is not None
+    assert not run.tool_runs[0].result.ok
+    assert "Unknown tool" in run.tool_runs[0].result.stderr
 
 
-def test_mismatched_tool_blocks_fail_task(tmp_path: Path) -> None:
+def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
     bad_turn = ModelTurn(
         content=({"type": "tool_use", "id": "a", "name": "read_file", "input": {}},),
         tool_calls=(ToolCall("b", "read_file", {}),),
         stop_reason="tool_use",
     )
-    task = Task(goal="bad", workspace=tmp_path, session_id="test-session")
+    session, run = _session_run(tmp_path, "bad")
 
     with pytest.raises(ModelProtocolError):
-        run_agent(
-            task,
+        start_run(
+            session,
+            run,
             ScriptedModel([bad_turn]),
             create_default_registry(lambda _cwd, _argv: True),
         )
 
-    assert task.status is TaskStatus.FAILED
+    assert run.status is RunStatus.FAILED
 
 
-def test_script_exhaustion_fails_task(tmp_path: Path) -> None:
-    task = Task(goal="bad", workspace=tmp_path, session_id="test-session")
+def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
+    session, run = _session_run(tmp_path, "bad")
 
     with pytest.raises(ModelProviderError):
-        run_agent(
-            task,
+        start_run(
+            session,
+            run,
             ScriptedModel([]),
             create_default_registry(lambda _cwd, _argv: True),
         )
 
-    assert task.status is TaskStatus.FAILED
+    assert run.status is RunStatus.FAILED
 
 
-def test_step_limit_fails_task(tmp_path: Path) -> None:
-    task = Task(goal="too long", workspace=tmp_path, session_id="test-session")
+def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
+    session, run = _session_run(tmp_path, "too long", max_steps=1)
     model = ScriptedModel(
         [tool_turn(ToolCall("plan", "update_plan", {"steps": ["continue"]}))]
     )
 
     with pytest.raises(StepLimitExceededError):
-        run_agent(
-            task,
+        start_run(
+            session,
+            run,
             model,
             create_default_registry(lambda _cwd, _argv: True),
-            max_steps=1,
         )
 
-    assert task.status is TaskStatus.FAILED
+    assert run.status is RunStatus.FAILED
 
 
-def test_cancelled_approval_cancels_task(tmp_path: Path) -> None:
+def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) -> None:
     def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
         raise UserCancelledError("cancelled")
 
-    task = Task(goal="cancel", workspace=tmp_path, session_id="test-session")
+    session, run = _session_run(tmp_path, "cancel")
     model = ScriptedModel(
         [tool_turn(ToolCall("shell", "run_shell", {"argv": ["true"]}))]
     )
 
     with pytest.raises(UserCancelledError):
-        run_agent(task, model, create_default_registry(cancel))
+        start_run(session, run, model, create_default_registry(cancel))
 
-    assert task.status is TaskStatus.CANCELLED
+    assert run.status is RunStatus.CANCELLED
+    result = session.messages[-1].content[0]
+    assert result["type"] == "tool_result"
+    assert result["tool_use_id"] == "shell"
+    assert result["is_error"] is True
 
 
-def test_text_wait_round_trips_thinking_and_resumes_with_original_call_id(
-    tmp_path: Path,
-) -> None:
+def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
+    def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
+        raise UserCancelledError("cancelled")
+
+    session, run = _session_run(tmp_path, "several tools")
+    calls = (
+        ToolCall("write-a", "write_file", {"path": "a.txt", "content": "done"}),
+        ToolCall("shell", "run_shell", {"argv": ["true"]}),
+        ToolCall("write-b", "write_file", {"path": "b.txt", "content": "skipped"}),
+    )
+
+    with pytest.raises(UserCancelledError):
+        start_run(
+            session,
+            run,
+            ScriptedModel([tool_turn(*calls)]),
+            create_default_registry(cancel),
+        )
+
+    results = session.messages[-1].content
+    assert [block["tool_use_id"] for block in results] == [
+        "write-a",
+        "shell",
+        "write-b",
+    ]
+    assert results[0]["is_error"] is False
+    assert results[1]["is_error"] is True
+    assert results[2]["is_error"] is True
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "done"
+    assert not (tmp_path / "b.txt").exists()
+
+
+def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("value", encoding="utf-8")
+    session, first = _session_run(tmp_path, "inspect")
+    first_model = ScriptedModel(
+        [
+            ModelTurn(
+                content=(
+                    {"type": "thinking", "thinking": "read first"},
+                    {
+                        "type": "tool_use",
+                        "id": "read",
+                        "name": "read_file",
+                        "input": {"path": "a.txt"},
+                    },
+                ),
+                tool_calls=(ToolCall("read", "read_file", {"path": "a.txt"}),),
+                stop_reason="tool_use",
+            ),
+            final_turn("first complete"),
+        ]
+    )
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    start_run(session, first, first_model, registry)
+    second = create_followup_run(session, [first], "continue")
+    second_model = ScriptedModel([final_turn("second complete")])
+
+    start_run(session, second, second_model, registry)
+
+    messages = second_model.contexts[0].messages
+    assert [message.run_id for message in messages] == [
+        first.run_id,
+        first.run_id,
+        first.run_id,
+        first.run_id,
+        second.run_id,
+    ]
+    assert messages[1].content[0]["type"] == "thinking"
+    assert messages[1].content[1]["id"] == "read"
+    assert messages[2].content[0]["tool_use_id"] == "read"
+    assert messages[3].content[0]["text"] == "first complete"
+
+
+def test_text_wait_round_trips_thinking_and_original_call_id(tmp_path: Path) -> None:
     wait_turn = ModelTurn(
         content=(
             {"type": "thinking", "thinking": "The repository cannot answer this."},
@@ -162,33 +255,36 @@ def test_text_wait_round_trips_thinking_and_resumes_with_original_call_id(
         stop_reason="tool_use",
     )
     store = SQLiteStateStore(tmp_path / "handshake.db")
-    session = Session(workspace=tmp_path)
+    session, run = _session_run(tmp_path, "style the button")
     store.create_session(session)
     first_model = ScriptedModel([wait_turn])
-    task = Task(
-        goal="style the button",
-        workspace=tmp_path,
-        session_id=session.session_id,
-    )
 
-    run_agent(
-        task,
+    start_run(
+        session,
+        run,
         first_model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
     )
 
-    assert task.status is TaskStatus.WAITING
+    assert run.status is RunStatus.WAITING
     wait_tool = next(tool for tool in first_model.tool_sets[0] if tool.name == "wait_for_text")
     assert wait_tool.input_schema["required"] == ["prompt"]
     assert "API keys" in wait_tool.description
 
-    resumed = store.load_task(task.task_id)
-    resolve_text_wait(resumed, resumed.waits[0].wait_id, "navy")
-    store.checkpoint_task(resumed)
+    resumed_session = store.load_session(session.session_id)
+    resumed_run = store.load_run(run.run_id)
+    resolve_text_wait(
+        resumed_session,
+        resumed_run,
+        resumed_run.waits[0].wait_id,
+        "navy",
+    )
+    store.checkpoint_run(resumed_session, resumed_run)
     second_model = ScriptedModel([final_turn("used navy")])
-    continue_agent(
-        resumed,
+    continue_run(
+        resumed_session,
+        resumed_run,
         second_model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
@@ -199,8 +295,8 @@ def test_text_wait_round_trips_thinking_and_resumes_with_original_call_id(
         "The repository cannot answer this."
     )
     assert context.messages[-1].content[0]["tool_use_id"] == "ask-color"
-    assert resumed.status is TaskStatus.COMPLETED
-    assert store.load_task(task.task_id).final_summary == "used navy"
+    assert resumed_run.status is RunStatus.COMPLETED
+    assert store.load_run(run.run_id).final_summary == "used navy"
 
 
 def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) -> None:
@@ -210,19 +306,19 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
     )
     model = ScriptedModel([mixed, final_turn("corrected")])
     store = SQLiteStateStore(tmp_path / "handshake.db")
-    session = Session(workspace=tmp_path)
+    session, run = _session_run(tmp_path, "safe")
     store.create_session(session)
-    task = Task(goal="safe", workspace=tmp_path, session_id=session.session_id)
 
-    run_agent(
-        task,
+    start_run(
+        session,
+        run,
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
     )
 
     assert not (tmp_path / "created.txt").exists()
-    assert task.status is TaskStatus.COMPLETED
+    assert run.status is RunStatus.COMPLETED
     errors = model.contexts[1].messages[-1].content
     assert len(errors) == 2
     assert all(block["is_error"] for block in errors)
@@ -230,29 +326,32 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
 
 def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
     store = SQLiteStateStore(tmp_path / "handshake.db")
-    session = Session(workspace=tmp_path)
+    session, run = _session_run(tmp_path, "ask once", max_steps=1)
     store.create_session(session)
-    task = Task(goal="ask once", workspace=tmp_path, session_id=session.session_id)
     model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}))]
     )
-    run_agent(
-        task,
+    start_run(
+        session,
+        run,
         model,
         create_default_registry(lambda _cwd, _argv: True),
-        max_steps=1,
         store=store,
     )
-    resumed = store.load_task(task.task_id)
-    resolve_text_wait(resumed, resumed.waits[0].wait_id, "A")
-    store.checkpoint_task(resumed)
+    resumed_session = store.load_session(session.session_id)
+    resumed_run = store.load_run(run.run_id)
+    resolve_text_wait(
+        resumed_session, resumed_run, resumed_run.waits[0].wait_id, "A"
+    )
+    store.checkpoint_run(resumed_session, resumed_run)
 
     with pytest.raises(StepLimitExceededError):
-        continue_agent(
-            resumed,
+        continue_run(
+            resumed_session,
+            resumed_run,
             ScriptedModel([final_turn()]),
             create_default_registry(lambda _cwd, _argv: True),
             store=store,
         )
 
-    assert resumed.status is TaskStatus.FAILED
+    assert resumed_run.status is RunStatus.FAILED

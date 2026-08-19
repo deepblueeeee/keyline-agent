@@ -2,9 +2,10 @@ import shutil
 import sys
 from pathlib import Path
 
+from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
-from handshake.runtime.loop import run_agent
-from handshake.runtime.state import ModelTurn, Task, TaskStatus, ToolCall
+from handshake.runtime.loop import start_run
+from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
 
 
@@ -65,11 +66,12 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
         approvals.append((cwd, argv))
         return True
 
-    task = Task(goal="Implement add", workspace=workspace, session_id="test-session")
-    run_agent(task, model, create_default_registry(approve))
+    session = Session(workspace=workspace)
+    run = Run(goal="Implement add", session_id=session.session_id)
+    start_run(session, run, model, create_default_registry(approve))
 
-    assert task.status is TaskStatus.COMPLETED
+    assert run.status is RunStatus.COMPLETED
     assert "return left + right" in (workspace / "calculator.py").read_text()
-    assert task.tool_runs[-1].result is not None
-    assert task.tool_runs[-1].result.ok
+    assert run.tool_runs[-1].result is not None
+    assert run.tool_runs[-1].result.ok
     assert len(approvals) == 1

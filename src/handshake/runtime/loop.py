@@ -1,4 +1,4 @@
-"""The model/tool loop with durable text waits and automatic resumption."""
+"""Session-first ReAct loop with durable text waits and resumption."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from contextlib import suppress
 from typing import Any
 
 from handshake.models.base import ModelAdapter
+from handshake.models.protocol import ModelContext, ModelMessage, ToolCall
 from handshake.runtime.errors import (
     AgentLoopError,
     HandshakeError,
@@ -16,17 +17,14 @@ from handshake.runtime.errors import (
     UserCancelledError,
 )
 from handshake.runtime.state import (
-    ModelContext,
-    ModelMessage,
-    SessionHistoryEntry,
-    Task,
-    TaskStatus,
-    ToolCall,
+    Run,
+    RunStatus,
+    Session,
     ToolResult,
     ToolRun,
     ToolRunStatus,
 )
-from handshake.storage.base import TaskStore
+from handshake.storage.base import RunStore
 from handshake.tools import (
     PLAN_TOOL,
     TEXT_WAIT_TOOL,
@@ -38,21 +36,16 @@ from handshake.tools.registry import ToolRegistry
 
 EmitCallback = Callable[[str], None]
 
-def _system_prompt(
-    task: Task, session_history: tuple[SessionHistoryEntry, ...]
-) -> str:
-    plan = "\n".join(f"- {step}" for step in task.plan) or "(not set yet)"
-    prior_tasks = _format_session_history(session_history)
+
+def _system_prompt(session: Session, run: Run) -> str:
+    plan = "\n".join(f"- {step}" for step in run.plan) or "(not set yet)"
     return f"""You are Handshake, a local coding agent operating on one workspace.
 
-Earlier tasks in this session:
-{prior_tasks}
-
-Goal:
-{task.goal}
+Current goal:
+{run.goal}
 
 Workspace:
-{task.workspace}
+{session.workspace}
 
 Current plan:
 {plan}
@@ -68,35 +61,18 @@ Rules:
 - Never request passwords, API keys, tokens, or other secrets with wait_for_text.
 - Use tool results as evidence and correct failures when possible.
 - Do not claim a test passed unless its tool result says it passed.
-- When the task is complete, respond without tool calls with a concise summary of changes,
-  validation performed, and any unresolved issue.
+- When the current request is complete, respond without tool calls with a concise summary of
+  changes, validation performed, and any unresolved issue.
 """
 
 
-def _format_session_history(history: tuple[SessionHistoryEntry, ...]) -> str:
-    if not history:
-        return "(none)"
-    lines: list[str] = []
-    for entry in history:
-        outcome = entry.outcome or "(no outcome recorded)"
-        lines.append(
-            f"- Task {entry.sequence} [{entry.status.value}]\n"
-            f"  Goal: {entry.goal}\n"
-            f"  Outcome: {outcome}"
-        )
-    return "\n".join(lines)
-
-
-def _context(
-    task: Task, session_history: tuple[SessionHistoryEntry, ...]
-) -> ModelContext:
+def _context(session: Session, run: Run) -> ModelContext:
     return ModelContext(
-        system_prompt=_system_prompt(task, session_history),
-        goal=task.goal,
-        workspace=str(task.workspace),
-        plan=tuple(task.plan),
-        messages=tuple(task.messages),
-        session_history=session_history,
+        system_prompt=_system_prompt(session, run),
+        goal=run.goal,
+        workspace=str(session.workspace),
+        plan=tuple(run.plan),
+        messages=tuple(session.messages),
     )
 
 
@@ -126,15 +102,16 @@ def _validate_turn_tool_calls(
 
 
 def _execute_tool_call(
-    task: Task,
+    session: Session,
+    run: Run,
     call: ToolCall,
     registry: ToolRegistry,
     emit: EmitCallback,
 ) -> ToolResult:
     if call.name == PLAN_TOOL.name:
-        result = handle_plan(task, call)
+        result = handle_plan(run, call)
         if result.ok:
-            emit("Plan updated: " + " | ".join(task.plan))
+            emit("Plan updated: " + " | ".join(run.plan))
         else:
             emit(f"Plan update failed: {result.stderr}")
         return result
@@ -144,10 +121,19 @@ def _execute_tool_call(
         tool_name=call.name,
         arguments=dict(call.arguments),
     )
-    task.tool_runs.append(tool_run)
+    run.tool_runs.append(tool_run)
     tool_run.transition(ToolRunStatus.RUNNING)
     emit(f"Running tool: {call.name}")
-    result = registry.execute(call.name, task.workspace, call.arguments)
+    try:
+        result = registry.execute(call.name, session.workspace, call.arguments)
+    except Exception as exc:
+        tool_run.result = ToolResult(
+            ok=False,
+            stderr=f"Tool execution interrupted ({type(exc).__name__})",
+        )
+        tool_run.transition(ToolRunStatus.FAILED)
+        emit(f"Tool {call.name}: interrupted")
+        raise
     tool_run.result = result
     tool_run.transition(ToolRunStatus.SUCCEEDED if result.ok else ToolRunStatus.FAILED)
     emit(f"Tool {call.name}: {'succeeded' if result.ok else 'failed'}")
@@ -155,9 +141,12 @@ def _execute_tool_call(
 
 
 def _append_tool_results(
-    task: Task, calls: tuple[ToolCall, ...], results: tuple[ToolResult, ...]
+    session: Session,
+    run: Run,
+    calls: tuple[ToolCall, ...],
+    results: tuple[ToolResult, ...],
 ) -> None:
-    task.messages.append(
+    session.messages.append(
         ModelMessage(
             role="user",
             content=tuple(
@@ -169,69 +158,102 @@ def _append_tool_results(
                 }
                 for call, result in zip(calls, results, strict=True)
             ),
+            run_id=run.run_id,
         )
     )
 
 
-def _checkpoint(task: Task, store: TaskStore | None) -> None:
+def _execute_tool_calls(
+    session: Session,
+    run: Run,
+    calls: tuple[ToolCall, ...],
+    registry: ToolRegistry,
+    emit: EmitCallback,
+    store: RunStore | None,
+) -> tuple[ToolResult, ...]:
+    results: list[ToolResult] = []
+    for index, call in enumerate(calls):
+        try:
+            results.append(_execute_tool_call(session, run, call, registry, emit))
+        except Exception as exc:
+            results.append(
+                ToolResult(
+                    ok=False,
+                    stderr=f"Tool execution interrupted ({type(exc).__name__})",
+                )
+            )
+            results.extend(
+                ToolResult(
+                    ok=False,
+                    stderr="Tool was not executed because an earlier call was interrupted",
+                )
+                for _call in calls[index + 1 :]
+            )
+            _append_tool_results(session, run, calls, tuple(results))
+            _safe_checkpoint(session, run, store)
+            raise
+    return tuple(results)
+
+
+def _checkpoint(session: Session, run: Run, store: RunStore | None) -> None:
     if store is not None:
-        store.checkpoint_task(task)
+        store.checkpoint_run(session, run)
 
 
 def _create_text_wait(
-    task: Task,
+    session: Session,
+    run: Run,
     call: ToolCall,
-    store: TaskStore | None,
+    store: RunStore | None,
     emit: EmitCallback,
 ) -> bool:
     prepared = prepare_text_wait(call)
     if isinstance(prepared, ToolResult):
-        _append_tool_results(
-            task,
-            (call,),
-            (prepared,),
-        )
-        _checkpoint(task, store)
+        _append_tool_results(session, run, (call,), (prepared,))
+        _checkpoint(session, run, store)
         return False
     if store is None:
         _append_tool_results(
-            task,
+            session,
+            run,
             (call,),
             (
                 ToolResult(
                     ok=False,
-                    stderr="wait_for_text requires durable task storage",
+                    stderr="wait_for_text requires durable session storage",
                 ),
             ),
         )
         return False
 
     work_item, wait = prepared
-    task.work_items.append(work_item)
-    task.waits.append(wait)
-    task.transition(TaskStatus.WAITING)
-    store.checkpoint_task(task)
+    run.work_items.append(work_item)
+    run.waits.append(wait)
+    run.transition(RunStatus.WAITING)
+    store.checkpoint_run(session, run)
     emit(f"Waiting for text: {wait.prompt}")
     return True
 
 
 def _run_turns(
-    task: Task,
+    session: Session,
+    run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
     emit: EmitCallback,
-    store: TaskStore | None,
-    session_history: tuple[SessionHistoryEntry, ...],
-) -> Task:
+    store: RunStore | None,
+) -> Run:
     definitions = (*runtime_tool_definitions(), *registry.definitions())
-    while task.model_turns < task.max_steps:
-        emit(f"Model turn {task.model_turns + 1}/{task.max_steps}")
-        turn = model.complete(_context(task, session_history), definitions)
-        task.model_turns += 1
+    while run.model_turns < run.max_steps:
+        emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
+        turn = model.complete(_context(session, run), definitions)
+        run.model_turns += 1
         if not turn.content:
             raise ModelProtocolError("Model returned an empty turn")
         _validate_turn_tool_calls(turn.content, turn.tool_calls)
-        task.messages.append(ModelMessage(role="assistant", content=turn.content))
+        session.messages.append(
+            ModelMessage(role="assistant", content=turn.content, run_id=run.run_id)
+        )
 
         if turn.tool_calls:
             if turn.text:
@@ -245,127 +267,130 @@ def _run_turns(
                     stderr="wait_for_text must be the only tool call in its turn",
                 )
                 _append_tool_results(
-                    task,
+                    session,
+                    run,
                     turn.tool_calls,
                     tuple(error for _call in turn.tool_calls),
                 )
-                _checkpoint(task, store)
+                _checkpoint(session, run, store)
                 emit("Rejected tool turn: wait_for_text must be called alone")
                 continue
             if wait_calls:
-                if _create_text_wait(task, wait_calls[0], store, emit):
-                    return task
+                if _create_text_wait(session, run, wait_calls[0], store, emit):
+                    return run
                 continue
 
-            results = tuple(
-                _execute_tool_call(task, call, registry, emit)
-                for call in turn.tool_calls
+            results = _execute_tool_calls(
+                session, run, turn.tool_calls, registry, emit, store
             )
-            _append_tool_results(task, turn.tool_calls, results)
-            _checkpoint(task, store)
+            _append_tool_results(session, run, turn.tool_calls, results)
+            _checkpoint(session, run, store)
             continue
 
         if turn.stop_reason == "end_turn" and turn.text:
-            task.final_summary = turn.text
-            task.transition(TaskStatus.COMPLETED)
-            _checkpoint(task, store)
-            emit("Task completed")
-            return task
+            run.final_summary = turn.text
+            run.transition(RunStatus.COMPLETED)
+            _checkpoint(session, run, store)
+            emit("Run completed")
+            return run
         raise ModelProtocolError(
             "Model stopped without tool calls or a non-empty final end_turn response"
         )
 
     raise StepLimitExceededError(
-        f"Agent exceeded the maximum of {task.max_steps} model turns"
+        f"Agent exceeded the maximum of {run.max_steps} model turns"
     )
 
 
-def _safe_checkpoint(task: Task, store: TaskStore | None) -> None:
+def _safe_checkpoint(
+    session: Session, run: Run, store: RunStore | None
+) -> None:
     if store is None:
         return
     with suppress(HandshakeError):
-        store.checkpoint_task(task)
+        store.checkpoint_run(session, run)
 
 
 def _run_with_failure_handling(
-    task: Task,
+    session: Session,
+    run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
     emit: EmitCallback,
-    store: TaskStore | None,
-    session_history: tuple[SessionHistoryEntry, ...],
-) -> Task:
+    store: RunStore | None,
+) -> Run:
     try:
-        return _run_turns(task, model, registry, emit, store, session_history)
+        return _run_turns(session, run, model, registry, emit, store)
     except UserCancelledError as exc:
-        task.error = str(exc)
-        if task.status in {TaskStatus.RUNNING, TaskStatus.WAITING}:
-            task.transition(TaskStatus.CANCELLED)
-        _safe_checkpoint(task, store)
+        run.error = str(exc)
+        if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
+            run.transition(RunStatus.CANCELLED)
+        _safe_checkpoint(session, run, store)
         raise
     except HandshakeError as exc:
-        task.error = str(exc)
-        if task.status in {TaskStatus.RUNNING, TaskStatus.WAITING}:
-            task.transition(TaskStatus.FAILED)
-        _safe_checkpoint(task, store)
+        run.error = str(exc)
+        if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
+            run.transition(RunStatus.FAILED)
+        _safe_checkpoint(session, run, store)
         raise
     except Exception as exc:
-        task.error = f"Unexpected runtime failure ({type(exc).__name__})"
-        if task.status in {TaskStatus.RUNNING, TaskStatus.WAITING}:
-            task.transition(TaskStatus.FAILED)
-        _safe_checkpoint(task, store)
-        raise AgentLoopError(task.error) from None
+        run.error = f"Unexpected runtime failure ({type(exc).__name__})"
+        if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
+            run.transition(RunStatus.FAILED)
+        _safe_checkpoint(session, run, store)
+        raise AgentLoopError(run.error) from None
 
 
-def run_agent(
-    task: Task,
+def start_run(
+    session: Session,
+    run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
     *,
-    max_steps: int = 50,
     emit: EmitCallback | None = None,
-    store: TaskStore | None = None,
-    session_history: tuple[SessionHistoryEntry, ...] = (),
-) -> Task:
-    """Start a task and run until completion, failure, or a durable wait."""
-    if max_steps < 1:
+    store: RunStore | None = None,
+) -> Run:
+    """Start one user-request run and execute until terminal state or a wait."""
+    if run.max_steps < 1:
         raise ValueError("max_steps must be >= 1")
-    if task.status is not TaskStatus.CREATED:
-        raise AgentLoopError("Only a newly created task can be run")
+    if run.status is not RunStatus.CREATED:
+        raise AgentLoopError("Only a newly created run can be started")
+    if run.session_id != session.session_id:
+        raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
+    if any(message.run_id == run.run_id for message in session.messages):
+        raise AgentLoopError(f"Run {run.run_id} already has session messages")
+
     output = emit or (lambda _message: None)
-    task.workspace = task.workspace.resolve()
-    task.max_steps = max_steps
-    task.transition(TaskStatus.RUNNING)
-    if not task.messages:
-        task.messages.append(
-            ModelMessage(
-                role="user",
-                content=({"type": "text", "text": task.goal},),
-            )
+    session.workspace = session.workspace.resolve()
+    run.transition(RunStatus.RUNNING)
+    session.messages.append(
+        ModelMessage(
+            role="user",
+            content=({"type": "text", "text": run.goal},),
+            run_id=run.run_id,
         )
-    if store is not None:
-        store.create_task(task)
-        output(f"Task created: {task.task_id}")
-    return _run_with_failure_handling(
-        task, model, registry, output, store, session_history
     )
+    if store is not None:
+        store.create_run(session, run)
+        output(f"Run started: {run.run_id}")
+    return _run_with_failure_handling(session, run, model, registry, output, store)
 
 
-def continue_agent(
-    task: Task,
+def continue_run(
+    session: Session,
+    run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
     *,
     emit: EmitCallback | None = None,
-    store: TaskStore | None = None,
-    session_history: tuple[SessionHistoryEntry, ...] = (),
-) -> Task:
-    """Continue a durable task after its text wait has been satisfied."""
-    if task.status is not TaskStatus.RUNNING:
-        raise AgentLoopError("Only a running task can continue")
-    if not task.messages:
-        raise AgentLoopError("A resumed task must contain model protocol history")
+    store: RunStore | None = None,
+) -> Run:
+    """Continue a durable run after its text wait has been satisfied."""
+    if run.status is not RunStatus.RUNNING:
+        raise AgentLoopError("Only a running run can continue")
+    if run.session_id != session.session_id:
+        raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
+    if not any(message.run_id == run.run_id for message in session.messages):
+        raise AgentLoopError("A resumed run must have model protocol history")
     output = emit or (lambda _message: None)
-    return _run_with_failure_handling(
-        task, model, registry, output, store, session_history
-    )
+    return _run_with_failure_handling(session, run, model, registry, output, store)

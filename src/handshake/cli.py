@@ -1,4 +1,4 @@
-"""CLI for real-model tasks, durable text waits, and the scripted demo."""
+"""CLI for durable model runs, text waits, and the scripted demo."""
 
 from __future__ import annotations
 
@@ -14,22 +14,19 @@ from pathlib import Path
 from handshake.config import DeepSeekConfig, handshake_home, read_deepseek_api_key
 from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
+from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.errors import HandshakeError, UserCancelledError
-from handshake.runtime.loop import continue_agent, run_agent
-from handshake.runtime.sessions import (
-    build_session_history,
-    create_followup_task,
-    create_initial_task,
-    latest_task,
+from handshake.runtime.loop import continue_run, start_run
+from handshake.runtime.runs import (
+    create_followup_run,
+    create_initial_run,
+    latest_run,
 )
 from handshake.runtime.state import (
-    ModelTurn,
+    Run,
+    RunStatus,
     Session,
-    SessionHistoryEntry,
-    Task,
-    TaskStatus,
-    ToolCall,
     WaitCondition,
 )
 from handshake.runtime.waits import resolve_text_wait
@@ -74,11 +71,11 @@ def _create_real_model(model_name: str) -> ModelAdapter:
     return model
 
 
-def _single_open_wait(task: Task) -> WaitCondition:
-    waits = task.open_waits()
+def _single_open_wait(run: Run) -> WaitCondition:
+    waits = run.open_waits()
     if len(waits) != 1:
         raise HandshakeError(
-            f"Task {task.task_id} must have exactly one open text wait, found {len(waits)}"
+            f"Run {run.run_id} must have exactly one open text wait, found {len(waits)}"
         )
     return waits[0]
 
@@ -88,87 +85,86 @@ def _resume_command(session: Session) -> str:
 
 
 def _read_wait_response(
-    session: Session, task: Task, wait: WaitCondition
+    session: Session, run: Run, wait: WaitCondition
 ) -> str | None:
     print("\nInput required")
     print(f"  session:  {session.session_id}")
-    print(f"  task:     {task.task_id}")
+    print(f"  run:      {run.run_id}")
     print(f"  wait:     {wait.wait_id}")
     print(f"  question: {wait.prompt}")
     if not sys.stdin.isatty():
-        print("Task remains waiting because stdin is not interactive.")
+        print("Run remains waiting because stdin is not interactive.")
         print(f"Resume with: {_resume_command(session)}")
         return None
     try:
         return input("Response: ")
     except EOFError:
-        print("\nTask remains waiting; no response was recorded.")
+        print("\nRun remains waiting; no response was recorded.")
         print(f"Resume with: {_resume_command(session)}")
         return None
     except KeyboardInterrupt as exc:
-        print("\nTask remains waiting; no response was recorded.")
+        print("\nRun remains waiting; no response was recorded.")
         print(f"Resume with: {_resume_command(session)}")
         raise UserCancelledError("User interrupted text input") from exc
 
 
-def _print_final_summary(task: Task) -> None:
+def _print_final_summary(run: Run) -> None:
     print("\nFinal summary")
-    print(task.final_summary or "(none)")
+    print(run.final_summary or "(none)")
 
 
-def _drive_task(
+def _drive_run(
     session: Session,
-    task: Task,
+    run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
     store: SQLiteStateStore,
-    session_history: tuple[SessionHistoryEntry, ...],
-) -> tuple[int, Task]:
-    while task.status is TaskStatus.WAITING:
-        wait = _single_open_wait(task)
-        response = _read_wait_response(session, task, wait)
+) -> tuple[int, Run]:
+    while run.status is RunStatus.WAITING:
+        wait = _single_open_wait(run)
+        response = _read_wait_response(session, run, wait)
         if response is None:
-            return _WAITING_EXIT_CODE, task
+            return _WAITING_EXIT_CODE, run
         if not response.strip():
-            print("Response must not be empty; the task is still waiting.")
+            print("Response must not be empty; the run is still waiting.")
             continue
-        resolve_text_wait(task, wait.wait_id, response)
-        store.checkpoint_task(task)
-        print("Input received; resuming task")
-        task = continue_agent(
-            task,
+        resolve_text_wait(session, run, wait.wait_id, response)
+        store.checkpoint_run(session, run)
+        print("Input received; resuming run")
+        run = continue_run(
+            session,
+            run,
             model,
             registry,
             emit=print,
             store=store,
-            session_history=session_history,
         )
-    if task.status is not TaskStatus.COMPLETED:
+    if run.status is not RunStatus.COMPLETED:
         raise HandshakeError(
-            f"Task {task.task_id} stopped in unsupported state {task.status.value}"
+            f"Run {run.run_id} stopped in unsupported state {run.status.value}"
         )
-    _print_final_summary(task)
-    return 0, task
+    _print_final_summary(run)
+    return 0, run
 
 
-def _print_terminal_task(task: Task) -> int:
-    if task.status is TaskStatus.COMPLETED:
-        _print_final_summary(task)
+def _print_terminal_run(run: Run) -> int:
+    if run.status is RunStatus.COMPLETED:
+        _print_final_summary(run)
         return 0
-    if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
-        print(f"\nTask {task.status.value}")
-        print(task.error or "(no error recorded)")
+    if run.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
+        print(f"\nRun {run.status.value}")
+        print(run.error or "(no error recorded)")
         return 1
     raise HandshakeError(
-        f"Task {task.task_id} cannot be restored from {task.status.value}; "
-        "only stable waiting or terminal tasks are supported"
+        f"Run {run.run_id} cannot be restored from {run.status.value}; "
+        "only stable waiting or terminal runs are supported"
     )
 
 
 def _read_next_goal(session: Session) -> str | None:
     if not sys.stdin.isatty():
         return None
-    print(f"\nSession {session.session_id} is ready for the next task.")
+    print(f"\nSession {session.session_id} is ready for the next request.")
     while True:
         try:
             goal = input("You: ").strip()
@@ -182,67 +178,54 @@ def _read_next_goal(session: Session) -> str | None:
             return None
         if goal:
             return goal
-        print("Task goal must not be empty. Enter /exit to leave the session.")
+        print("Request must not be empty. Enter /exit to leave the session.")
 
 
-def _task_history(
-    session: Session, task: Task, store: SQLiteStateStore
-) -> tuple[SessionHistoryEntry, ...]:
-    tasks = store.list_tasks(session.session_id)
-    return build_session_history(
-        session,
-        tasks,
-        before_sequence=task.sequence,
-    )
-
-
-def _process_current_task(
+def _process_current_run(
     session: Session,
-    task: Task,
+    run: Run,
     registry: ToolRegistry,
     store: SQLiteStateStore,
     model: ModelAdapter | None = None,
-) -> tuple[int, Task]:
-    if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-        return _print_terminal_task(task), task
-    if task.status not in {TaskStatus.CREATED, TaskStatus.WAITING}:
-        return _print_terminal_task(task), task
+) -> tuple[int, Run]:
+    if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+        return _print_terminal_run(run), run
+    if run.status not in {RunStatus.CREATED, RunStatus.WAITING}:
+        return _print_terminal_run(run), run
 
-    history = _task_history(session, task, store)
-    current_model = model or _create_real_model(task.model_name)
+    current_model = model or _create_real_model(run.model_name)
     try:
-        if task.status is TaskStatus.CREATED:
-            task = run_agent(
-                task,
+        if run.status is RunStatus.CREATED:
+            run = start_run(
+                session,
+                run,
                 current_model,
                 registry,
-                max_steps=task.max_steps,
                 emit=print,
                 store=store,
-                session_history=history,
             )
-        return _drive_task(session, task, current_model, registry, store, history)
+        return _drive_run(session, run, current_model, registry, store)
     except UserCancelledError:
         raise
     except HandshakeError as exc:
         try:
-            persisted = store.load_task(task.task_id)
+            persisted = store.load_run(run.run_id)
         except HandshakeError:
             raise exc from None
-        if persisted.status is not TaskStatus.FAILED:
+        if persisted.status is not RunStatus.FAILED:
             raise
-        return _print_terminal_task(persisted), persisted
+        return _print_terminal_run(persisted), persisted
 
 
 def _drive_session(
     session: Session,
-    task: Task,
+    run: Run,
     registry: ToolRegistry,
     store: SQLiteStateStore,
     initial_model: ModelAdapter | None = None,
 ) -> int:
-    result_code, task = _process_current_task(
-        session, task, registry, store, initial_model
+    result_code, run = _process_current_run(
+        session, run, registry, store, initial_model
     )
     if result_code == _WAITING_EXIT_CODE or not sys.stdin.isatty():
         return result_code
@@ -251,9 +234,9 @@ def _drive_session(
         goal = _read_next_goal(session)
         if goal is None:
             return 0
-        tasks = store.list_tasks(session.session_id)
-        task = create_followup_task(session, tasks, goal)
-        result_code, task = _process_current_task(session, task, registry, store)
+        runs = store.list_runs(session.session_id)
+        run = create_followup_run(session, runs, goal)
+        result_code, run = _process_current_run(session, run, registry, store)
         if result_code == _WAITING_EXIT_CODE:
             return result_code
 
@@ -266,16 +249,16 @@ def _run_real(args: argparse.Namespace) -> int:
     model = _create_real_model(config.model)
     store = _state_store()
     session = Session(workspace=workspace)
-    task = create_initial_task(
+    run = create_initial_run(
         session,
-        args.task,
+        args.request,
         model_name=config.model,
         max_steps=args.max_steps,
     )
     store.create_session(session)
     print(f"Session created: {session.session_id}")
     registry = create_default_registry(_interactive_approval)
-    return _drive_session(session, task, registry, store, model)
+    return _drive_session(session, run, registry, store, model)
 
 
 def _resume_session(args: argparse.Namespace) -> int:
@@ -283,9 +266,9 @@ def _resume_session(args: argparse.Namespace) -> int:
     session = store.load_session(args.session_id)
     if not session.workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
-    task = latest_task(session, store.list_tasks(session.session_id))
+    run = latest_run(session, store.list_runs(session.session_id))
     registry = create_default_registry(_interactive_approval)
-    return _drive_session(session, task, registry, store)
+    return _drive_session(session, run, registry, store)
 
 
 def _list_sessions(_args: argparse.Namespace) -> int:
@@ -295,16 +278,16 @@ def _list_sessions(_args: argparse.Namespace) -> int:
         print("No durable sessions.")
         return 0
     for session in sessions:
-        tasks = store.list_tasks(session.session_id)
-        if not tasks:
+        runs = store.list_runs(session.session_id)
+        if not runs:
             print(f"{session.session_id}  empty      {session.created_at}  [{session.workspace}]")
             continue
-        task = latest_task(session, tasks)
-        goal = task.goal.replace("\n", " ")
+        run = latest_run(session, runs)
+        goal = run.goal.replace("\n", " ")
         if len(goal) > 60:
             goal = goal[:57] + "..."
         print(
-            f"{session.session_id}  {task.status.value:<9}  {task.updated_at}  "
+            f"{session.session_id}  {run.status.value:<9}  {run.updated_at}  "
             f"{goal}  [{session.workspace}]"
         )
     return 0
@@ -313,47 +296,51 @@ def _list_sessions(_args: argparse.Namespace) -> int:
 def _inspect_session(args: argparse.Namespace) -> int:
     store = _state_store()
     session = store.load_session(args.session_id)
-    tasks = store.list_tasks(session.session_id)
+    runs = store.list_runs(session.session_id)
     print(f"Session:   {session.session_id}")
     print(f"Workspace: {session.workspace}")
     print(f"Created:   {session.created_at}")
-    print("Tasks:")
-    for task in tasks:
-        goal = task.goal.replace("\n", " ")
+    print(f"Messages:  {len(session.messages)}")
+    print("Runs:")
+    for run in runs:
+        goal = run.goal.replace("\n", " ")
         print(
-            f"  - #{task.sequence} {task.task_id} [{task.status.value}] "
-            f"{task.model_turns}/{task.max_steps} {goal}"
+            f"  - #{run.sequence} {run.run_id} [{run.status.value}] "
+            f"{run.model_turns}/{run.max_steps} {goal}"
         )
-        for wait in task.open_waits():
+        for wait in run.open_waits():
             print(f"      wait {wait.wait_id} [{wait.kind.value}] {wait.prompt}")
     return 0
 
 
-def _inspect_task(args: argparse.Namespace) -> int:
-    task = _state_store().load_task(args.task_id)
-    print(f"Task:        {task.task_id}")
-    print(f"Session:     {task.session_id}")
-    print(f"Sequence:    {task.sequence}")
-    print(f"Status:      {task.status.value}")
-    print(f"Goal:        {task.goal}")
-    print(f"Workspace:   {task.workspace}")
-    print(f"Model:       {task.model_name or '(not recorded)'}")
-    print(f"Model turns: {task.model_turns}/{task.max_steps}")
-    print(f"Messages:    {len(task.messages)}")
+def _inspect_run(args: argparse.Namespace) -> int:
+    store = _state_store()
+    run = store.load_run(args.run_id)
+    session = store.load_session(run.session_id)
+    message_count = sum(message.run_id == run.run_id for message in session.messages)
+    print(f"Run:         {run.run_id}")
+    print(f"Session:     {run.session_id}")
+    print(f"Sequence:    {run.sequence}")
+    print(f"Status:      {run.status.value}")
+    print(f"Goal:        {run.goal}")
+    print(f"Workspace:   {session.workspace}")
+    print(f"Model:       {run.model_name or '(not recorded)'}")
+    print(f"Model turns: {run.model_turns}/{run.max_steps}")
+    print(f"Messages:    {message_count}")
     print("Plan:")
-    if task.plan:
-        for step in task.plan:
+    if run.plan:
+        for step in run.plan:
             print(f"  - {step}")
     else:
         print("  (not set)")
     print("Waits:")
-    if task.waits:
-        for wait in task.waits:
+    if run.waits:
+        for wait in run.waits:
             print(f"  - {wait.wait_id} [{wait.kind.value}/{wait.status.value}] {wait.prompt}")
     else:
         print("  (none)")
-    if task.error:
-        print(f"Error:       {task.error}")
+    if run.error:
+        print(f"Error:       {run.error}")
     return 0
 
 
@@ -435,15 +422,14 @@ def _run_demo(_args: argparse.Namespace) -> int:
         shutil.copytree(fixture, workspace)
         print(f"Running isolated scripted demo in {workspace}")
         session = Session(workspace=workspace)
-        task = Task(
+        run = Run(
             goal="Implement the missing calculator.add function",
-            workspace=workspace,
             session_id=session.session_id,
             model_name="scripted",
         )
         registry = create_default_registry(lambda _cwd, _argv: True)
-        run_agent(task, _demo_model(), registry, emit=print)
-        _print_final_summary(task)
+        start_run(session, run, _demo_model(), registry, emit=print)
+        _print_final_summary(run)
         return 0
 
 
@@ -453,7 +439,7 @@ def _parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="start a durable DeepSeek session")
     run_parser.add_argument("repo", help="repository workspace")
-    run_parser.add_argument("task", help="natural-language coding task")
+    run_parser.add_argument("request", help="natural-language coding request")
     run_parser.add_argument(
         "--model",
         default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
@@ -473,11 +459,11 @@ def _parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("session_id", help="durable session ID")
     inspect_parser.set_defaults(handler=_inspect_session)
 
-    inspect_task_parser = subparsers.add_parser(
-        "inspect-task", help="inspect one durable task"
+    inspect_run_parser = subparsers.add_parser(
+        "inspect-run", help="inspect one durable run"
     )
-    inspect_task_parser.add_argument("task_id", help="durable task ID")
-    inspect_task_parser.set_defaults(handler=_inspect_task)
+    inspect_run_parser.add_argument("run_id", help="durable run ID")
+    inspect_run_parser.set_defaults(handler=_inspect_run)
 
     demo_parser = subparsers.add_parser("demo", help="run the offline scripted demo")
     demo_parser.set_defaults(handler=_run_demo)

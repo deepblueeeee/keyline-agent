@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from handshake.runtime.state import ModelContext, ModelTurn
+from handshake.models.protocol import ModelContext, ModelTurn
 
 
 @dataclass(slots=True, frozen=True)

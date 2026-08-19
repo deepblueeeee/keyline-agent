@@ -6,8 +6,8 @@ import pytest
 
 from handshake.config import DeepSeekConfig
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
-from handshake.runtime.loop import run_agent
-from handshake.runtime.state import Task, TaskStatus
+from handshake.runtime.loop import start_run
+from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
 
 
@@ -28,13 +28,18 @@ def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
         model=config.model,
     )
     del api_key
-    task = Task(
+    session = Session(workspace=workspace)
+    run = Run(
         goal="Implement calculator.add and run the existing tests.",
-        workspace=workspace,
-        session_id="live-session",
+        session_id=session.session_id,
     )
 
-    run_agent(task, model, create_default_registry(lambda _cwd, _argv: True))
+    start_run(
+        session,
+        run,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+    )
 
-    assert task.status is TaskStatus.COMPLETED
+    assert run.status is RunStatus.COMPLETED
     assert "return left + right" in (workspace / "calculator.py").read_text()

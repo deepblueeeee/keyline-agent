@@ -29,7 +29,7 @@ class DeepSeekConfig:
 
 
 def read_deepseek_api_key() -> str:
-    """Read the key without placing it in normal task/config state."""
+    """Read the key without placing it in normal session/run state."""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise HandshakeError("DEEPSEEK_API_KEY is required for real-model runs")

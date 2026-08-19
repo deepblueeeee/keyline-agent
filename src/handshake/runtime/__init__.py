@@ -1,1 +1,1 @@
-"""Session-aware task runtime."""
+"""Session-first ReAct runtime."""

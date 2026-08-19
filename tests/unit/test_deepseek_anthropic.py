@@ -5,9 +5,10 @@ import pytest
 
 from handshake.models.base import ToolDefinition
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
+from handshake.models.protocol import ModelContext, ModelMessage
 from handshake.runtime.errors import ModelProviderError
-from handshake.runtime.loop import run_agent
-from handshake.runtime.state import ModelContext, ModelMessage, Task, TaskStatus
+from handshake.runtime.loop import start_run
+from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
 
 
@@ -53,7 +54,13 @@ def test_normalizes_thinking_text_and_tool_use() -> None:
         goal="goal",
         workspace="/tmp/work",
         plan=(),
-        messages=(ModelMessage("user", ({"type": "text", "text": "goal"},)),),
+        messages=(
+            ModelMessage(
+                "user",
+                ({"type": "text", "text": "goal"},),
+                run_id="internal-run-id",
+            ),
+        ),
     )
     definition = ToolDefinition("read_file", "read", {"type": "object"})
 
@@ -66,6 +73,7 @@ def test_normalizes_thinking_text_and_tool_use() -> None:
     assert request["model"] == "deepseek-v4-flash"
     assert request["system"] == "system"
     assert request["tools"][0]["name"] == "read_file"
+    assert "run_id" not in request["messages"][0]
 
 
 def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
@@ -90,15 +98,17 @@ def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
             },
         ]
     )
-    task = Task(goal="inspect", workspace=tmp_path, session_id="test-session")
+    session = Session(workspace=tmp_path)
+    run = Run(goal="inspect", session_id=session.session_id)
 
-    run_agent(
-        task,
+    start_run(
+        session,
+        run,
         DeepSeekAnthropicModel(api_key="canary", client=client),
         create_default_registry(lambda _cwd, _argv: True),
     )
 
-    assert task.status is TaskStatus.COMPLETED
+    assert run.status is RunStatus.COMPLETED
     second_messages = client.messages.requests[1]["messages"]
     assert second_messages[-2]["content"][0]["type"] == "thinking"
     assert second_messages[-2]["content"][0]["signature"] == "signed"

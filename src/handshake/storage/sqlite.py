@@ -1,4 +1,4 @@
-"""SQLite-backed durable sessions and task snapshots."""
+"""SQLite-backed durable sessions, conversations, and run snapshots."""
 
 from __future__ import annotations
 
@@ -7,18 +7,18 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from handshake.models.protocol import ModelMessage
 from handshake.runtime.errors import (
+    ConcurrentRunUpdateError,
     ConcurrentSessionUpdateError,
-    ConcurrentTaskUpdateError,
+    RunNotFoundError,
     SessionNotFoundError,
     StorageError,
-    TaskNotFoundError,
 )
 from handshake.runtime.state import (
-    ModelMessage,
+    Run,
+    RunStatus,
     Session,
-    Task,
-    TaskStatus,
     WaitCondition,
     WaitKind,
     WaitStatus,
@@ -30,7 +30,7 @@ from handshake.storage.schema import initialize_schema
 
 
 class SQLiteStateStore:
-    """Persist sessions and complete stable task snapshots in SQLite."""
+    """Persist session transcripts and complete stable run snapshots."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path.expanduser().resolve()
@@ -53,13 +53,17 @@ class SQLiteStateStore:
     def create_session(self, session: Session) -> None:
         try:
             workspace = session.workspace.expanduser().resolve()
+            if session.messages:
+                raise StorageError("A new session cannot contain messages before its first run")
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO sessions VALUES (?, ?, ?)",
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
                     (
                         session.session_id,
                         str(workspace),
+                        session.version,
                         session.created_at,
+                        session.updated_at,
                     ),
                 )
             session.workspace = workspace
@@ -69,16 +73,7 @@ class SQLiteStateStore:
     def load_session(self, session_id: str) -> Session:
         try:
             with self._connect() as connection:
-                row = connection.execute(
-                    "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-                ).fetchone()
-                if row is None:
-                    raise SessionNotFoundError(f"Session not found: {session_id}")
-                return Session(
-                    session_id=str(row["session_id"]),
-                    workspace=Path(row["workspace"]),
-                    created_at=str(row["created_at"]),
-                )
+                return self._load_session(connection, session_id)
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
@@ -87,129 +82,107 @@ class SQLiteStateStore:
             with self._connect() as connection:
                 rows = connection.execute(
                     """
-                    SELECT sessions.*
+                    SELECT sessions.session_id
                     FROM sessions
-                    LEFT JOIN tasks USING (session_id)
+                    LEFT JOIN runs USING (session_id)
                     GROUP BY sessions.session_id
-                    ORDER BY COALESCE(MAX(tasks.updated_at), sessions.created_at) DESC,
+                    ORDER BY COALESCE(MAX(runs.updated_at), sessions.updated_at) DESC,
                              sessions.session_id
                     """
                 ).fetchall()
                 return tuple(
-                    Session(
-                        session_id=str(row["session_id"]),
-                        workspace=Path(row["workspace"]),
-                        created_at=str(row["created_at"]),
-                    )
+                    self._load_session(connection, str(row["session_id"]))
                     for row in rows
                 )
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def create_task(self, task: Task) -> None:
+    def create_run(self, session: Session, run: Run) -> None:
+        """Atomically append a run and the session transcript containing its prompt."""
         try:
             updated_at = utc_now()
+            expected_session_version = session.version
+            next_session_version = expected_session_version + 1
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                session_row = connection.execute(
-                    "SELECT workspace FROM sessions WHERE session_id = ?",
-                    (task.session_id,),
-                ).fetchone()
-                if session_row is None:
-                    raise SessionNotFoundError(f"Session not found: {task.session_id}")
-                if Path(session_row["workspace"]) != task.workspace:
-                    raise StorageError(
-                        f"Task workspace does not match session {task.session_id}"
-                    )
+                self._validate_session_workspace(connection, session)
                 tail = connection.execute(
                     """
-                    SELECT task_id, sequence FROM tasks
+                    SELECT run_id, sequence FROM runs
                     WHERE session_id = ? ORDER BY sequence DESC LIMIT 1
                     """,
-                    (task.session_id,),
+                    (session.session_id,),
                 ).fetchone()
-                tail_id = None if tail is None else str(tail["task_id"])
+                tail_id = None if tail is None else str(tail["run_id"])
                 next_sequence = 1 if tail is None else int(tail["sequence"]) + 1
-                if tail_id != task.previous_task_id or task.sequence != next_sequence:
+                if tail_id != run.previous_run_id or run.sequence != next_sequence:
                     raise ConcurrentSessionUpdateError(
-                        f"Session {task.session_id} changed before task {task.task_id} "
+                        f"Session {session.session_id} changed before run {run.run_id} "
                         "could be appended"
                     )
-                self._write_task(
+                self._insert_run(connection, run, updated_at)
+                self._compare_and_update_session(
                     connection,
-                    task,
-                    create=True,
+                    session,
+                    expected_version=expected_session_version,
+                    next_version=next_session_version,
                     updated_at=updated_at,
-                    expected_version=task.version,
-                    next_version=task.version,
                 )
-            task.updated_at = updated_at
+                self._replace_session_messages(connection, session)
+                self._replace_run_children(connection, run)
+            session.version = next_session_version
+            session.updated_at = updated_at
+            run.updated_at = updated_at
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def checkpoint_task(self, task: Task) -> None:
+    def checkpoint_run(self, session: Session, run: Run) -> None:
+        """Atomically checkpoint one run and the conversation it has extended."""
         try:
-            expected_version = task.version
-            next_version = expected_version + 1
+            expected_session_version = session.version
+            expected_run_version = run.version
+            next_session_version = expected_session_version + 1
+            next_run_version = expected_run_version + 1
             updated_at = utc_now()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                self._validate_existing_task_membership(connection, task)
-                self._write_task(
+                self._validate_run_membership(connection, session, run)
+                self._compare_and_update_session(
                     connection,
-                    task,
-                    create=False,
+                    session,
+                    expected_version=expected_session_version,
+                    next_version=next_session_version,
                     updated_at=updated_at,
-                    expected_version=expected_version,
-                    next_version=next_version,
                 )
-            task.version = next_version
-            task.updated_at = updated_at
+                self._compare_and_update_run(
+                    connection,
+                    run,
+                    expected_version=expected_run_version,
+                    next_version=next_run_version,
+                    updated_at=updated_at,
+                )
+                self._replace_session_messages(connection, session)
+                self._replace_run_children(connection, run)
+            session.version = next_session_version
+            session.updated_at = updated_at
+            run.version = next_run_version
+            run.updated_at = updated_at
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def _validate_existing_task_membership(
-        self, connection: sqlite3.Connection, task: Task
-    ) -> None:
-        row = connection.execute(
-            """
-            SELECT tasks.session_id, tasks.sequence, tasks.previous_task_id,
-                   sessions.workspace
-            FROM tasks JOIN sessions USING (session_id)
-            WHERE task_id = ?
-            """,
-            (task.task_id,),
-        ).fetchone()
-        if row is None:
-            raise TaskNotFoundError(f"Task not found: {task.task_id}")
-        membership = (
-            str(row["session_id"]),
-            int(row["sequence"]),
-            row["previous_task_id"],
-            Path(row["workspace"]),
-        )
-        expected = (
-            task.session_id,
-            task.sequence,
-            task.previous_task_id,
-            task.workspace,
-        )
-        if membership != expected:
-            raise StorageError(f"Task {task.task_id} has invalid session membership")
-
-    def load_task(self, task_id: str) -> Task:
+    def load_run(self, run_id: str) -> Run:
         try:
             with self._connect() as connection:
-                return self._load_task(connection, task_id)
+                return self._load_run(connection, run_id)
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def list_tasks(self, session_id: str | None = None) -> tuple[Task, ...]:
+    def list_runs(self, session_id: str | None = None) -> tuple[Run, ...]:
         try:
             with self._connect() as connection:
                 if session_id is None:
                     rows = connection.execute(
-                        "SELECT task_id FROM tasks ORDER BY updated_at DESC, task_id"
+                        "SELECT run_id FROM runs ORDER BY updated_at DESC, run_id"
                     ).fetchall()
                 else:
                     if connection.execute(
@@ -218,153 +191,58 @@ class SQLiteStateStore:
                         raise SessionNotFoundError(f"Session not found: {session_id}")
                     rows = connection.execute(
                         """
-                        SELECT task_id FROM tasks
+                        SELECT run_id FROM runs
                         WHERE session_id = ? ORDER BY sequence
                         """,
                         (session_id,),
                     ).fetchall()
-                return tuple(self._load_task(connection, str(row["task_id"])) for row in rows)
+                return tuple(self._load_run(connection, str(row["run_id"])) for row in rows)
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def _write_task(
-        self,
-        connection: sqlite3.Connection,
-        task: Task,
-        *,
-        create: bool,
-        updated_at: str,
-        expected_version: int,
-        next_version: int,
-    ) -> None:
-        mutable_values = (
-            task.goal,
-            task.status.value,
-            _dump_json(task.plan),
-            task.final_summary,
-            task.error,
-            task.model_name,
-            task.model_turns,
-            task.max_steps,
-            next_version,
-            task.created_at,
-            updated_at,
-        )
-        if create:
-            connection.execute(
-                """
-                INSERT INTO tasks (
-                    task_id, session_id, sequence, previous_task_id, goal, status,
-                    plan_json, final_summary, error, model_name, model_turns,
-                    max_steps, version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task.task_id,
-                    task.session_id,
-                    task.sequence,
-                    task.previous_task_id,
-                    *mutable_values,
-                ),
-            )
-        else:
-            cursor = connection.execute(
-                """
-                UPDATE tasks SET
-                    goal = ?, status = ?, plan_json = ?, final_summary = ?,
-                    error = ?, model_name = ?, model_turns = ?, max_steps = ?,
-                    version = ?, created_at = ?, updated_at = ?
-                WHERE task_id = ? AND version = ?
-                """,
-                (*mutable_values, task.task_id, expected_version),
-            )
-            if cursor.rowcount != 1:
-                row = connection.execute(
-                    "SELECT version FROM tasks WHERE task_id = ?", (task.task_id,)
-                ).fetchone()
-                if row is None:
-                    raise TaskNotFoundError(f"Task not found: {task.task_id}")
-                raise ConcurrentTaskUpdateError(
-                    f"Task {task.task_id} changed since it was loaded "
-                    f"(expected version {expected_version}, "
-                    f"stored version {int(row['version'])})"
-                )
-
-        connection.execute("DELETE FROM wait_conditions WHERE task_id = ?", (task.task_id,))
-        connection.execute("DELETE FROM work_items WHERE task_id = ?", (task.task_id,))
-        connection.execute("DELETE FROM messages WHERE task_id = ?", (task.task_id,))
-        connection.executemany(
-            "INSERT INTO messages VALUES (?, ?, ?, ?)",
-            (
-                (task.task_id, index, message.role, _dump_json(list(message.content)))
-                for index, message in enumerate(task.messages)
-            ),
-        )
-        connection.executemany(
-            """
-            INSERT INTO work_items (
-                work_id, task_id, position, description, tool_call_id, status
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                (
-                    item.work_id,
-                    task.task_id,
-                    index,
-                    item.description,
-                    item.tool_call_id,
-                    item.status.value,
-                )
-                for index, item in enumerate(task.work_items)
-            ),
-        )
-        connection.executemany(
-            """
-            INSERT INTO wait_conditions (
-                wait_id, task_id, work_id, position, tool_call_id, kind, prompt,
-                status, response_text, created_at, resolved_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                (
-                    wait.wait_id,
-                    task.task_id,
-                    wait.work_id,
-                    index,
-                    wait.tool_call_id,
-                    wait.kind.value,
-                    wait.prompt,
-                    wait.status.value,
-                    wait.response_text,
-                    wait.created_at,
-                    wait.resolved_at,
-                )
-                for index, wait in enumerate(task.waits)
-            ),
-        )
-
-    def _load_task(self, connection: sqlite3.Connection, task_id: str) -> Task:
+    def _load_session(
+        self, connection: sqlite3.Connection, session_id: str
+    ) -> Session:
         row = connection.execute(
-            """
-            SELECT tasks.*, sessions.workspace AS workspace
-            FROM tasks JOIN sessions USING (session_id)
-            WHERE task_id = ?
-            """,
-            (task_id,),
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
         if row is None:
-            raise TaskNotFoundError(f"Task not found: {task_id}")
+            raise SessionNotFoundError(f"Session not found: {session_id}")
         try:
             messages = [
                 ModelMessage(
                     role=message_row["role"],
-                    content=tuple(_load_json(message_row["content_json"], "message content")),
+                    content=tuple(
+                        _load_json(message_row["content_json"], "message content")
+                    ),
+                    run_id=str(message_row["run_id"]),
                 )
                 for message_row in connection.execute(
-                    "SELECT * FROM messages WHERE task_id = ? ORDER BY sequence",
-                    (task_id,),
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY sequence",
+                    (session_id,),
                 )
             ]
+            return Session(
+                session_id=str(row["session_id"]),
+                workspace=Path(row["workspace"]),
+                messages=messages,
+                version=int(row["version"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StorageError(
+                f"Session {session_id} contains invalid persisted state "
+                f"({type(exc).__name__})"
+            ) from None
+
+    def _load_run(self, connection: sqlite3.Connection, run_id: str) -> Run:
+        row = connection.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise RunNotFoundError(f"Run not found: {run_id}")
+        try:
             work_items = [
                 WorkItem(
                     work_id=str(item_row["work_id"]),
@@ -373,8 +251,8 @@ class SQLiteStateStore:
                     status=WorkItemStatus(item_row["status"]),
                 )
                 for item_row in connection.execute(
-                    "SELECT * FROM work_items WHERE task_id = ? ORDER BY position",
-                    (task_id,),
+                    "SELECT * FROM work_items WHERE run_id = ? ORDER BY position",
+                    (run_id,),
                 )
             ]
             waits = [
@@ -390,23 +268,21 @@ class SQLiteStateStore:
                     resolved_at=wait_row["resolved_at"],
                 )
                 for wait_row in connection.execute(
-                    "SELECT * FROM wait_conditions WHERE task_id = ? ORDER BY position",
-                    (task_id,),
+                    "SELECT * FROM wait_conditions WHERE run_id = ? ORDER BY position",
+                    (run_id,),
                 )
             ]
-            plan = _load_json(row["plan_json"], "task plan")
+            plan = _load_json(row["plan_json"], "run plan")
             if not isinstance(plan, list) or any(not isinstance(item, str) for item in plan):
-                raise StorageError(f"Task {task_id} has an invalid stored plan")
-            return Task(
-                task_id=str(row["task_id"]),
+                raise StorageError(f"Run {run_id} has an invalid stored plan")
+            return Run(
+                run_id=str(row["run_id"]),
                 session_id=str(row["session_id"]),
                 sequence=int(row["sequence"]),
-                previous_task_id=row["previous_task_id"],
+                previous_run_id=row["previous_run_id"],
                 goal=str(row["goal"]),
-                workspace=Path(row["workspace"]),
-                status=TaskStatus(row["status"]),
+                status=RunStatus(row["status"]),
                 plan=plan,
-                messages=messages,
                 work_items=work_items,
                 waits=waits,
                 final_summary=row["final_summary"],
@@ -420,8 +296,215 @@ class SQLiteStateStore:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise StorageError(
-                f"Task {task_id} contains invalid persisted state ({type(exc).__name__})"
+                f"Run {run_id} contains invalid persisted state ({type(exc).__name__})"
             ) from None
+
+    def _validate_session_workspace(
+        self, connection: sqlite3.Connection, session: Session
+    ) -> None:
+        row = connection.execute(
+            "SELECT workspace FROM sessions WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()
+        if row is None:
+            raise SessionNotFoundError(f"Session not found: {session.session_id}")
+        if Path(row["workspace"]) != session.workspace:
+            raise StorageError(f"Session {session.session_id} has an invalid workspace")
+
+    def _validate_run_membership(
+        self, connection: sqlite3.Connection, session: Session, run: Run
+    ) -> None:
+        self._validate_session_workspace(connection, session)
+        row = connection.execute(
+            """
+            SELECT session_id, sequence, previous_run_id, goal
+            FROM runs WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+        if row is None:
+            raise RunNotFoundError(f"Run not found: {run.run_id}")
+        membership = (
+            str(row["session_id"]),
+            int(row["sequence"]),
+            row["previous_run_id"],
+            str(row["goal"]),
+        )
+        expected = (run.session_id, run.sequence, run.previous_run_id, run.goal)
+        if membership != expected or run.session_id != session.session_id:
+            raise StorageError(f"Run {run.run_id} has invalid session membership")
+
+    def _insert_run(
+        self, connection: sqlite3.Connection, run: Run, updated_at: str
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO runs (
+                run_id, session_id, sequence, previous_run_id, goal, status,
+                plan_json, final_summary, error, model_name, model_turns,
+                max_steps, version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run.run_id,
+                run.session_id,
+                run.sequence,
+                run.previous_run_id,
+                run.goal,
+                run.status.value,
+                _dump_json(run.plan),
+                run.final_summary,
+                run.error,
+                run.model_name,
+                run.model_turns,
+                run.max_steps,
+                run.version,
+                run.created_at,
+                updated_at,
+            ),
+        )
+
+    def _compare_and_update_session(
+        self,
+        connection: sqlite3.Connection,
+        session: Session,
+        *,
+        expected_version: int,
+        next_version: int,
+        updated_at: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE sessions SET version = ?, updated_at = ?
+            WHERE session_id = ? AND version = ?
+            """,
+            (next_version, updated_at, session.session_id, expected_version),
+        )
+        if cursor.rowcount != 1:
+            row = connection.execute(
+                "SELECT version FROM sessions WHERE session_id = ?",
+                (session.session_id,),
+            ).fetchone()
+            if row is None:
+                raise SessionNotFoundError(f"Session not found: {session.session_id}")
+            raise ConcurrentSessionUpdateError(
+                f"Session {session.session_id} changed since it was loaded "
+                f"(expected version {expected_version}, stored version {int(row['version'])})"
+            )
+
+    def _compare_and_update_run(
+        self,
+        connection: sqlite3.Connection,
+        run: Run,
+        *,
+        expected_version: int,
+        next_version: int,
+        updated_at: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE runs SET
+                status = ?, plan_json = ?, final_summary = ?,
+                error = ?, model_name = ?, model_turns = ?, max_steps = ?,
+                version = ?, created_at = ?, updated_at = ?
+            WHERE run_id = ? AND version = ?
+            """,
+            (
+                run.status.value,
+                _dump_json(run.plan),
+                run.final_summary,
+                run.error,
+                run.model_name,
+                run.model_turns,
+                run.max_steps,
+                next_version,
+                run.created_at,
+                updated_at,
+                run.run_id,
+                expected_version,
+            ),
+        )
+        if cursor.rowcount != 1:
+            row = connection.execute(
+                "SELECT version FROM runs WHERE run_id = ?", (run.run_id,)
+            ).fetchone()
+            if row is None:
+                raise RunNotFoundError(f"Run not found: {run.run_id}")
+            raise ConcurrentRunUpdateError(
+                f"Run {run.run_id} changed since it was loaded "
+                f"(expected version {expected_version}, stored version {int(row['version'])})"
+            )
+
+    def _replace_session_messages(
+        self, connection: sqlite3.Connection, session: Session
+    ) -> None:
+        connection.execute(
+            "DELETE FROM messages WHERE session_id = ?", (session.session_id,)
+        )
+        connection.executemany(
+            """
+            INSERT INTO messages (session_id, sequence, run_id, role, content_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    session.session_id,
+                    index,
+                    message.run_id,
+                    message.role,
+                    _dump_json(list(message.content)),
+                )
+                for index, message in enumerate(session.messages)
+            ),
+        )
+
+    def _replace_run_children(
+        self, connection: sqlite3.Connection, run: Run
+    ) -> None:
+        connection.execute("DELETE FROM wait_conditions WHERE run_id = ?", (run.run_id,))
+        connection.execute("DELETE FROM work_items WHERE run_id = ?", (run.run_id,))
+        connection.executemany(
+            """
+            INSERT INTO work_items (
+                work_id, run_id, position, description, tool_call_id, status
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    item.work_id,
+                    run.run_id,
+                    index,
+                    item.description,
+                    item.tool_call_id,
+                    item.status.value,
+                )
+                for index, item in enumerate(run.work_items)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO wait_conditions (
+                wait_id, run_id, work_id, position, tool_call_id, kind, prompt,
+                status, response_text, created_at, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    wait.wait_id,
+                    run.run_id,
+                    wait.work_id,
+                    index,
+                    wait.tool_call_id,
+                    wait.kind.value,
+                    wait.prompt,
+                    wait.status.value,
+                    wait.response_text,
+                    wait.created_at,
+                    wait.resolved_at,
+                )
+                for index, wait in enumerate(run.waits)
+            ),
+        )
 
 
 def _dump_json(value: Any) -> str:
@@ -436,4 +519,4 @@ def _load_json(value: str, description: str) -> Any:
 
 
 def _storage_error(exc: Exception) -> StorageError:
-    return StorageError(f"SQLite task storage failed ({type(exc).__name__})")
+    return StorageError(f"SQLite state storage failed ({type(exc).__name__})")

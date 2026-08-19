@@ -4,22 +4,14 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from handshake.runtime.state import Task
+from handshake.runtime.state import Run, Session
 
 
-class TaskStore(Protocol):
-    def create_task(self, task: Task) -> None:
-        """Persist a newly started task."""
+class RunStore(Protocol):
+    def create_run(self, session: Session, run: Run) -> None:
+        """Persist a newly started run and its initial session message."""
         ...
 
-    def checkpoint_task(self, task: Task) -> None:
-        """Atomically replace a task snapshot if its version is still current."""
-        ...
-
-    def load_task(self, task_id: str) -> Task:
-        """Load one task and its model protocol history."""
-        ...
-
-    def list_tasks(self, session_id: str | None = None) -> tuple[Task, ...]:
-        """List durable tasks, optionally scoped to one session."""
+    def checkpoint_run(self, session: Session, run: Run) -> None:
+        """Atomically persist session conversation and one run snapshot."""
         ...

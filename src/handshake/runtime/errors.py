@@ -6,7 +6,7 @@ class HandshakeError(Exception):
 
 
 class InvalidStateTransitionError(HandshakeError):
-    """Raised when a task or tool run attempts an invalid transition."""
+    """Raised when a run or tool execution attempts an invalid transition."""
 
 
 class ModelProviderError(HandshakeError):
@@ -26,7 +26,7 @@ class StepLimitExceededError(HandshakeError):
 
 
 class AgentLoopError(HandshakeError):
-    """Raised when the runtime cannot safely continue a task."""
+    """Raised when the runtime cannot safely continue a run."""
 
 
 class UserCancelledError(HandshakeError):
@@ -34,23 +34,23 @@ class UserCancelledError(HandshakeError):
 
 
 class StorageError(HandshakeError):
-    """Raised when durable task state cannot be read or written safely."""
+    """Raised when durable session state cannot be read or written safely."""
 
 
-class TaskNotFoundError(StorageError):
-    """Raised when a requested durable task does not exist."""
+class RunNotFoundError(StorageError):
+    """Raised when a requested durable run does not exist."""
 
 
 class SessionNotFoundError(StorageError):
     """Raised when a requested durable session does not exist."""
 
 
-class ConcurrentTaskUpdateError(StorageError):
-    """Raised when a task snapshot was based on an outdated stored version."""
+class ConcurrentRunUpdateError(StorageError):
+    """Raised when a run snapshot was based on an outdated stored version."""
 
 
 class ConcurrentSessionUpdateError(StorageError):
-    """Raised when a task is appended to an outdated session tail."""
+    """Raised when session conversation was based on an outdated version."""
 
 
 class WaitResolutionError(HandshakeError):

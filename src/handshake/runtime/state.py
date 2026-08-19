@@ -1,4 +1,4 @@
-"""Provider-neutral state for Handshake tasks and stable text waits."""
+"""Runtime execution state for sessions, runs, tools, and waits."""
 
 from __future__ import annotations
 
@@ -6,15 +6,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
+from handshake.models.protocol import ModelMessage
 from handshake.runtime.errors import InvalidStateTransitionError
 
-ContentBlock = dict[str, Any]
 
-
-class TaskStatus(StrEnum):
+class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING = "waiting"
@@ -45,22 +44,22 @@ class WaitStatus(StrEnum):
     SATISFIED = "satisfied"
 
 
-_TASK_TRANSITIONS = {
-    TaskStatus.CREATED: {TaskStatus.RUNNING, TaskStatus.CANCELLED},
-    TaskStatus.RUNNING: {
-        TaskStatus.WAITING,
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
+_RUN_TRANSITIONS = {
+    RunStatus.CREATED: {RunStatus.RUNNING, RunStatus.CANCELLED},
+    RunStatus.RUNNING: {
+        RunStatus.WAITING,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
     },
-    TaskStatus.WAITING: {
-        TaskStatus.RUNNING,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
+    RunStatus.WAITING: {
+        RunStatus.RUNNING,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
     },
-    TaskStatus.COMPLETED: set(),
-    TaskStatus.FAILED: set(),
-    TaskStatus.CANCELLED: set(),
+    RunStatus.COMPLETED: set(),
+    RunStatus.FAILED: set(),
+    RunStatus.CANCELLED: set(),
 }
 
 _WORK_ITEM_TRANSITIONS = {
@@ -88,55 +87,6 @@ _TOOL_RUN_TRANSITIONS = {
 
 
 @dataclass(slots=True, frozen=True)
-class ModelMessage:
-    role: Literal["user", "assistant"]
-    content: tuple[ContentBlock, ...]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"role": self.role, "content": list(self.content)}
-
-
-@dataclass(slots=True, frozen=True)
-class SessionHistoryEntry:
-    sequence: int
-    goal: str
-    status: TaskStatus
-    outcome: str | None
-
-
-@dataclass(slots=True, frozen=True)
-class ModelContext:
-    system_prompt: str
-    goal: str
-    workspace: str
-    plan: tuple[str, ...]
-    messages: tuple[ModelMessage, ...]
-    session_history: tuple[SessionHistoryEntry, ...] = ()
-
-
-@dataclass(slots=True, frozen=True)
-class ToolCall:
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-@dataclass(slots=True, frozen=True)
-class ModelTurn:
-    content: tuple[ContentBlock, ...]
-    tool_calls: tuple[ToolCall, ...] = ()
-    stop_reason: str | None = None
-
-    @property
-    def text(self) -> str:
-        return "\n".join(
-            str(block["text"])
-            for block in self.content
-            if block.get("type") == "text" and block.get("text")
-        ).strip()
-
-
-@dataclass(slots=True, frozen=True)
 class ToolResult:
     ok: bool
     stdout: str = ""
@@ -149,7 +99,7 @@ class ToolRun:
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any]
-    run_id: str = field(default_factory=lambda: str(uuid4()))
+    tool_run_id: str = field(default_factory=lambda: str(uuid4()))
     status: ToolRunStatus = ToolRunStatus.PENDING
     result: ToolResult | None = None
 
@@ -200,20 +150,21 @@ class WaitCondition:
 class Session:
     workspace: Path
     session_id: str = field(default_factory=lambda: str(uuid4()))
+    messages: list[ModelMessage] = field(default_factory=list)
+    version: int = 0
     created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
 
 
 @dataclass(slots=True)
-class Task:
+class Run:
     goal: str
-    workspace: Path
     session_id: str
-    task_id: str = field(default_factory=lambda: str(uuid4()))
+    run_id: str = field(default_factory=lambda: str(uuid4()))
     sequence: int = 1
-    previous_task_id: str | None = None
-    status: TaskStatus = TaskStatus.CREATED
+    previous_run_id: str | None = None
+    status: RunStatus = RunStatus.CREATED
     plan: list[str] = field(default_factory=list)
-    messages: list[ModelMessage] = field(default_factory=list)
     tool_runs: list[ToolRun] = field(default_factory=list)
     work_items: list[WorkItem] = field(default_factory=list)
     waits: list[WaitCondition] = field(default_factory=list)
@@ -226,10 +177,10 @@ class Task:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
-    def transition(self, target: TaskStatus) -> None:
-        if target not in _TASK_TRANSITIONS[self.status]:
+    def transition(self, target: RunStatus) -> None:
+        if target not in _RUN_TRANSITIONS[self.status]:
             raise InvalidStateTransitionError(
-                f"Cannot transition task from {self.status} to {target}"
+                f"Cannot transition run from {self.status} to {target}"
             )
         self.status = target
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from handshake.models.base import ToolDefinition
-from handshake.runtime.state import ToolCall, ToolResult, WaitCondition, WorkItem
+from handshake.models.protocol import ToolCall
+from handshake.runtime.state import ToolResult, WaitCondition, WorkItem
 
 TEXT_WAIT_TOOL = ToolDefinition(
     name="wait_for_text",

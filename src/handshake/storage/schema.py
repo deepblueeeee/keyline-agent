@@ -6,20 +6,22 @@ import sqlite3
 
 from handshake.runtime.errors import StorageError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY,
     workspace TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
-CREATE TABLE tasks (
-    task_id TEXT PRIMARY KEY,
+CREATE TABLE runs (
+    run_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL,
-    previous_task_id TEXT REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    previous_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
     goal TEXT NOT NULL,
     status TEXT NOT NULL,
     plan_json TEXT NOT NULL,
@@ -32,20 +34,24 @@ CREATE TABLE tasks (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (session_id, sequence),
-    UNIQUE (previous_task_id)
+    UNIQUE (previous_run_id),
+    UNIQUE (run_id, session_id)
 );
 
 CREATE TABLE messages (
-    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     sequence INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content_json TEXT NOT NULL,
-    PRIMARY KEY (task_id, sequence)
+    PRIMARY KEY (session_id, sequence),
+    FOREIGN KEY (run_id, session_id) REFERENCES runs(run_id, session_id)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE work_items (
     work_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     description TEXT NOT NULL,
     tool_call_id TEXT NOT NULL,
@@ -54,7 +60,7 @@ CREATE TABLE work_items (
 
 CREATE TABLE wait_conditions (
     wait_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     work_id TEXT NOT NULL REFERENCES work_items(work_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     tool_call_id TEXT NOT NULL,
@@ -66,8 +72,9 @@ CREATE TABLE wait_conditions (
     resolved_at TEXT
 );
 
-CREATE INDEX tasks_session_sequence ON tasks(session_id, sequence);
-CREATE INDEX wait_conditions_task_status ON wait_conditions(task_id, status);
+CREATE INDEX runs_session_sequence ON runs(session_id, sequence);
+CREATE INDEX messages_run ON messages(run_id, sequence);
+CREATE INDEX wait_conditions_run_status ON wait_conditions(run_id, status);
 """
 
 

@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from handshake.models.base import ToolDefinition
+from handshake.models.protocol import ModelContext, ModelTurn
 from handshake.runtime.errors import ModelProviderError
-from handshake.runtime.state import ModelContext, ModelTurn
 
 
 class ScriptedModel:
