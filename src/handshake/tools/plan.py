@@ -9,8 +9,9 @@ from handshake.runtime.state import Run, ToolResult
 PLAN_TOOL = ToolDefinition(
     name="update_plan",
     description=(
-        "Replace the current run's short plan. Use this after initial investigation and when the "
-        "approach materially changes."
+        "Replace the current run's optional short plan. Use this for non-trivial, multi-step work "
+        "after initial investigation, and update it only when the approach materially changes. "
+        "Do not call this tool for simple work that does not benefit from progress tracking."
     ),
     input_schema={
         "type": "object",

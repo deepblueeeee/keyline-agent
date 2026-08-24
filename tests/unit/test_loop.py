@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -127,7 +128,15 @@ def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
 def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path, "too long", max_steps=1)
     model = ScriptedModel(
-        [tool_turn(ToolCall("plan", "update_plan", {"steps": ["continue"]}))]
+        [
+            tool_turn(
+                ToolCall(
+                    "search",
+                    "search_files",
+                    {"query": "missing", "path": "."},
+                )
+            )
+        ]
     )
 
     with pytest.raises(StepLimitExceededError):
@@ -139,6 +148,72 @@ def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
         )
 
     assert run.status is RunStatus.FAILED
+
+
+def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_text("old", encoding="utf-8")
+    session, run = _session_run(tmp_path, "replace one value")
+    model = ScriptedModel(
+        [
+            tool_turn(ToolCall("read", "read_file", {"path": "value.txt"})),
+            tool_turn(
+                ToolCall(
+                    "write",
+                    "write_file",
+                    {"path": "value.txt", "content": "new"},
+                )
+            ),
+            tool_turn(
+                ToolCall(
+                    "test",
+                    "run_tests",
+                    {
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            "assert open('value.txt').read() == 'new'",
+                        ]
+                    },
+                )
+            ),
+            final_turn("updated and verified"),
+        ]
+    )
+
+    start_run(
+        session,
+        run,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+    )
+
+    assert run.status is RunStatus.COMPLETED
+    assert run.plan == []
+    assert (tmp_path / "value.txt").read_text(encoding="utf-8") == "new"
+    assert run.tool_runs[-1].result is not None
+    assert run.tool_runs[-1].result.ok
+
+
+def test_prompt_and_plan_tool_describe_adaptive_planning(tmp_path: Path) -> None:
+    session, run = _session_run(tmp_path, "small request")
+    model = ScriptedModel([final_turn()])
+
+    start_run(
+        session,
+        run,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+    )
+
+    prompt = model.contexts[0].system_prompt
+    assert "Optional current plan:\n(none)" in prompt
+    assert "Investigate enough repository context" in prompt
+    assert "Simple requests may be completed without creating a plan." in prompt
+    assert "Treat the plan as provisional" in prompt
+    assert "Keep a short current plan" not in prompt
+    plan_tool = next(tool for tool in model.tool_sets[0] if tool.name == "update_plan")
+    assert "non-trivial, multi-step work" in plan_tool.description
+    assert "Do not call this tool for simple work" in plan_tool.description
 
 
 def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) -> None:

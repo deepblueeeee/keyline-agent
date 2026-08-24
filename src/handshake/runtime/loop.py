@@ -38,7 +38,7 @@ EmitCallback = Callable[[str], None]
 
 
 def _system_prompt(session: Session, run: Run) -> str:
-    plan = "\n".join(f"- {step}" for step in run.plan) or "(not set yet)"
+    plan = "\n".join(f"- {step}" for step in run.plan) or "(none)"
     return f"""You are Handshake, a local coding agent operating on one workspace.
 
 Current goal:
@@ -47,12 +47,14 @@ Current goal:
 Workspace:
 {session.workspace}
 
-Current plan:
+Optional current plan:
 {plan}
 
 Rules:
-- Investigate the repository before modifying files.
-- Keep a short current plan using update_plan.
+- Investigate enough repository context before choosing an approach or modifying files.
+- Use update_plan for non-trivial, multi-step work when it improves progress tracking.
+- Simple requests may be completed without creating a plan.
+- Treat the plan as provisional and revise it when tool results materially change the approach.
 - All file paths must be relative to the workspace.
 - Make targeted changes and run appropriate validation afterwards.
 - Shell tools require user approval. If denied, adapt instead of pretending they ran.

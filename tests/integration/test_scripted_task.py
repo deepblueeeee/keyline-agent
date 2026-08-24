@@ -31,9 +31,6 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
     replacement = "def add(left: int, right: int) -> int:\n    return left + right\n"
     model = ScriptedModel(
         [
-            _tool_turn(
-                ToolCall("plan", "update_plan", {"steps": ["Inspect", "Edit", "Test"]})
-            ),
             _tool_turn(ToolCall("read", "read_file", {"path": "calculator.py"})),
             _tool_turn(
                 ToolCall(
@@ -41,6 +38,9 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
                     "search_files",
                     {"query": "NotImplementedError", "path": "."},
                 )
+            ),
+            _tool_turn(
+                ToolCall("plan", "update_plan", {"steps": ["Edit", "Test"]})
             ),
             _tool_turn(
                 ToolCall(
@@ -75,3 +75,6 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
     assert run.tool_runs[-1].result is not None
     assert run.tool_runs[-1].result.ok
     assert len(approvals) == 1
+    assert model.contexts[2].plan == ()
+    assert model.contexts[3].plan == ("Edit", "Test")
+    assert run.plan == ["Edit", "Test"]

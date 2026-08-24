@@ -371,13 +371,6 @@ def add(left: int, right: int) -> int:
     return ScriptedModel(
         [
             _tool_turn(
-                ToolCall(
-                    "plan-1",
-                    "update_plan",
-                    {"steps": ["Inspect the stub", "Implement add", "Run tests"]},
-                )
-            ),
-            _tool_turn(
                 ToolCall("read-1", "read_file", {"path": "calculator.py"}),
                 ToolCall(
                     "search-1",
@@ -385,6 +378,13 @@ def add(left: int, right: int) -> int:
                     {"query": "NotImplementedError", "path": "."},
                 ),
                 text="I will inspect the bundled fixture.",
+            ),
+            _tool_turn(
+                ToolCall(
+                    "plan-1",
+                    "update_plan",
+                    {"steps": ["Implement add", "Run tests"]},
+                )
             ),
             _tool_turn(
                 ToolCall(
