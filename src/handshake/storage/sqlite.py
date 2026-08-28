@@ -16,12 +16,12 @@ from handshake.runtime.errors import (
     StorageError,
 )
 from handshake.runtime.state import (
+    Dependency,
+    DependencyKind,
+    DependencyStatus,
     Run,
     RunStatus,
     Session,
-    WaitCondition,
-    WaitKind,
-    WaitStatus,
     WorkItem,
     WorkItemStatus,
     utc_now,
@@ -247,7 +247,6 @@ class SQLiteStateStore:
                 WorkItem(
                     work_id=str(item_row["work_id"]),
                     description=str(item_row["description"]),
-                    tool_call_id=str(item_row["tool_call_id"]),
                     status=WorkItemStatus(item_row["status"]),
                 )
                 for item_row in connection.execute(
@@ -255,20 +254,19 @@ class SQLiteStateStore:
                     (run_id,),
                 )
             ]
-            waits = [
-                WaitCondition(
-                    wait_id=str(wait_row["wait_id"]),
-                    work_id=str(wait_row["work_id"]),
-                    tool_call_id=str(wait_row["tool_call_id"]),
-                    prompt=str(wait_row["prompt"]),
-                    kind=WaitKind(wait_row["kind"]),
-                    status=WaitStatus(wait_row["status"]),
-                    response_text=wait_row["response_text"],
-                    created_at=str(wait_row["created_at"]),
-                    resolved_at=wait_row["resolved_at"],
+            dependencies = [
+                Dependency(
+                    dependency_id=str(dependency_row["dependency_id"]),
+                    work_id=str(dependency_row["work_id"]),
+                    tool_call_id=str(dependency_row["tool_call_id"]),
+                    prompt=str(dependency_row["prompt"]),
+                    kind=DependencyKind(dependency_row["kind"]),
+                    status=DependencyStatus(dependency_row["status"]),
+                    created_at=str(dependency_row["created_at"]),
+                    resolved_at=dependency_row["resolved_at"],
                 )
-                for wait_row in connection.execute(
-                    "SELECT * FROM wait_conditions WHERE run_id = ? ORDER BY position",
+                for dependency_row in connection.execute(
+                    "SELECT * FROM dependencies WHERE run_id = ? ORDER BY position",
                     (run_id,),
                 )
             ]
@@ -284,7 +282,7 @@ class SQLiteStateStore:
                 status=RunStatus(row["status"]),
                 plan=plan,
                 work_items=work_items,
-                waits=waits,
+                dependencies=dependencies,
                 final_summary=row["final_summary"],
                 error=row["error"],
                 model_name=str(row["model_name"]),
@@ -461,13 +459,13 @@ class SQLiteStateStore:
     def _replace_run_children(
         self, connection: sqlite3.Connection, run: Run
     ) -> None:
-        connection.execute("DELETE FROM wait_conditions WHERE run_id = ?", (run.run_id,))
+        connection.execute("DELETE FROM dependencies WHERE run_id = ?", (run.run_id,))
         connection.execute("DELETE FROM work_items WHERE run_id = ?", (run.run_id,))
         connection.executemany(
             """
             INSERT INTO work_items (
-                work_id, run_id, position, description, tool_call_id, status
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                work_id, run_id, position, description, status
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -475,7 +473,6 @@ class SQLiteStateStore:
                     run.run_id,
                     index,
                     item.description,
-                    item.tool_call_id,
                     item.status.value,
                 )
                 for index, item in enumerate(run.work_items)
@@ -483,26 +480,25 @@ class SQLiteStateStore:
         )
         connection.executemany(
             """
-            INSERT INTO wait_conditions (
-                wait_id, run_id, work_id, position, tool_call_id, kind, prompt,
-                status, response_text, created_at, resolved_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dependencies (
+                dependency_id, run_id, work_id, position, tool_call_id, kind,
+                prompt, status, created_at, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
-                    wait.wait_id,
+                    dependency.dependency_id,
                     run.run_id,
-                    wait.work_id,
+                    dependency.work_id,
                     index,
-                    wait.tool_call_id,
-                    wait.kind.value,
-                    wait.prompt,
-                    wait.status.value,
-                    wait.response_text,
-                    wait.created_at,
-                    wait.resolved_at,
+                    dependency.tool_call_id,
+                    dependency.kind.value,
+                    dependency.prompt,
+                    dependency.status.value,
+                    dependency.created_at,
+                    dependency.resolved_at,
                 )
-                for index, wait in enumerate(run.waits)
+                for index, dependency in enumerate(run.dependencies)
             ),
         )
 

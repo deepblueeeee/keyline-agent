@@ -115,6 +115,50 @@ def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
     assert second_messages[-1]["content"][0]["tool_use_id"] == "call-1"
 
 
+def test_adapter_sends_consecutive_user_messages_without_domain_normalization() -> None:
+    client = FakeClient(
+        [
+            {
+                "content": [{"type": "text", "text": "continued"}],
+                "stop_reason": "end_turn",
+            }
+        ]
+    )
+    model = DeepSeekAnthropicModel(api_key="canary", client=client)
+    context = ModelContext(
+        system_prompt="system",
+        goal="goal",
+        workspace="/tmp/work",
+        plan=(),
+        messages=(
+            ModelMessage(
+                "user",
+                (
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "ask-1",
+                        "content": "dependency registered",
+                    },
+                ),
+                run_id="run",
+            ),
+            ModelMessage(
+                "user",
+                ({"type": "text", "text": "User response: navy"},),
+                run_id="run",
+            ),
+        ),
+    )
+
+    model.complete(context, ())
+
+    messages = client.messages.requests[0]["messages"]
+    assert [message["role"] for message in messages] == ["user", "user"]
+    assert messages[0]["content"][0]["tool_use_id"] == "ask-1"
+    assert messages[1]["content"][0]["text"] == "User response: navy"
+    assert all("run_id" not in message for message in messages)
+
+
 def test_provider_error_does_not_leak_api_key() -> None:
     secret = "canary-super-secret"
     client = FakeClient([RuntimeError(secret)])

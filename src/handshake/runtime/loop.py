@@ -17,19 +17,22 @@ from handshake.runtime.errors import (
     UserCancelledError,
 )
 from handshake.runtime.state import (
+    DependencyStatus,
     Run,
     RunStatus,
     Session,
     ToolResult,
     ToolRun,
     ToolRunStatus,
+    WorkItem,
+    WorkItemStatus,
 )
 from handshake.storage.base import RunStore
 from handshake.tools import (
     PLAN_TOOL,
     TEXT_WAIT_TOOL,
     handle_plan,
-    prepare_text_wait,
+    prepare_text_dependency,
     runtime_tool_definitions,
 )
 from handshake.tools.registry import ToolRegistry
@@ -61,6 +64,8 @@ Rules:
 - Ask for a non-sensitive user fact with wait_for_text only when it cannot be inferred from the
   repository. Call wait_for_text by itself in a turn.
 - Never request passwords, API keys, tokens, or other secrets with wait_for_text.
+- A successful wait_for_text result means an input dependency was registered. The user's later
+  answer arrives as a new user continuation message, not as another result for the same tool call.
 - Use tool results as evidence and correct failures when possible.
 - Do not claim a test passed unless its tool result says it passed.
 - When the current request is complete, respond without tool calls with a concise summary of
@@ -88,6 +93,40 @@ def _result_content(result: ToolResult) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _running_work_item(run: Run) -> WorkItem:
+    running = tuple(
+        item for item in run.work_items if item.status is WorkItemStatus.RUNNING
+    )
+    if len(running) != 1:
+        raise AgentLoopError(
+            f"Run {run.run_id} must have exactly one running work item, found {len(running)}"
+        )
+    return running[0]
+
+
+def _is_runnable(run: Run, work_item: WorkItem) -> bool:
+    if work_item.status is not WorkItemStatus.READY:
+        return False
+    return not any(
+        dependency.status is DependencyStatus.OPEN
+        for dependency in run.dependencies_for(work_item)
+    )
+
+
+def _runnable_work_items(run: Run) -> tuple[WorkItem, ...]:
+    return tuple(item for item in run.work_items if _is_runnable(run, item))
+
+
+def _resume_one_work_item(run: Run) -> WorkItem:
+    runnable = _runnable_work_items(run)
+    if len(runnable) != 1:
+        raise AgentLoopError(
+            f"Run {run.run_id} must have exactly one runnable work item, found {len(runnable)}"
+        )
+    runnable[0].transition(WorkItemStatus.RUNNING)
+    return runnable[0]
 
 
 def _validate_turn_tool_calls(
@@ -118,12 +157,14 @@ def _execute_tool_call(
             emit(f"Plan update failed: {result.stderr}")
         return result
 
+    work_item = _running_work_item(run)
     tool_run = ToolRun(
+        work_id=work_item.work_id,
         tool_call_id=call.id,
         tool_name=call.name,
         arguments=dict(call.arguments),
     )
-    run.tool_runs.append(tool_run)
+    run.add_tool_run(work_item, tool_run)
     tool_run.transition(ToolRunStatus.RUNNING)
     emit(f"Running tool: {call.name}")
     try:
@@ -202,18 +243,13 @@ def _checkpoint(session: Session, run: Run, store: RunStore | None) -> None:
         store.checkpoint_run(session, run)
 
 
-def _create_text_wait(
+def _create_text_dependency(
     session: Session,
     run: Run,
     call: ToolCall,
     store: RunStore | None,
     emit: EmitCallback,
 ) -> bool:
-    prepared = prepare_text_wait(call)
-    if isinstance(prepared, ToolResult):
-        _append_tool_results(session, run, (call,), (prepared,))
-        _checkpoint(session, run, store)
-        return False
     if store is None:
         _append_tool_results(
             session,
@@ -228,13 +264,30 @@ def _create_text_wait(
         )
         return False
 
-    work_item, wait = prepared
-    run.work_items.append(work_item)
-    run.waits.append(wait)
-    run.transition(RunStatus.WAITING)
-    store.checkpoint_run(session, run)
-    emit(f"Waiting for text: {wait.prompt}")
-    return True
+    work_item = _running_work_item(run)
+    prepared = prepare_text_dependency(call, work_item)
+    if isinstance(prepared, ToolResult):
+        _append_tool_results(session, run, (call,), (prepared,))
+        _checkpoint(session, run, store)
+        return False
+
+    dependency = prepared
+    run.add_dependency(work_item, dependency)
+    work_item.transition(WorkItemStatus.READY)
+    result = ToolResult(
+        ok=True,
+        stdout=(
+            f"Registered text dependency {dependency.dependency_id} "
+            f"for work item {work_item.work_id}"
+        ),
+    )
+    _append_tool_results(session, run, (call,), (result,))
+
+    if not _runnable_work_items(run) and run.open_dependencies():
+        run.transition(RunStatus.WAITING)
+    _checkpoint(session, run, store)
+    emit(f"Waiting for text: {dependency.prompt}")
+    return run.status is RunStatus.WAITING
 
 
 def _run_turns(
@@ -278,7 +331,7 @@ def _run_turns(
                 emit("Rejected tool turn: wait_for_text must be called alone")
                 continue
             if wait_calls:
-                if _create_text_wait(session, run, wait_calls[0], store, emit):
+                if _create_text_dependency(session, run, wait_calls[0], store, emit):
                     return run
                 continue
 
@@ -291,6 +344,7 @@ def _run_turns(
 
         if turn.stop_reason == "end_turn" and turn.text:
             run.final_summary = turn.text
+            _running_work_item(run).transition(WorkItemStatus.COMPLETED)
             run.transition(RunStatus.COMPLETED)
             _checkpoint(session, run, store)
             emit("Run completed")
@@ -325,22 +379,31 @@ def _run_with_failure_handling(
         return _run_turns(session, run, model, registry, emit, store)
     except UserCancelledError as exc:
         run.error = str(exc)
+        _fail_running_work_items(run)
         if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
             run.transition(RunStatus.CANCELLED)
         _safe_checkpoint(session, run, store)
         raise
     except HandshakeError as exc:
         run.error = str(exc)
+        _fail_running_work_items(run)
         if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
             run.transition(RunStatus.FAILED)
         _safe_checkpoint(session, run, store)
         raise
     except Exception as exc:
         run.error = f"Unexpected runtime failure ({type(exc).__name__})"
+        _fail_running_work_items(run)
         if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
             run.transition(RunStatus.FAILED)
         _safe_checkpoint(session, run, store)
         raise AgentLoopError(run.error) from None
+
+
+def _fail_running_work_items(run: Run) -> None:
+    for work_item in run.work_items:
+        if work_item.status is WorkItemStatus.RUNNING:
+            work_item.transition(WorkItemStatus.FAILED)
 
 
 def start_run(
@@ -365,6 +428,7 @@ def start_run(
     output = emit or (lambda _message: None)
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
+    _resume_one_work_item(run)
     session.messages.append(
         ModelMessage(
             role="user",
@@ -394,5 +458,6 @@ def continue_run(
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
     if not any(message.run_id == run.run_id for message in session.messages):
         raise AgentLoopError("A resumed run must have model protocol history")
+    _resume_one_work_item(run)
     output = emit or (lambda _message: None)
     return _run_with_failure_handling(session, run, model, registry, output, store)

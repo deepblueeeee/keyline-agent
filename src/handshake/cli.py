@@ -16,6 +16,7 @@ from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
+from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import HandshakeError, UserCancelledError
 from handshake.runtime.loop import continue_run, start_run
 from handshake.runtime.runs import (
@@ -24,12 +25,11 @@ from handshake.runtime.runs import (
     latest_run,
 )
 from handshake.runtime.state import (
+    Dependency,
     Run,
     RunStatus,
     Session,
-    WaitCondition,
 )
-from handshake.runtime.waits import resolve_text_wait
 from handshake.storage import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.registry import ToolRegistry
@@ -71,27 +71,28 @@ def _create_real_model(model_name: str) -> ModelAdapter:
     return model
 
 
-def _single_open_wait(run: Run) -> WaitCondition:
-    waits = run.open_waits()
-    if len(waits) != 1:
+def _single_open_dependency(run: Run) -> Dependency:
+    dependencies = run.open_dependencies()
+    if len(dependencies) != 1:
         raise HandshakeError(
-            f"Run {run.run_id} must have exactly one open text wait, found {len(waits)}"
+            f"Run {run.run_id} must have exactly one open text dependency, "
+            f"found {len(dependencies)}"
         )
-    return waits[0]
+    return dependencies[0]
 
 
 def _resume_command(session: Session) -> str:
     return f"handshake resume {session.session_id}"
 
 
-def _read_wait_response(
-    session: Session, run: Run, wait: WaitCondition
+def _read_dependency_response(
+    session: Session, run: Run, dependency: Dependency
 ) -> str | None:
     print("\nInput required")
     print(f"  session:  {session.session_id}")
     print(f"  run:      {run.run_id}")
-    print(f"  wait:     {wait.wait_id}")
-    print(f"  question: {wait.prompt}")
+    print(f"  dependency: {dependency.dependency_id}")
+    print(f"  question:   {dependency.prompt}")
     if not sys.stdin.isatty():
         print("Run remains waiting because stdin is not interactive.")
         print(f"Resume with: {_resume_command(session)}")
@@ -121,14 +122,16 @@ def _drive_run(
     store: SQLiteStateStore,
 ) -> tuple[int, Run]:
     while run.status is RunStatus.WAITING:
-        wait = _single_open_wait(run)
-        response = _read_wait_response(session, run, wait)
+        dependency = _single_open_dependency(run)
+        response = _read_dependency_response(session, run, dependency)
         if response is None:
             return _WAITING_EXIT_CODE, run
         if not response.strip():
             print("Response must not be empty; the run is still waiting.")
             continue
-        resolve_text_wait(session, run, wait.wait_id, response)
+        resolve_text_dependency(
+            session, run, dependency.dependency_id, response
+        )
         store.checkpoint_run(session, run)
         print("Input received; resuming run")
         run = continue_run(
@@ -308,8 +311,11 @@ def _inspect_session(args: argparse.Namespace) -> int:
             f"  - #{run.sequence} {run.run_id} [{run.status.value}] "
             f"{run.model_turns}/{run.max_steps} {goal}"
         )
-        for wait in run.open_waits():
-            print(f"      wait {wait.wait_id} [{wait.kind.value}] {wait.prompt}")
+        for dependency in run.open_dependencies():
+            print(
+                f"      dependency {dependency.dependency_id} "
+                f"[{dependency.kind.value}] {dependency.prompt}"
+            )
     return 0
 
 
@@ -333,10 +339,20 @@ def _inspect_run(args: argparse.Namespace) -> int:
             print(f"  - {step}")
     else:
         print("  (not set)")
-    print("Waits:")
-    if run.waits:
-        for wait in run.waits:
-            print(f"  - {wait.wait_id} [{wait.kind.value}/{wait.status.value}] {wait.prompt}")
+    print("Work items:")
+    for work_item in run.work_items:
+        print(
+            f"  - {work_item.work_id} [{work_item.status.value}] "
+            f"{work_item.description}"
+        )
+    print("Dependencies:")
+    if run.dependencies:
+        for dependency in run.dependencies:
+            print(
+                f"  - {dependency.dependency_id} "
+                f"[{dependency.kind.value}/{dependency.status.value}] "
+                f"{dependency.prompt}"
+            )
     else:
         print("  (none)")
     if run.error:

@@ -5,7 +5,7 @@ import pytest
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.errors import AgentLoopError, ConcurrentSessionUpdateError
 from handshake.runtime.runs import create_followup_run, create_initial_run
-from handshake.runtime.state import Run, RunStatus, Session
+from handshake.runtime.state import Run, RunStatus, Session, WorkItemStatus
 from handshake.storage.sqlite import SQLiteStateStore
 
 
@@ -17,6 +17,7 @@ def _completed_initial_run(session: Session) -> Run:
         max_steps=17,
     )
     run.transition(RunStatus.RUNNING)
+    run.work_items[0].transition(WorkItemStatus.RUNNING)
     session.messages.extend(
         [
             ModelMessage(
@@ -32,6 +33,7 @@ def _completed_initial_run(session: Session) -> Run:
         ]
     )
     run.final_summary = "first result"
+    run.work_items[0].transition(WorkItemStatus.COMPLETED)
     run.transition(RunStatus.COMPLETED)
     return run
 
@@ -63,6 +65,7 @@ def test_active_run_blocks_followup(tmp_path: Path) -> None:
         max_steps=50,
     )
     active.transition(RunStatus.RUNNING)
+    active.work_items[0].transition(WorkItemStatus.RUNNING)
 
     with pytest.raises(AgentLoopError, match="already has an active run"):
         create_followup_run(session, [active], "must wait")
@@ -80,7 +83,9 @@ def test_failed_or_cancelled_run_allows_followup(
         max_steps=50,
     )
     run.transition(RunStatus.RUNNING)
+    run.work_items[0].transition(WorkItemStatus.RUNNING)
     run.error = "stopped"
+    run.work_items[0].transition(WorkItemStatus.FAILED)
     run.transition(status)
 
     followup = create_followup_run(session, [run], "try another approach")
@@ -103,6 +108,7 @@ def test_concurrent_followup_append_rejects_stale_session(tmp_path: Path) -> Non
     candidate_b = create_followup_run(session_b, [first_snapshot], "candidate B")
     for candidate, snapshot in ((candidate_a, session_a), (candidate_b, session_b)):
         candidate.transition(RunStatus.RUNNING)
+        candidate.work_items[0].transition(WorkItemStatus.RUNNING)
         snapshot.messages.append(
             ModelMessage(
                 role="user",

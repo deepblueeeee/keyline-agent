@@ -5,7 +5,7 @@ from handshake.tools.files import file_tool_bindings
 from handshake.tools.plan import PLAN_TOOL, handle_plan
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.shell import ApprovalCallback, process_tool_bindings
-from handshake.tools.text_wait import TEXT_WAIT_TOOL, prepare_text_wait
+from handshake.tools.text_wait import TEXT_WAIT_TOOL, prepare_text_dependency
 
 
 def create_default_registry(approval: ApprovalCallback) -> ToolRegistry:
@@ -29,6 +29,6 @@ __all__ = [
     "ToolRegistry",
     "create_default_registry",
     "handle_plan",
-    "prepare_text_wait",
+    "prepare_text_dependency",
     "runtime_tool_definitions",
 ]

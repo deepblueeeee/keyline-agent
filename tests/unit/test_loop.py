@@ -5,6 +5,7 @@ import pytest
 
 from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
+from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import (
     ModelProtocolError,
     ModelProviderError,
@@ -13,8 +14,13 @@ from handshake.runtime.errors import (
 )
 from handshake.runtime.loop import continue_run, start_run
 from handshake.runtime.runs import create_followup_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.runtime.waits import resolve_text_wait
+from handshake.runtime.state import (
+    DependencyStatus,
+    Run,
+    RunStatus,
+    Session,
+    WorkItemStatus,
+)
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 
@@ -73,6 +79,10 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
         "read_file",
         "write_file",
     ]
+    assert {tool_run.work_id for tool_run in run.tool_runs} == {
+        run.work_items[0].work_id
+    }
+    assert run.work_items[0].status is WorkItemStatus.COMPLETED
     tool_results = model.contexts[1].messages[-1].content
     assert [block["tool_use_id"] for block in tool_results] == ["read", "write"]
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new"
@@ -309,7 +319,7 @@ def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -
     assert messages[3].content[0]["text"] == "first complete"
 
 
-def test_text_wait_round_trips_thinking_and_original_call_id(tmp_path: Path) -> None:
+def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) -> None:
     wait_turn = ModelTurn(
         content=(
             {"type": "thinking", "thinking": "The repository cannot answer this."},
@@ -343,16 +353,23 @@ def test_text_wait_round_trips_thinking_and_original_call_id(tmp_path: Path) -> 
     )
 
     assert run.status is RunStatus.WAITING
+    assert run.work_items[0].status is WorkItemStatus.READY
+    assert run.dependencies[0].status is DependencyStatus.OPEN
+    immediate_result = session.messages[-1].content[0]
+    assert immediate_result["type"] == "tool_result"
+    assert immediate_result["tool_use_id"] == "ask-color"
+    assert immediate_result["is_error"] is False
+    assert run.dependencies[0].dependency_id in immediate_result["content"]
     wait_tool = next(tool for tool in first_model.tool_sets[0] if tool.name == "wait_for_text")
     assert wait_tool.input_schema["required"] == ["prompt"]
     assert "API keys" in wait_tool.description
 
     resumed_session = store.load_session(session.session_id)
     resumed_run = store.load_run(run.run_id)
-    resolve_text_wait(
+    resolve_text_dependency(
         resumed_session,
         resumed_run,
-        resumed_run.waits[0].wait_id,
+        resumed_run.dependencies[0].dependency_id,
         "navy",
     )
     store.checkpoint_run(resumed_session, resumed_run)
@@ -366,11 +383,21 @@ def test_text_wait_round_trips_thinking_and_original_call_id(tmp_path: Path) -> 
     )
 
     context = second_model.contexts[0]
-    assert context.messages[-2].content[0]["thinking"] == (
+    assert context.messages[-3].content[0]["thinking"] == (
         "The repository cannot answer this."
     )
-    assert context.messages[-1].content[0]["tool_use_id"] == "ask-color"
+    assert context.messages[-2].content[0]["tool_use_id"] == "ask-color"
+    continuation = context.messages[-1].content[0]
+    assert continuation["type"] == "text"
+    assert "navy" in continuation["text"]
+    assert resumed_run.dependencies[0].dependency_id in continuation["text"]
+    assert sum(
+        block.get("tool_use_id") == "ask-color"
+        for message in context.messages
+        for block in message.content
+    ) == 1
     assert resumed_run.status is RunStatus.COMPLETED
+    assert resumed_run.work_items[0].status is WorkItemStatus.COMPLETED
     assert store.load_run(run.run_id).final_summary == "used navy"
 
 
@@ -415,8 +442,11 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
     )
     resumed_session = store.load_session(session.session_id)
     resumed_run = store.load_run(run.run_id)
-    resolve_text_wait(
-        resumed_session, resumed_run, resumed_run.waits[0].wait_id, "A"
+    resolve_text_dependency(
+        resumed_session,
+        resumed_run,
+        resumed_run.dependencies[0].dependency_id,
+        "A",
     )
     store.checkpoint_run(resumed_session, resumed_run)
 

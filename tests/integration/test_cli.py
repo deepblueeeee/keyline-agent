@@ -7,7 +7,7 @@ import pytest
 
 import handshake.cli as cli
 from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
-from handshake.runtime.state import RunStatus
+from handshake.runtime.state import DependencyStatus, RunStatus
 from handshake.storage.sqlite import SQLiteStateStore
 
 
@@ -23,7 +23,7 @@ class _WaitThenFinishModel:
     def complete(self, context: ModelContext, tools: tuple[Any, ...]) -> ModelTurn:
         assert any(tool.name == "wait_for_text" for tool in tools)
         has_answer = any(
-            block.get("type") == "tool_result"
+            block.get("type") == "text" and "User response:" in block.get("text", "")
             for message in context.messages
             for block in message.content
         )
@@ -113,7 +113,9 @@ def test_run_answers_text_wait_and_finishes_in_same_process(
     assert "Applied the user's choice." in captured.out
     assert len(runs) == 1
     assert runs[0].status is RunStatus.COMPLETED
-    assert runs[0].waits[0].response_text == "navy"
+    assert runs[0].dependencies[0].status is DependencyStatus.SATISFIED
+    session = _store(home).load_session(runs[0].session_id)
+    assert "User response: navy" in session.messages[-2].content[0]["text"]
 
 
 def test_wait_survives_noninteractive_exit_interrupt_and_resume(
@@ -155,7 +157,8 @@ def test_wait_survives_noninteractive_exit_interrupt_and_resume(
     resumed = _store(home).load_run(run.run_id)
     resumed_session = _store(home).load_session(session_id)
     assert resumed.status is RunStatus.COMPLETED
-    assert resumed_session.messages[-2].content[0]["tool_use_id"] == "ask-color"
+    assert resumed_session.messages[-3].content[0]["tool_use_id"] == "ask-color"
+    assert "User response: navy" in resumed_session.messages[-2].content[0]["text"]
 
 
 def test_interactive_session_creates_followup_run_with_full_history(

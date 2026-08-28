@@ -1,10 +1,10 @@
-"""Definition and state preparation for the model-facing text wait tool."""
+"""Definition and dependency preparation for the model-facing text wait tool."""
 
 from __future__ import annotations
 
 from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ToolCall
-from handshake.runtime.state import ToolResult, WaitCondition, WorkItem
+from handshake.runtime.state import Dependency, ToolResult, WorkItem
 
 TEXT_WAIT_TOOL = ToolDefinition(
     name="wait_for_text",
@@ -28,16 +28,16 @@ TEXT_WAIT_TOOL = ToolDefinition(
 )
 
 
-def prepare_text_wait(call: ToolCall) -> tuple[WorkItem, WaitCondition] | ToolResult:
-    """Validate one request and bind its wait state to a minimal work item."""
+def prepare_text_dependency(
+    call: ToolCall, work_item: WorkItem
+) -> Dependency | ToolResult:
+    """Validate one request and describe the dependency blocking current work."""
     prompt = call.arguments.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return ToolResult(ok=False, stderr="prompt must be a non-empty string")
     normalized_prompt = prompt.strip()
-    work_item = WorkItem(description=normalized_prompt, tool_call_id=call.id)
-    wait = WaitCondition(
+    return Dependency(
         work_id=work_item.work_id,
         tool_call_id=call.id,
         prompt=normalized_prompt,
     )
-    return work_item, wait

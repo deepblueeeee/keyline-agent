@@ -11,11 +11,11 @@ from handshake.runtime.errors import (
     StorageError,
 )
 from handshake.runtime.state import (
+    Dependency,
     Run,
     RunStatus,
     Session,
-    WaitCondition,
-    WorkItem,
+    WorkItemStatus,
 )
 from handshake.storage.sqlite import SQLiteStateStore
 
@@ -29,6 +29,8 @@ def _waiting_run(session: Session) -> Run:
         model_turns=2,
     )
     run.transition(RunStatus.RUNNING)
+    work = run.work_items[0]
+    work.transition(WorkItemStatus.RUNNING)
     session.messages.extend(
         [
             ModelMessage(
@@ -49,17 +51,29 @@ def _waiting_run(session: Session) -> Run:
                 ),
                 run_id=run.run_id,
             ),
+            ModelMessage(
+                role="user",
+                content=(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "ask-1",
+                        "content": "dependency registered",
+                        "is_error": False,
+                    },
+                ),
+                run_id=run.run_id,
+            ),
         ]
     )
-    work = WorkItem(description="选择颜色", tool_call_id="ask-1")
-    run.work_items.append(work)
-    run.waits.append(
-        WaitCondition(
+    run.add_dependency(
+        work,
+        Dependency(
             work_id=work.work_id,
             tool_call_id="ask-1",
             prompt="发布按钮使用什么颜色？",
-        )
+        ),
     )
+    work.transition(WorkItemStatus.READY)
     run.transition(RunStatus.WAITING)
     return run
 
@@ -82,8 +96,22 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
     assert loaded_run.max_steps == 7
     assert loaded_session.messages[1].content[0]["thinking"] == "需要用户决定"
     assert loaded_session.messages[1].run_id == run.run_id
-    assert loaded_run.waits[0].tool_call_id == "ask-1"
+    assert loaded_run.dependencies[0].tool_call_id == "ask-1"
+    assert loaded_run.work_items[0].status is WorkItemStatus.READY
     assert loaded_run.session_id == session.session_id
+    with sqlite3.connect(database) as connection:
+        dependency_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(dependencies)")
+        }
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "response_text" not in dependency_columns
+    assert "dependencies" in tables
+    assert "wait_conditions" not in tables
 
     with pytest.raises(RunNotFoundError):
         store.load_run("missing")
@@ -92,7 +120,7 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
 def test_incompatible_development_schema_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "handshake.db"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 4")
+        connection.execute("PRAGMA user_version = 5")
 
     with pytest.raises(StorageError, match="incompatible with current development schema"):
         SQLiteStateStore(database)

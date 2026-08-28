@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.runtime.errors import StorageError
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -54,12 +54,11 @@ CREATE TABLE work_items (
     run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     description TEXT NOT NULL,
-    tool_call_id TEXT NOT NULL,
     status TEXT NOT NULL
 );
 
-CREATE TABLE wait_conditions (
-    wait_id TEXT PRIMARY KEY,
+CREATE TABLE dependencies (
+    dependency_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     work_id TEXT NOT NULL REFERENCES work_items(work_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
@@ -67,14 +66,13 @@ CREATE TABLE wait_conditions (
     kind TEXT NOT NULL,
     prompt TEXT NOT NULL,
     status TEXT NOT NULL,
-    response_text TEXT,
     created_at TEXT NOT NULL,
     resolved_at TEXT
 );
 
 CREATE INDEX runs_session_sequence ON runs(session_id, sequence);
 CREATE INDEX messages_run ON messages(run_id, sequence);
-CREATE INDEX wait_conditions_run_status ON wait_conditions(run_id, status);
+CREATE INDEX dependencies_run_status ON dependencies(run_id, status);
 """
 
 
