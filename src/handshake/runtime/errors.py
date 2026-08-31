@@ -55,3 +55,11 @@ class ConcurrentSessionUpdateError(StorageError):
 
 class WaitResolutionError(HandshakeError):
     """Raised when text input cannot satisfy the requested wait condition."""
+
+
+class SecretInputError(HandshakeError):
+    """Raised when Secret input cannot satisfy its requested dependency."""
+
+
+class SecretStoreError(HandshakeError):
+    """Raised when an ephemeral Secret capability cannot perform its operation."""

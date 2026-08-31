@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import re
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -7,7 +12,11 @@ import pytest
 
 import handshake.cli as cli
 from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
-from handshake.runtime.state import DependencyStatus, RunStatus
+from handshake.runtime.state import (
+    DependencyStatus,
+    RunStatus,
+    SecretHandleStatus,
+)
 from handshake.storage.sqlite import SQLiteStateStore
 
 
@@ -62,6 +71,69 @@ class _RecordingFinishModel:
         return ModelTurn(
             content=({"type": "text", "text": self.summary},),
             stop_reason="end_turn",
+        )
+
+
+class _SecretFlagshipModel:
+    def __init__(self, api_url: str) -> None:
+        self.api_url = api_url
+        self.contexts: list[ModelContext] = []
+
+    def complete(self, context: ModelContext, tools: tuple[Any, ...]) -> ModelTurn:
+        self.contexts.append(context)
+        assert any(tool.name == "wait_for_secret" for tool in tools)
+        assert any(tool.name == "run_command_with_secret" for tool in tools)
+        if any(
+            block.get("tool_use_id") == "secure-test"
+            for message in context.messages
+            for block in message.content
+        ):
+            return ModelTurn(
+                content=({"type": "text", "text": "Authenticated test passed."},),
+                stop_reason="end_turn",
+            )
+        continuation = next(
+            (
+                str(block.get("text"))
+                for message in reversed(context.messages)
+                for block in message.content
+                if block.get("type") == "text"
+                and "Secret handle:" in str(block.get("text"))
+            ),
+            None,
+        )
+        if continuation is None:
+            call = ToolCall(
+                "ask-secret",
+                "wait_for_secret",
+                {
+                    "prompt": "Enter the local integration API key",
+                    "purpose": "authenticate the local Mock API test",
+                    "environment_variable": "TEST_API_KEY",
+                },
+            )
+        else:
+            match = re.search(r"Secret handle: (secret_[^\s]+)", continuation)
+            assert match is not None
+            call = ToolCall(
+                "secure-test",
+                "run_command_with_secret",
+                {
+                    "secret_handle": match.group(1),
+                    "argv": [sys.executable, "integration_check.py", self.api_url],
+                },
+            )
+        return ModelTurn(
+            content=(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                },
+            ),
+            tool_calls=(call,),
+            stop_reason="tool_use",
         )
 
 
@@ -195,3 +267,111 @@ def test_interactive_session_creates_followup_run_with_full_history(
     assert messages[1].content[0]["text"] == "first result"
     assert messages[2].content[0]["text"] == "second request"
     assert "Earlier tasks" not in second_model.contexts[0].system_prompt
+
+
+def test_secret_flagship_uses_getpass_secret_command_and_leaks_no_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canary = "flagship-canary-secret-value"
+
+    class MockApiHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            authorized = self.headers.get("Authorization") == f"Bearer {canary}"
+            self.send_response(200 if authorized else 403)
+            self.end_headers()
+            self.wfile.write(b"authorized" if authorized else b"denied")
+
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockApiHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    api_url = f"http://127.0.0.1:{server.server_port}/verify"
+    integration_script = """import os
+import sys
+import urllib.request
+
+request = urllib.request.Request(
+    sys.argv[1],
+    headers={"Authorization": f"Bearer {os.environ['TEST_API_KEY']}"},
+)
+with urllib.request.urlopen(request, timeout=3) as response:
+    print(response.read().decode("utf-8"))
+"""
+    (tmp_path / "integration_check.py").write_text(
+        integration_script, encoding="utf-8"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Handshake", "-c", "user.email=test@example.com", "add", "."],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Handshake",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    home = tmp_path / "state"
+    model = _SecretFlagshipModel(api_url)
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: model)
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: canary)
+
+    def answer(prompt: str) -> str:
+        if "Execute this command once?" in prompt:
+            return "y"
+        return "/exit"
+
+    monkeypatch.setattr("builtins.input", answer)
+    try:
+        exit_code = cli.main(
+            ["run", str(tmp_path), "run the authenticated integration test"]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=3)
+
+    captured = capsys.readouterr()
+    state_store = _store(home)
+    run = state_store.list_runs()[0]
+    session = state_store.load_session(run.session_id)
+    workspace_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in tmp_path.rglob("*")
+        if path.is_file() and ".git" not in path.parts and path != state_store.database_path
+    )
+    git_diff = subprocess.run(
+        ["git", "diff", "--no-ext-diff"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert exit_code == 0
+    assert run.status is RunStatus.COMPLETED
+    assert run.secret_handles[0].status is SecretHandleStatus.CONSUMED
+    assert "Authenticated test passed." in captured.out
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert canary not in repr(model.contexts)
+    assert canary not in repr(session.messages)
+    assert canary.encode() not in state_store.database_path.read_bytes()
+    assert canary not in workspace_text
+    assert canary not in git_diff

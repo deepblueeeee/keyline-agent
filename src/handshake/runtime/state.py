@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from secrets import token_urlsafe
 from typing import Any
 from uuid import uuid4
 
@@ -38,11 +39,20 @@ class WorkItemStatus(StrEnum):
 
 class DependencyKind(StrEnum):
     TEXT = "text"
+    SECRET = "secret"
 
 
 class DependencyStatus(StrEnum):
     OPEN = "open"
     SATISFIED = "satisfied"
+    LOST = "lost"
+
+
+class SecretHandleStatus(StrEnum):
+    REQUESTED = "requested"
+    AVAILABLE = "available"
+    CONSUMED = "consumed"
+    LOST = "lost"
 
 
 _RUN_TRANSITIONS = {
@@ -75,8 +85,22 @@ _WORK_ITEM_TRANSITIONS = {
 }
 
 _DEPENDENCY_TRANSITIONS = {
-    DependencyStatus.OPEN: {DependencyStatus.SATISFIED},
-    DependencyStatus.SATISFIED: set(),
+    DependencyStatus.OPEN: {DependencyStatus.SATISFIED, DependencyStatus.LOST},
+    DependencyStatus.SATISFIED: {DependencyStatus.LOST},
+    DependencyStatus.LOST: set(),
+}
+
+_SECRET_HANDLE_TRANSITIONS = {
+    SecretHandleStatus.REQUESTED: {
+        SecretHandleStatus.AVAILABLE,
+        SecretHandleStatus.LOST,
+    },
+    SecretHandleStatus.AVAILABLE: {
+        SecretHandleStatus.CONSUMED,
+        SecretHandleStatus.LOST,
+    },
+    SecretHandleStatus.CONSUMED: set(),
+    SecretHandleStatus.LOST: set(),
 }
 
 
@@ -152,6 +176,28 @@ class Dependency:
 
 
 @dataclass(slots=True)
+class SecretHandle:
+    dependency_id: str
+    purpose: str
+    consumer: str
+    environment_variable: str
+    secret_handle: str = field(
+        default_factory=lambda: f"secret_{token_urlsafe(24)}"
+    )
+    status: SecretHandleStatus = SecretHandleStatus.REQUESTED
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+    def transition(self, target: SecretHandleStatus) -> None:
+        if target not in _SECRET_HANDLE_TRANSITIONS[self.status]:
+            raise InvalidStateTransitionError(
+                f"Cannot transition secret handle from {self.status} to {target}"
+            )
+        self.status = target
+        self.updated_at = utc_now()
+
+
+@dataclass(slots=True)
 class Session:
     workspace: Path
     session_id: str = field(default_factory=lambda: str(uuid4()))
@@ -173,6 +219,7 @@ class Run:
     tool_runs: list[ToolRun] = field(default_factory=list)
     work_items: list[WorkItem] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
+    secret_handles: list[SecretHandle] = field(default_factory=list)
     final_summary: str | None = None
     error: str | None = None
     model_name: str = ""
@@ -211,6 +258,17 @@ class Run:
             None,
         )
 
+    def secret_handle_by_id(self, secret_handle: str) -> SecretHandle | None:
+        """Return opaque Secret metadata owned by this run, if present."""
+        return next(
+            (
+                handle
+                for handle in self.secret_handles
+                if handle.secret_handle == secret_handle
+            ),
+            None,
+        )
+
     def add_dependency(
         self, work_item: WorkItem, dependency: Dependency
     ) -> None:
@@ -243,6 +301,51 @@ class Run:
                 f"Tool run {tool_run.tool_run_id} already belongs to run {self.run_id}"
             )
         self.tool_runs.append(tool_run)
+
+    def add_secret_handle(
+        self, dependency: Dependency, secret_handle: SecretHandle
+    ) -> None:
+        """Associate opaque Secret metadata with a SECRET dependency."""
+        owned_dependency = self.dependency_by_id(dependency.dependency_id)
+        if owned_dependency is None:
+            raise InvalidStateTransitionError(
+                f"Dependency {dependency.dependency_id} does not belong to run {self.run_id}"
+            )
+        if owned_dependency.kind is not DependencyKind.SECRET:
+            raise InvalidStateTransitionError(
+                f"Dependency {dependency.dependency_id} is not a secret dependency"
+            )
+        if secret_handle.dependency_id != owned_dependency.dependency_id:
+            raise InvalidStateTransitionError(
+                f"Secret handle {secret_handle.secret_handle} is bound to dependency "
+                f"{secret_handle.dependency_id}, not {owned_dependency.dependency_id}"
+            )
+        if self.secret_handle_by_id(secret_handle.secret_handle) is not None:
+            raise InvalidStateTransitionError(
+                f"Secret handle {secret_handle.secret_handle} already belongs to run "
+                f"{self.run_id}"
+            )
+        if self.secret_handle_for(owned_dependency) is not None:
+            raise InvalidStateTransitionError(
+                f"Dependency {owned_dependency.dependency_id} already has a secret handle"
+            )
+        self.secret_handles.append(secret_handle)
+
+    def secret_handle_for(self, dependency: Dependency) -> SecretHandle | None:
+        """Return the opaque Secret metadata associated with a dependency."""
+        owned_dependency = self.dependency_by_id(dependency.dependency_id)
+        if owned_dependency is None:
+            raise InvalidStateTransitionError(
+                f"Dependency {dependency.dependency_id} does not belong to run {self.run_id}"
+            )
+        return next(
+            (
+                handle
+                for handle in self.secret_handles
+                if handle.dependency_id == owned_dependency.dependency_id
+            ),
+            None,
+        )
 
     def dependencies_for(self, work_item: WorkItem) -> tuple[Dependency, ...]:
         """Return dependencies associated with work owned by this run."""

@@ -1,8 +1,9 @@
-"""CLI for durable model runs, text waits, and the scripted demo."""
+"""CLI for durable model runs, routed dependencies, and scripted demos."""
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import shlex
 import shutil
@@ -12,6 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from handshake.config import DeepSeekConfig, handshake_home, read_deepseek_api_key
+from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.models.protocol import ModelTurn, ToolCall
@@ -24,8 +26,13 @@ from handshake.runtime.runs import (
     create_initial_run,
     latest_run,
 )
+from handshake.runtime.secret_dependencies import (
+    reissue_lost_secret_dependencies,
+    resolve_secret_dependency,
+)
 from handshake.runtime.state import (
     Dependency,
+    DependencyKind,
     Run,
     RunStatus,
     Session,
@@ -33,6 +40,7 @@ from handshake.runtime.state import (
 from handshake.storage import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.registry import ToolRegistry
+from handshake.tools.secret_command import SecretCommandRunner
 
 _WAITING_EXIT_CODE = 2
 
@@ -71,11 +79,18 @@ def _create_real_model(model_name: str) -> ModelAdapter:
     return model
 
 
+def _create_secret_capabilities() -> tuple[SecretWriter, SecretCommandRunner]:
+    store = EphemeralSecretStore()
+    return store.writer(), SecretCommandRunner(
+        store.consumer(), _interactive_approval
+    )
+
+
 def _single_open_dependency(run: Run) -> Dependency:
     dependencies = run.open_dependencies()
     if len(dependencies) != 1:
         raise HandshakeError(
-            f"Run {run.run_id} must have exactly one open text dependency, "
+            f"Run {run.run_id} must have exactly one open dependency, "
             f"found {len(dependencies)}"
         )
     return dependencies[0]
@@ -109,6 +124,37 @@ def _read_dependency_response(
         raise UserCancelledError("User interrupted text input") from exc
 
 
+def _read_secret_value(
+    session: Session, run: Run, dependency: Dependency
+) -> str | None:
+    handle = run.secret_handle_for(dependency)
+    if handle is None:
+        raise HandshakeError(
+            f"Secret dependency {dependency.dependency_id} has no handle metadata"
+        )
+    print("\nSecret input required")
+    print(f"  session:    {session.session_id}")
+    print(f"  run:        {run.run_id}")
+    print(f"  dependency: {dependency.dependency_id}")
+    print(f"  request:    {dependency.prompt}")
+    print(f"  purpose:    {handle.purpose}")
+    print(f"  target:     {handle.environment_variable}")
+    if not sys.stdin.isatty():
+        print("Run remains waiting because stdin is not interactive.")
+        print(f"Resume with: {_resume_command(session)}")
+        return None
+    try:
+        return getpass.getpass("Secret (input hidden): ")
+    except EOFError:
+        print("\nRun remains waiting; no Secret was recorded.")
+        print(f"Resume with: {_resume_command(session)}")
+        return None
+    except KeyboardInterrupt as exc:
+        print("\nRun remains waiting; no Secret was recorded.")
+        print(f"Resume with: {_resume_command(session)}")
+        raise UserCancelledError("User interrupted Secret input") from exc
+
+
 def _print_final_summary(run: Run) -> None:
     print("\nFinal summary")
     print(run.final_summary or "(none)")
@@ -120,18 +166,40 @@ def _drive_run(
     model: ModelAdapter,
     registry: ToolRegistry,
     store: SQLiteStateStore,
+    secret_writer: SecretWriter,
+    secret_command_runner: SecretCommandRunner,
 ) -> tuple[int, Run]:
     while run.status is RunStatus.WAITING:
         dependency = _single_open_dependency(run)
-        response = _read_dependency_response(session, run, dependency)
-        if response is None:
-            return _WAITING_EXIT_CODE, run
-        if not response.strip():
-            print("Response must not be empty; the run is still waiting.")
-            continue
-        resolve_text_dependency(
-            session, run, dependency.dependency_id, response
-        )
+        if dependency.kind is DependencyKind.TEXT:
+            response = _read_dependency_response(session, run, dependency)
+            if response is None:
+                return _WAITING_EXIT_CODE, run
+            if not response.strip():
+                print("Response must not be empty; the run is still waiting.")
+                continue
+            resolve_text_dependency(
+                session, run, dependency.dependency_id, response
+            )
+        elif dependency.kind is DependencyKind.SECRET:
+            secret_value = _read_secret_value(session, run, dependency)
+            if secret_value is None:
+                return _WAITING_EXIT_CODE, run
+            if secret_value == "":
+                print("Secret must not be empty; the run is still waiting.")
+                continue
+            resolve_secret_dependency(
+                session,
+                run,
+                dependency.dependency_id,
+                secret_value,
+                secret_writer,
+            )
+            del secret_value
+        else:
+            raise HandshakeError(
+                f"Unsupported dependency kind: {dependency.kind.value}"
+            )
         store.checkpoint_run(session, run)
         print("Input received; resuming run")
         run = continue_run(
@@ -141,6 +209,7 @@ def _drive_run(
             registry,
             emit=print,
             store=store,
+            secret_command_runner=secret_command_runner,
         )
     if run.status is not RunStatus.COMPLETED:
         raise HandshakeError(
@@ -189,6 +258,8 @@ def _process_current_run(
     run: Run,
     registry: ToolRegistry,
     store: SQLiteStateStore,
+    secret_writer: SecretWriter,
+    secret_command_runner: SecretCommandRunner,
     model: ModelAdapter | None = None,
 ) -> tuple[int, Run]:
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
@@ -206,8 +277,17 @@ def _process_current_run(
                 registry,
                 emit=print,
                 store=store,
+                secret_command_runner=secret_command_runner,
             )
-        return _drive_run(session, run, current_model, registry, store)
+        return _drive_run(
+            session,
+            run,
+            current_model,
+            registry,
+            store,
+            secret_writer,
+            secret_command_runner,
+        )
     except UserCancelledError:
         raise
     except HandshakeError as exc:
@@ -225,10 +305,18 @@ def _drive_session(
     run: Run,
     registry: ToolRegistry,
     store: SQLiteStateStore,
+    secret_writer: SecretWriter,
+    secret_command_runner: SecretCommandRunner,
     initial_model: ModelAdapter | None = None,
 ) -> int:
     result_code, run = _process_current_run(
-        session, run, registry, store, initial_model
+        session,
+        run,
+        registry,
+        store,
+        secret_writer,
+        secret_command_runner,
+        initial_model,
     )
     if result_code == _WAITING_EXIT_CODE or not sys.stdin.isatty():
         return result_code
@@ -239,7 +327,14 @@ def _drive_session(
             return 0
         runs = store.list_runs(session.session_id)
         run = create_followup_run(session, runs, goal)
-        result_code, run = _process_current_run(session, run, registry, store)
+        result_code, run = _process_current_run(
+            session,
+            run,
+            registry,
+            store,
+            secret_writer,
+            secret_command_runner,
+        )
         if result_code == _WAITING_EXIT_CODE:
             return result_code
 
@@ -261,7 +356,16 @@ def _run_real(args: argparse.Namespace) -> int:
     store.create_session(session)
     print(f"Session created: {session.session_id}")
     registry = create_default_registry(_interactive_approval)
-    return _drive_session(session, run, registry, store, model)
+    secret_writer, secret_command_runner = _create_secret_capabilities()
+    return _drive_session(
+        session,
+        run,
+        registry,
+        store,
+        secret_writer,
+        secret_command_runner,
+        model,
+    )
 
 
 def _resume_session(args: argparse.Namespace) -> int:
@@ -271,7 +375,18 @@ def _resume_session(args: argparse.Namespace) -> int:
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
     run = latest_run(session, store.list_runs(session.session_id))
     registry = create_default_registry(_interactive_approval)
-    return _drive_session(session, run, registry, store)
+    secret_writer, secret_command_runner = _create_secret_capabilities()
+    if reissue_lost_secret_dependencies(run, secret_command_runner):
+        store.checkpoint_run(session, run)
+        print("A process-local Secret was lost and must be entered again.")
+    return _drive_session(
+        session,
+        run,
+        registry,
+        store,
+        secret_writer,
+        secret_command_runner,
+    )
 
 
 def _list_sessions(_args: argparse.Namespace) -> int:
@@ -352,6 +467,15 @@ def _inspect_run(args: argparse.Namespace) -> int:
                 f"  - {dependency.dependency_id} "
                 f"[{dependency.kind.value}/{dependency.status.value}] "
                 f"{dependency.prompt}"
+            )
+    else:
+        print("  (none)")
+    print("Secret handles:")
+    if run.secret_handles:
+        for handle in run.secret_handles:
+            print(
+                f"  - {handle.secret_handle} [{handle.status.value}] "
+                f"{handle.consumer} → {handle.environment_variable}"
             )
     else:
         print("  (none)")

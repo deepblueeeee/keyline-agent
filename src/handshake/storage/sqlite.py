@@ -21,6 +21,8 @@ from handshake.runtime.state import (
     DependencyStatus,
     Run,
     RunStatus,
+    SecretHandle,
+    SecretHandleStatus,
     Session,
     WorkItem,
     WorkItemStatus,
@@ -270,6 +272,22 @@ class SQLiteStateStore:
                     (run_id,),
                 )
             ]
+            secret_handles = [
+                SecretHandle(
+                    secret_handle=str(handle_row["secret_handle"]),
+                    dependency_id=str(handle_row["dependency_id"]),
+                    purpose=str(handle_row["purpose"]),
+                    consumer=str(handle_row["consumer"]),
+                    environment_variable=str(handle_row["environment_variable"]),
+                    status=SecretHandleStatus(handle_row["status"]),
+                    created_at=str(handle_row["created_at"]),
+                    updated_at=str(handle_row["updated_at"]),
+                )
+                for handle_row in connection.execute(
+                    "SELECT * FROM secret_handles WHERE run_id = ? ORDER BY position",
+                    (run_id,),
+                )
+            ]
             plan = _load_json(row["plan_json"], "run plan")
             if not isinstance(plan, list) or any(not isinstance(item, str) for item in plan):
                 raise StorageError(f"Run {run_id} has an invalid stored plan")
@@ -283,6 +301,7 @@ class SQLiteStateStore:
                 plan=plan,
                 work_items=work_items,
                 dependencies=dependencies,
+                secret_handles=secret_handles,
                 final_summary=row["final_summary"],
                 error=row["error"],
                 model_name=str(row["model_name"]),
@@ -459,6 +478,7 @@ class SQLiteStateStore:
     def _replace_run_children(
         self, connection: sqlite3.Connection, run: Run
     ) -> None:
+        connection.execute("DELETE FROM secret_handles WHERE run_id = ?", (run.run_id,))
         connection.execute("DELETE FROM dependencies WHERE run_id = ?", (run.run_id,))
         connection.execute("DELETE FROM work_items WHERE run_id = ?", (run.run_id,))
         connection.executemany(
@@ -499,6 +519,29 @@ class SQLiteStateStore:
                     dependency.resolved_at,
                 )
                 for index, dependency in enumerate(run.dependencies)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO secret_handles (
+                secret_handle, run_id, dependency_id, position, purpose,
+                consumer, environment_variable, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    handle.secret_handle,
+                    run.run_id,
+                    handle.dependency_id,
+                    index,
+                    handle.purpose,
+                    handle.consumer,
+                    handle.environment_variable,
+                    handle.status.value,
+                    handle.created_at,
+                    handle.updated_at,
+                )
+                for index, handle in enumerate(run.secret_handles)
             ),
         )
 

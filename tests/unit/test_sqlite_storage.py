@@ -120,7 +120,7 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
 def test_incompatible_development_schema_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "handshake.db"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 5")
+        connection.execute("PRAGMA user_version = 6")
 
     with pytest.raises(StorageError, match="incompatible with current development schema"):
         SQLiteStateStore(database)

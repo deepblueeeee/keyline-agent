@@ -1,4 +1,4 @@
-"""Session-first ReAct loop with durable text waits and resumption."""
+"""Session-first ReAct loop with durable dependencies and resumption."""
 
 from __future__ import annotations
 
@@ -30,12 +30,16 @@ from handshake.runtime.state import (
 from handshake.storage.base import RunStore
 from handshake.tools import (
     PLAN_TOOL,
+    SECRET_COMMAND_TOOL,
+    SECRET_WAIT_TOOL,
     TEXT_WAIT_TOOL,
     handle_plan,
+    prepare_secret_dependency,
     prepare_text_dependency,
     runtime_tool_definitions,
 )
 from handshake.tools.registry import ToolRegistry
+from handshake.tools.secret_command import SecretCommandRunner
 
 EmitCallback = Callable[[str], None]
 
@@ -66,6 +70,10 @@ Rules:
 - Never request passwords, API keys, tokens, or other secrets with wait_for_text.
 - A successful wait_for_text result means an input dependency was registered. The user's later
   answer arrives as a new user continuation message, not as another result for the same tool call.
+- Request a test credential with wait_for_secret, never through normal messages or file tools.
+  Call wait_for_secret by itself. Its successful result provides an opaque handle, not the Secret.
+- Pass that opaque handle only to run_command_with_secret when the requested credential is
+  available. Handles are one-time: request a new one before rerunning a command that started.
 - Use tool results as evidence and correct failures when possible.
 - Do not claim a test passed unless its tool result says it passed.
 - When the current request is complete, respond without tool calls with a concise summary of
@@ -147,6 +155,7 @@ def _execute_tool_call(
     run: Run,
     call: ToolCall,
     registry: ToolRegistry,
+    secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
 ) -> ToolResult:
     if call.name == PLAN_TOOL.name:
@@ -168,7 +177,18 @@ def _execute_tool_call(
     tool_run.transition(ToolRunStatus.RUNNING)
     emit(f"Running tool: {call.name}")
     try:
-        result = registry.execute(call.name, session.workspace, call.arguments)
+        if call.name == SECRET_COMMAND_TOOL.name:
+            if secret_command_runner is None:
+                result = ToolResult(
+                    ok=False,
+                    stderr="Secure test capability is unavailable; no shell fallback was used",
+                )
+            else:
+                result = secret_command_runner.execute(
+                    run, session.workspace, call.arguments
+                )
+        else:
+            result = registry.execute(call.name, session.workspace, call.arguments)
     except Exception as exc:
         tool_run.result = ToolResult(
             ok=False,
@@ -211,13 +231,18 @@ def _execute_tool_calls(
     run: Run,
     calls: tuple[ToolCall, ...],
     registry: ToolRegistry,
+    secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
     store: RunStore | None,
 ) -> tuple[ToolResult, ...]:
     results: list[ToolResult] = []
     for index, call in enumerate(calls):
         try:
-            results.append(_execute_tool_call(session, run, call, registry, emit))
+            results.append(
+                _execute_tool_call(
+                    session, run, call, registry, secret_command_runner, emit
+                )
+            )
         except Exception as exc:
             results.append(
                 ToolResult(
@@ -290,11 +315,62 @@ def _create_text_dependency(
     return run.status is RunStatus.WAITING
 
 
+def _create_secret_dependency(
+    session: Session,
+    run: Run,
+    call: ToolCall,
+    store: RunStore | None,
+    emit: EmitCallback,
+) -> bool:
+    if store is None:
+        _append_tool_results(
+            session,
+            run,
+            (call,),
+            (
+                ToolResult(
+                    ok=False,
+                    stderr="wait_for_secret requires durable session storage",
+                ),
+            ),
+        )
+        return False
+
+    work_item = _running_work_item(run)
+    prepared = prepare_secret_dependency(call, work_item)
+    if isinstance(prepared, ToolResult):
+        _append_tool_results(session, run, (call,), (prepared,))
+        _checkpoint(session, run, store)
+        return False
+
+    dependency, handle = prepared
+    run.add_dependency(work_item, dependency)
+    run.add_secret_handle(dependency, handle)
+    work_item.transition(WorkItemStatus.READY)
+    result = ToolResult(
+        ok=True,
+        stdout=(
+            f"Registered Secret dependency {dependency.dependency_id}\n"
+            f"Secret handle: {handle.secret_handle}\n"
+            f"Consumer: {handle.consumer}\n"
+            f"Environment variable: {handle.environment_variable}"
+        ),
+    )
+    _append_tool_results(session, run, (call,), (result,))
+
+    if not _runnable_work_items(run) and run.open_dependencies():
+        run.transition(RunStatus.WAITING)
+    _checkpoint(session, run, store)
+    emit(f"Waiting for Secret input: {dependency.prompt}")
+    return run.status is RunStatus.WAITING
+
+
 def _run_turns(
     session: Session,
     run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
+    secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
     store: RunStore | None,
 ) -> Run:
@@ -313,13 +389,20 @@ def _run_turns(
         if turn.tool_calls:
             if turn.text:
                 emit(f"Model: {turn.text}")
-            wait_calls = tuple(
-                call for call in turn.tool_calls if call.name == TEXT_WAIT_TOOL.name
+            dependency_calls = tuple(
+                call
+                for call in turn.tool_calls
+                if call.name in {TEXT_WAIT_TOOL.name, SECRET_WAIT_TOOL.name}
             )
-            if wait_calls and (len(wait_calls) != 1 or len(turn.tool_calls) != 1):
+            if dependency_calls and (
+                len(dependency_calls) != 1 or len(turn.tool_calls) != 1
+            ):
                 error = ToolResult(
                     ok=False,
-                    stderr="wait_for_text must be the only tool call in its turn",
+                    stderr=(
+                        "wait_for_text or wait_for_secret must be the only "
+                        "tool call in its turn"
+                    ),
                 )
                 _append_tool_results(
                     session,
@@ -328,15 +411,30 @@ def _run_turns(
                     tuple(error for _call in turn.tool_calls),
                 )
                 _checkpoint(session, run, store)
-                emit("Rejected tool turn: wait_for_text must be called alone")
+                emit("Rejected tool turn: dependency request must be called alone")
                 continue
-            if wait_calls:
-                if _create_text_dependency(session, run, wait_calls[0], store, emit):
+            if dependency_calls:
+                dependency_call = dependency_calls[0]
+                if dependency_call.name == TEXT_WAIT_TOOL.name:
+                    is_waiting = _create_text_dependency(
+                        session, run, dependency_call, store, emit
+                    )
+                else:
+                    is_waiting = _create_secret_dependency(
+                        session, run, dependency_call, store, emit
+                    )
+                if is_waiting:
                     return run
                 continue
 
             results = _execute_tool_calls(
-                session, run, turn.tool_calls, registry, emit, store
+                session,
+                run,
+                turn.tool_calls,
+                registry,
+                secret_command_runner,
+                emit,
+                store,
             )
             _append_tool_results(session, run, turn.tool_calls, results)
             _checkpoint(session, run, store)
@@ -372,11 +470,14 @@ def _run_with_failure_handling(
     run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
+    secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
     store: RunStore | None,
 ) -> Run:
     try:
-        return _run_turns(session, run, model, registry, emit, store)
+        return _run_turns(
+            session, run, model, registry, secret_command_runner, emit, store
+        )
     except UserCancelledError as exc:
         run.error = str(exc)
         _fail_running_work_items(run)
@@ -414,6 +515,7 @@ def start_run(
     *,
     emit: EmitCallback | None = None,
     store: RunStore | None = None,
+    secret_command_runner: SecretCommandRunner | None = None,
 ) -> Run:
     """Start one user-request run and execute until terminal state or a wait."""
     if run.max_steps < 1:
@@ -439,7 +541,9 @@ def start_run(
     if store is not None:
         store.create_run(session, run)
         output(f"Run started: {run.run_id}")
-    return _run_with_failure_handling(session, run, model, registry, output, store)
+    return _run_with_failure_handling(
+        session, run, model, registry, secret_command_runner, output, store
+    )
 
 
 def continue_run(
@@ -450,6 +554,7 @@ def continue_run(
     *,
     emit: EmitCallback | None = None,
     store: RunStore | None = None,
+    secret_command_runner: SecretCommandRunner | None = None,
 ) -> Run:
     """Continue a durable run after its text wait has been satisfied."""
     if run.status is not RunStatus.RUNNING:
@@ -460,4 +565,6 @@ def continue_run(
         raise AgentLoopError("A resumed run must have model protocol history")
     _resume_one_work_item(run)
     output = emit or (lambda _message: None)
-    return _run_with_failure_handling(session, run, model, registry, output, store)
+    return _run_with_failure_handling(
+        session, run, model, registry, secret_command_runner, output, store
+    )

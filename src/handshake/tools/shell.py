@@ -33,7 +33,7 @@ _ALLOWED_ENVIRONMENT_VARIABLES = {
 }
 
 
-def _safe_process_environment() -> dict[str, str]:
+def safe_process_environment() -> dict[str, str]:
     """Return useful non-secret process settings without inheriting credentials."""
     return {
         name: value
@@ -42,7 +42,7 @@ def _safe_process_environment() -> dict[str, str]:
     }
 
 
-def _parse_process_arguments(arguments: Mapping[str, Any]) -> tuple[tuple[str, ...], float]:
+def parse_process_arguments(arguments: Mapping[str, Any]) -> tuple[tuple[str, ...], float]:
     raw_argv = arguments.get("argv")
     if (
         not isinstance(raw_argv, list)
@@ -60,7 +60,7 @@ def _parse_process_arguments(arguments: Mapping[str, Any]) -> tuple[tuple[str, .
     return tuple(raw_argv), float(raw_timeout)
 
 
-def _timeout_stream(value: str | bytes | None) -> str:
+def timeout_stream(value: str | bytes | None) -> str:
     if value is None:
         return ""
     if isinstance(value, bytes):
@@ -72,7 +72,7 @@ def process_tool_handler(
     approval: ApprovalCallback,
 ) -> Callable[[Path, Mapping[str, Any]], ToolResult]:
     def execute(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
-        argv, timeout = _parse_process_arguments(arguments)
+        argv, timeout = parse_process_arguments(arguments)
         cwd = workspace.resolve()
         if not approval(cwd, argv):
             return ToolResult(ok=False, stderr="Execution denied by user")
@@ -85,13 +85,13 @@ def process_tool_handler(
                 timeout=timeout,
                 check=False,
                 shell=False,
-                env=_safe_process_environment(),
+                env=safe_process_environment(),
             )
         except subprocess.TimeoutExpired as exc:
             return ToolResult(
                 ok=False,
-                stdout=_timeout_stream(exc.stdout),
-                stderr=_timeout_stream(exc.stderr) + f"\nCommand timed out after {timeout:g}s",
+                stdout=timeout_stream(exc.stdout),
+                stderr=timeout_stream(exc.stderr) + f"\nCommand timed out after {timeout:g}s",
             )
         except OSError as exc:
             return ToolResult(ok=False, stderr=f"Could not start process: {exc}")

@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.runtime.errors import StorageError
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -70,9 +70,24 @@ CREATE TABLE dependencies (
     resolved_at TEXT
 );
 
+CREATE TABLE secret_handles (
+    secret_handle TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    dependency_id TEXT NOT NULL UNIQUE
+        REFERENCES dependencies(dependency_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    consumer TEXT NOT NULL,
+    environment_variable TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX runs_session_sequence ON runs(session_id, sequence);
 CREATE INDEX messages_run ON messages(run_id, sequence);
 CREATE INDEX dependencies_run_status ON dependencies(run_id, status);
+CREATE INDEX secret_handles_run_status ON secret_handles(run_id, status);
 """
 
 

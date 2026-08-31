@@ -2,6 +2,7 @@ import json
 import sys
 from pathlib import Path
 
+from handshake.inputs import EphemeralSecretStore
 from handshake.runtime.errors import UserCancelledError
 from handshake.tools.shell import process_tool_handler
 
@@ -82,3 +83,34 @@ def test_approval_cancellation_propagates(tmp_path: Path) -> None:
         assert str(exc) == "cancelled"
     else:  # pragma: no cover
         raise AssertionError("Expected cancellation")
+
+
+def test_normal_shell_can_observe_handle_but_cannot_obtain_secret(
+    tmp_path: Path,
+) -> None:
+    canary = "normal-shell-must-not-see-this"
+    handle = "secret_public_opaque_handle"
+    store = EphemeralSecretStore()
+    store.writer().put(handle, canary)
+    handler = process_tool_handler(lambda _cwd, _argv: True)
+
+    result = handler(
+        tmp_path,
+        {
+            "argv": [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; "
+                    "print(sys.argv[1]); "
+                    "print(os.environ.get('TEST_API_KEY'))"
+                ),
+                handle,
+            ]
+        },
+    )
+
+    assert result.ok
+    assert handle in result.stdout
+    assert "None" in result.stdout
+    assert canary not in result.stdout
