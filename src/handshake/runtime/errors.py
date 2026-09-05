@@ -33,26 +33,6 @@ class UserCancelledError(HandshakeError):
     """Raised when the user interrupts an approval prompt."""
 
 
-class StorageError(HandshakeError):
-    """Raised when durable session state cannot be read or written safely."""
-
-
-class RunNotFoundError(StorageError):
-    """Raised when a requested durable run does not exist."""
-
-
-class SessionNotFoundError(StorageError):
-    """Raised when a requested durable session does not exist."""
-
-
-class ConcurrentRunUpdateError(StorageError):
-    """Raised when a run snapshot was based on an outdated stored version."""
-
-
-class ConcurrentSessionUpdateError(StorageError):
-    """Raised when session conversation was based on an outdated version."""
-
-
 class WaitResolutionError(HandshakeError):
     """Raised when text input cannot satisfy the requested wait condition."""
 

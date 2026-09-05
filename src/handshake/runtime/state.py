@@ -202,7 +202,6 @@ class Session:
     workspace: Path
     session_id: str = field(default_factory=lambda: str(uuid4()))
     messages: list[ModelMessage] = field(default_factory=list)
-    version: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -225,7 +224,6 @@ class Run:
     model_name: str = ""
     model_turns: int = 0
     max_steps: int = 50
-    version: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 

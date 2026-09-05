@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import sqlite3
 
-from handshake.runtime.errors import StorageError
+from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY,
     workspace TEXT NOT NULL,
-    version INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -30,7 +29,6 @@ CREATE TABLE runs (
     model_name TEXT NOT NULL,
     model_turns INTEGER NOT NULL,
     max_steps INTEGER NOT NULL,
-    version INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (session_id, sequence),

@@ -3,9 +3,8 @@ from pathlib import Path
 from handshake.inputs import EphemeralSecretStore
 from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
-from handshake.runtime.loop import start_run
+from handshake.runtime.loop import prepare_run_for_resume, start_run
 from handshake.runtime.secret_dependencies import (
-    reissue_lost_secret_dependencies,
     resolve_secret_dependency,
 )
 from handshake.runtime.state import (
@@ -80,8 +79,12 @@ def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> N
         empty_process_store.consumer(), lambda _cwd, _argv: True
     )
 
-    assert reissue_lost_secret_dependencies(resumed_run, runner)
-    state_store.checkpoint_run(resumed_session, resumed_run)
+    assert prepare_run_for_resume(
+        resumed_session,
+        resumed_run,
+        runner,
+        store=state_store,
+    )
 
     assert resumed_run.status is RunStatus.WAITING
     assert resumed_run.dependencies[0].status is DependencyStatus.LOST

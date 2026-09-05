@@ -20,16 +20,13 @@ from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import HandshakeError, UserCancelledError
-from handshake.runtime.loop import continue_run, start_run
+from handshake.runtime.loop import continue_run, prepare_run_for_resume, start_run
 from handshake.runtime.runs import (
     create_followup_run,
     create_initial_run,
     latest_run,
 )
-from handshake.runtime.secret_dependencies import (
-    reissue_lost_secret_dependencies,
-    resolve_secret_dependency,
-)
+from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
     Dependency,
     DependencyKind,
@@ -37,7 +34,7 @@ from handshake.runtime.state import (
     RunStatus,
     Session,
 )
-from handshake.storage import SQLiteStateStore
+from handshake.storage import SQLiteStateStore, StorageError
 from handshake.tools import create_default_registry
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
@@ -200,8 +197,6 @@ def _drive_run(
             raise HandshakeError(
                 f"Unsupported dependency kind: {dependency.kind.value}"
             )
-        store.checkpoint_run(session, run)
-        print("Input received; resuming run")
         run = continue_run(
             session,
             run,
@@ -376,8 +371,12 @@ def _resume_session(args: argparse.Namespace) -> int:
     run = latest_run(session, store.list_runs(session.session_id))
     registry = create_default_registry(_interactive_approval)
     secret_writer, secret_command_runner = _create_secret_capabilities()
-    if reissue_lost_secret_dependencies(run, secret_command_runner):
-        store.checkpoint_run(session, run)
+    if prepare_run_for_resume(
+        session,
+        run,
+        secret_command_runner,
+        store=store,
+    ):
         print("A process-local Secret was lost and must be entered again.")
     return _drive_session(
         session,
@@ -618,7 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UserCancelledError as exc:
         print(f"Cancelled: {exc}", file=sys.stderr)
         return 130
-    except HandshakeError as exc:
+    except (HandshakeError, StorageError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

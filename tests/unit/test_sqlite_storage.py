@@ -4,12 +4,6 @@ from pathlib import Path
 import pytest
 
 from handshake.models.protocol import ModelMessage
-from handshake.runtime.errors import (
-    ConcurrentRunUpdateError,
-    ConcurrentSessionUpdateError,
-    RunNotFoundError,
-    StorageError,
-)
 from handshake.runtime.state import (
     Dependency,
     Run,
@@ -17,6 +11,7 @@ from handshake.runtime.state import (
     Session,
     WorkItemStatus,
 )
+from handshake.storage.errors import RunNotFoundError, StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 
 
@@ -100,6 +95,12 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
     assert loaded_run.work_items[0].status is WorkItemStatus.READY
     assert loaded_run.session_id == session.session_id
     with sqlite3.connect(database) as connection:
+        session_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        run_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(runs)")
+        }
         dependency_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(dependencies)")
         }
@@ -110,6 +111,10 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
             )
         }
     assert "response_text" not in dependency_columns
+    assert "version" not in session_columns
+    assert "version" not in run_columns
+    assert not hasattr(loaded_session, "version")
+    assert not hasattr(loaded_run, "version")
     assert "dependencies" in tables
     assert "wait_conditions" not in tables
 
@@ -120,7 +125,7 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
 def test_incompatible_development_schema_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "handshake.db"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 6")
+        connection.execute("PRAGMA user_version = 7")
 
     with pytest.raises(StorageError, match="incompatible with current development schema"):
         SQLiteStateStore(database)
@@ -140,65 +145,29 @@ def test_environment_api_key_is_not_written_to_database(
     assert secret.encode() not in database.read_bytes()
 
 
-def test_stale_session_checkpoint_cannot_overwrite_conversation(tmp_path: Path) -> None:
+def test_checkpoint_failure_rolls_back_the_complete_snapshot(tmp_path: Path) -> None:
     store = SQLiteStateStore(tmp_path / "handshake.db")
     session = Session(workspace=tmp_path)
     store.create_session(session)
     run = _waiting_run(session)
     store.create_run(session, run)
 
-    current_session = store.load_session(session.session_id)
-    stale_session = store.load_session(session.session_id)
-    current_run = store.load_run(run.run_id)
-    stale_run = store.load_run(run.run_id)
-    current_session.messages.append(
+    loaded_session = store.load_session(session.session_id)
+    loaded_run = store.load_run(run.run_id)
+    original_messages = tuple(loaded_session.messages)
+    loaded_run.plan = ["must roll back"]
+    loaded_session.messages.append(
         ModelMessage(
             role="user",
-            content=({"type": "text", "text": "newer message"},),
-            run_id=run.run_id,
+            content=({"type": "text", "text": "invalid foreign key"},),
+            run_id="missing-run",
         )
     )
-    current_run.plan = ["newer plan"]
-    store.checkpoint_run(current_session, current_run)
+    with pytest.raises(StorageError, match="SQLite state storage failed"):
+        store.checkpoint_run(loaded_session, loaded_run)
 
-    stale_session.messages.append(
-        ModelMessage(
-            role="user",
-            content=({"type": "text", "text": "stale message"},),
-            run_id=run.run_id,
-        )
-    )
-    stale_run.plan = ["stale plan"]
-    with pytest.raises(ConcurrentSessionUpdateError):
-        store.checkpoint_run(stale_session, stale_run)
-
-    persisted_session = store.load_session(session.session_id)
-    persisted_run = store.load_run(run.run_id)
-    assert persisted_run.plan == ["newer plan"]
-    assert persisted_session.messages[-1].content[0]["text"] == "newer message"
-
-
-def test_stale_run_checkpoint_rolls_back_session_version(tmp_path: Path) -> None:
-    store = SQLiteStateStore(tmp_path / "handshake.db")
-    session = Session(workspace=tmp_path)
-    store.create_session(session)
-    run = _waiting_run(session)
-    store.create_run(session, run)
-    stale_run = store.load_run(run.run_id)
-
-    current_session = store.load_session(session.session_id)
-    current_run = store.load_run(run.run_id)
-    current_run.plan = ["current"]
-    store.checkpoint_run(current_session, current_run)
-
-    fresh_session = store.load_session(session.session_id)
-    original_session_version = fresh_session.version
-    stale_run.plan = ["stale"]
-    with pytest.raises(ConcurrentRunUpdateError):
-        store.checkpoint_run(fresh_session, stale_run)
-
-    assert store.load_session(session.session_id).version == original_session_version
-    assert store.load_run(run.run_id).plan == ["current"]
+    assert tuple(store.load_session(session.session_id).messages) == original_messages
+    assert store.load_run(run.run_id).plan == []
 
 
 def test_run_goal_cannot_change_after_creation(tmp_path: Path) -> None:

@@ -21,6 +21,7 @@ from handshake.runtime.state import (
     Session,
     WorkItemStatus,
 )
+from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 
@@ -57,6 +58,35 @@ def _session_run(tmp_path: Path, goal: str, *, max_steps: int = 50) -> tuple[Ses
         max_steps=max_steps,
     )
     return session, run
+
+
+class _RecordingStore:
+    def __init__(self, events: list[str], *, fail_checkpoint: bool = False) -> None:
+        self.events = events
+        self.fail_checkpoint = fail_checkpoint
+        self.snapshots: list[
+            tuple[RunStatus, WorkItemStatus, DependencyStatus | None, int]
+        ] = []
+
+    def create_run(self, session: Session, run: Run) -> None:
+        del session, run
+        self.events.append("create-run")
+
+    def checkpoint_run(self, session: Session, run: Run) -> None:
+        dependency_status = (
+            run.dependencies[-1].status if run.dependencies else None
+        )
+        self.snapshots.append(
+            (
+                run.status,
+                run.work_items[0].status,
+                dependency_status,
+                len(session.messages),
+            )
+        )
+        self.events.append(f"checkpoint:{run.status.value}")
+        if self.fail_checkpoint:
+            raise StorageError("checkpoint unavailable")
 
 
 def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: Path) -> None:
@@ -372,7 +402,6 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         resumed_run.dependencies[0].dependency_id,
         "navy",
     )
-    store.checkpoint_run(resumed_session, resumed_run)
     second_model = ScriptedModel([final_turn("used navy")])
     continue_run(
         resumed_session,
@@ -399,6 +428,73 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
     assert resumed_run.status is RunStatus.COMPLETED
     assert resumed_run.work_items[0].status is WorkItemStatus.COMPLETED
     assert store.load_run(run.run_id).final_summary == "used navy"
+
+
+def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    store = _RecordingStore(events)
+    session, run = _session_run(tmp_path, "choose a color")
+    wait_model = ScriptedModel(
+        [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
+    )
+
+    start_run(
+        session,
+        run,
+        wait_model,
+        create_default_registry(lambda _cwd, _argv: True),
+        emit=events.append,
+        store=store,
+    )
+
+    assert events.index("checkpoint:waiting") < events.index(
+        "Waiting for text: Which color?"
+    )
+    resolve_text_dependency(session, run, run.dependencies[0].dependency_id, "navy")
+    continue_run(
+        session,
+        run,
+        ScriptedModel([final_turn("used navy")]),
+        create_default_registry(lambda _cwd, _argv: True),
+        emit=events.append,
+        store=store,
+    )
+
+    assert store.snapshots == [
+        (RunStatus.WAITING, WorkItemStatus.READY, DependencyStatus.OPEN, 3),
+        (RunStatus.RUNNING, WorkItemStatus.READY, DependencyStatus.SATISFIED, 4),
+        (RunStatus.COMPLETED, WorkItemStatus.COMPLETED, DependencyStatus.SATISFIED, 5),
+    ]
+    assert events.index("checkpoint:running") < events.index(
+        "Input received; resuming run"
+    )
+    assert events.index("checkpoint:completed") < events.index("Run completed")
+
+
+def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -> None:
+    events: list[str] = []
+    store = _RecordingStore(events, fail_checkpoint=True)
+    session, run = _session_run(tmp_path, "choose a color")
+    model = ScriptedModel(
+        [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
+    )
+
+    with pytest.raises(StorageError, match="checkpoint unavailable"):
+        start_run(
+            session,
+            run,
+            model,
+            create_default_registry(lambda _cwd, _argv: True),
+            emit=events.append,
+            store=store,
+        )
+
+    assert run.status is RunStatus.WAITING
+    assert run.work_items[0].status is WorkItemStatus.READY
+    assert run.error is None
+    assert "Waiting for text: Which color?" not in events
 
 
 def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) -> None:
@@ -448,7 +544,6 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
         resumed_run.dependencies[0].dependency_id,
         "A",
     )
-    store.checkpoint_run(resumed_session, resumed_run)
 
     with pytest.raises(StepLimitExceededError):
         continue_run(

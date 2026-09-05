@@ -102,7 +102,6 @@ def test_secret_dependency_and_command_complete_without_model_leak(
     resolve_secret_dependency(
         session, run, dependency.dependency_id, canary, writer
     )
-    state_store.checkpoint_run(session, run)
     assert canary not in repr(session.messages)
     assert canary.encode() not in state_store.database_path.read_bytes()
 

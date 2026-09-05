@@ -8,13 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from handshake.models.protocol import ModelMessage
-from handshake.runtime.errors import (
-    ConcurrentRunUpdateError,
-    ConcurrentSessionUpdateError,
-    RunNotFoundError,
-    SessionNotFoundError,
-    StorageError,
-)
 from handshake.runtime.state import (
     Dependency,
     DependencyKind,
@@ -28,6 +21,7 @@ from handshake.runtime.state import (
     WorkItemStatus,
     utc_now,
 )
+from handshake.storage.errors import RunNotFoundError, SessionNotFoundError, StorageError
 from handshake.storage.schema import initialize_schema
 
 
@@ -59,11 +53,14 @@ class SQLiteStateStore:
                 raise StorageError("A new session cannot contain messages before its first run")
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+                    """
+                    INSERT INTO sessions (
+                        session_id, workspace, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
                     (
                         session.session_id,
                         str(workspace),
-                        session.version,
                         session.created_at,
                         session.updated_at,
                     ),
@@ -103,8 +100,6 @@ class SQLiteStateStore:
         """Atomically append a run and the session transcript containing its prompt."""
         try:
             updated_at = utc_now()
-            expected_session_version = session.version
-            next_session_version = expected_session_version + 1
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 self._validate_session_workspace(connection, session)
@@ -118,21 +113,14 @@ class SQLiteStateStore:
                 tail_id = None if tail is None else str(tail["run_id"])
                 next_sequence = 1 if tail is None else int(tail["sequence"]) + 1
                 if tail_id != run.previous_run_id or run.sequence != next_sequence:
-                    raise ConcurrentSessionUpdateError(
-                        f"Session {session.session_id} changed before run {run.run_id} "
-                        "could be appended"
+                    raise StorageError(
+                        f"Run {run.run_id} is not the next run for session "
+                        f"{session.session_id}"
                     )
                 self._insert_run(connection, run, updated_at)
-                self._compare_and_update_session(
-                    connection,
-                    session,
-                    expected_version=expected_session_version,
-                    next_version=next_session_version,
-                    updated_at=updated_at,
-                )
+                self._update_session(connection, session, updated_at=updated_at)
                 self._replace_session_messages(connection, session)
                 self._replace_run_children(connection, run)
-            session.version = next_session_version
             session.updated_at = updated_at
             run.updated_at = updated_at
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
@@ -141,33 +129,15 @@ class SQLiteStateStore:
     def checkpoint_run(self, session: Session, run: Run) -> None:
         """Atomically checkpoint one run and the conversation it has extended."""
         try:
-            expected_session_version = session.version
-            expected_run_version = run.version
-            next_session_version = expected_session_version + 1
-            next_run_version = expected_run_version + 1
             updated_at = utc_now()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 self._validate_run_membership(connection, session, run)
-                self._compare_and_update_session(
-                    connection,
-                    session,
-                    expected_version=expected_session_version,
-                    next_version=next_session_version,
-                    updated_at=updated_at,
-                )
-                self._compare_and_update_run(
-                    connection,
-                    run,
-                    expected_version=expected_run_version,
-                    next_version=next_run_version,
-                    updated_at=updated_at,
-                )
+                self._update_session(connection, session, updated_at=updated_at)
+                self._update_run(connection, run, updated_at=updated_at)
                 self._replace_session_messages(connection, session)
                 self._replace_run_children(connection, run)
-            session.version = next_session_version
             session.updated_at = updated_at
-            run.version = next_run_version
             run.updated_at = updated_at
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
@@ -228,7 +198,6 @@ class SQLiteStateStore:
                 session_id=str(row["session_id"]),
                 workspace=Path(row["workspace"]),
                 messages=messages,
-                version=int(row["version"]),
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
             )
@@ -307,7 +276,6 @@ class SQLiteStateStore:
                 model_name=str(row["model_name"]),
                 model_turns=int(row["model_turns"]),
                 max_steps=int(row["max_steps"]),
-                version=int(row["version"]),
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
             )
@@ -359,8 +327,8 @@ class SQLiteStateStore:
             INSERT INTO runs (
                 run_id, session_id, sequence, previous_run_id, goal, status,
                 plan_json, final_summary, error, model_name, model_turns,
-                max_steps, version, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_steps, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
@@ -375,47 +343,30 @@ class SQLiteStateStore:
                 run.model_name,
                 run.model_turns,
                 run.max_steps,
-                run.version,
                 run.created_at,
                 updated_at,
             ),
         )
 
-    def _compare_and_update_session(
+    def _update_session(
         self,
         connection: sqlite3.Connection,
         session: Session,
         *,
-        expected_version: int,
-        next_version: int,
         updated_at: str,
     ) -> None:
         cursor = connection.execute(
-            """
-            UPDATE sessions SET version = ?, updated_at = ?
-            WHERE session_id = ? AND version = ?
-            """,
-            (next_version, updated_at, session.session_id, expected_version),
+            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            (updated_at, session.session_id),
         )
         if cursor.rowcount != 1:
-            row = connection.execute(
-                "SELECT version FROM sessions WHERE session_id = ?",
-                (session.session_id,),
-            ).fetchone()
-            if row is None:
-                raise SessionNotFoundError(f"Session not found: {session.session_id}")
-            raise ConcurrentSessionUpdateError(
-                f"Session {session.session_id} changed since it was loaded "
-                f"(expected version {expected_version}, stored version {int(row['version'])})"
-            )
+            raise SessionNotFoundError(f"Session not found: {session.session_id}")
 
-    def _compare_and_update_run(
+    def _update_run(
         self,
         connection: sqlite3.Connection,
         run: Run,
         *,
-        expected_version: int,
-        next_version: int,
         updated_at: str,
     ) -> None:
         cursor = connection.execute(
@@ -423,8 +374,8 @@ class SQLiteStateStore:
             UPDATE runs SET
                 status = ?, plan_json = ?, final_summary = ?,
                 error = ?, model_name = ?, model_turns = ?, max_steps = ?,
-                version = ?, created_at = ?, updated_at = ?
-            WHERE run_id = ? AND version = ?
+                updated_at = ?
+            WHERE run_id = ?
             """,
             (
                 run.status.value,
@@ -434,23 +385,12 @@ class SQLiteStateStore:
                 run.model_name,
                 run.model_turns,
                 run.max_steps,
-                next_version,
-                run.created_at,
                 updated_at,
                 run.run_id,
-                expected_version,
             ),
         )
         if cursor.rowcount != 1:
-            row = connection.execute(
-                "SELECT version FROM runs WHERE run_id = ?", (run.run_id,)
-            ).fetchone()
-            if row is None:
-                raise RunNotFoundError(f"Run not found: {run.run_id}")
-            raise ConcurrentRunUpdateError(
-                f"Run {run.run_id} changed since it was loaded "
-                f"(expected version {expected_version}, stored version {int(row['version'])})"
-            )
+            raise RunNotFoundError(f"Run not found: {run.run_id}")
 
     def _replace_session_messages(
         self, connection: sqlite3.Connection, session: Session

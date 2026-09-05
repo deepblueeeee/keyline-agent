@@ -3,9 +3,10 @@ from pathlib import Path
 import pytest
 
 from handshake.models.protocol import ModelMessage
-from handshake.runtime.errors import AgentLoopError, ConcurrentSessionUpdateError
+from handshake.runtime.errors import AgentLoopError
 from handshake.runtime.runs import create_followup_run, create_initial_run
 from handshake.runtime.state import Run, RunStatus, Session, WorkItemStatus
+from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 
 
@@ -94,7 +95,7 @@ def test_failed_or_cancelled_run_allows_followup(
     assert followup.sequence == 2
 
 
-def test_concurrent_followup_append_rejects_stale_session(tmp_path: Path) -> None:
+def test_competing_followup_run_cannot_fork_session_history(tmp_path: Path) -> None:
     store = SQLiteStateStore(tmp_path / "handshake.db")
     session = Session(workspace=tmp_path)
     store.create_session(session)
@@ -119,7 +120,7 @@ def test_concurrent_followup_append_rejects_stale_session(tmp_path: Path) -> Non
 
     store.create_run(session_a, candidate_a)
 
-    with pytest.raises(ConcurrentSessionUpdateError):
+    with pytest.raises(StorageError, match="is not the next run"):
         store.create_run(session_b, candidate_b)
 
     runs = store.list_runs(session.session_id)
