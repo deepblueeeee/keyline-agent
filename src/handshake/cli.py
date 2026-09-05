@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import readline  # noqa: F401  # Enable line editing for interactive input().
 import shlex
 import shutil
 import sys
