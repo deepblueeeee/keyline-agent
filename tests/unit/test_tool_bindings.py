@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 
 from handshake.tools.files import (
+    edit_file,
     file_tool_bindings,
+    list_files,
     read_file,
     search_files,
     write_file,
@@ -16,13 +18,17 @@ def test_file_module_owns_definition_handler_bindings() -> None:
     bindings = file_tool_bindings()
 
     assert [binding.definition.name for binding in bindings] == [
+        "list_files",
         "read_file",
         "search_files",
+        "edit_file",
         "write_file",
     ]
     assert [binding.handler for binding in bindings] == [
+        list_files,
         read_file,
         search_files,
+        edit_file,
         write_file,
     ]
 
@@ -48,5 +54,5 @@ def test_registry_rejects_duplicate_binding_name() -> None:
     registry = ToolRegistry()
     registry.register(binding)
 
-    with pytest.raises(ValueError, match="read_file"):
+    with pytest.raises(ValueError, match=binding.definition.name):
         registry.register(binding)

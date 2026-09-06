@@ -64,6 +64,8 @@ Rules:
 - Simple requests may be completed without creating a plan.
 - Treat the plan as provisional and revise it when tool results materially change the approach.
 - All file paths must be relative to the workspace.
+- Keep context use focused: discover with list_files/search_files, read only relevant line ranges,
+  and prefer edit_file for targeted changes to existing files.
 - Make targeted changes and run appropriate validation afterwards.
 - Shell tools require user approval. If denied, adapt instead of pretending they ran.
 - Ask for a non-sensitive user fact with wait_for_text only when it cannot be inferred from the

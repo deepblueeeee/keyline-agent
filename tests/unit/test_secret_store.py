@@ -52,8 +52,10 @@ def test_normal_tool_registry_has_no_secret_resolution_capability() -> None:
     assert not hasattr(registry, "resolve")
     assert not hasattr(registry, "secret_store")
     assert {tool.name for tool in registry.definitions()} == {
+        "list_files",
         "read_file",
         "search_files",
+        "edit_file",
         "write_file",
         "run_shell",
         "run_tests",

@@ -28,9 +28,15 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
     fixture = Path(__file__).resolve().parents[2] / "examples" / "minimal_task"
     workspace = tmp_path / "workspace"
     shutil.copytree(fixture, workspace)
-    replacement = "def add(left: int, right: int) -> int:\n    return left + right\n"
     model = ScriptedModel(
         [
+            _tool_turn(
+                ToolCall(
+                    "list",
+                    "list_files",
+                    {"pattern": "*.py"},
+                )
+            ),
             _tool_turn(ToolCall("read", "read_file", {"path": "calculator.py"})),
             _tool_turn(
                 ToolCall(
@@ -44,7 +50,13 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
             ),
             _tool_turn(
                 ToolCall(
-                    "write", "write_file", {"path": "calculator.py", "content": replacement}
+                    "edit",
+                    "edit_file",
+                    {
+                        "path": "calculator.py",
+                        "old_text": "    raise NotImplementedError",
+                        "new_text": "    return left + right",
+                    },
                 )
             ),
             _tool_turn(
@@ -75,6 +87,13 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
     assert run.tool_runs[-1].result is not None
     assert run.tool_runs[-1].result.ok
     assert len(approvals) == 1
-    assert model.contexts[2].plan == ()
-    assert model.contexts[3].plan == ("Edit", "Test")
+    assert [tool_run.tool_name for tool_run in run.tool_runs] == [
+        "list_files",
+        "read_file",
+        "search_files",
+        "edit_file",
+        "run_tests",
+    ]
+    assert model.contexts[3].plan == ()
+    assert model.contexts[4].plan == ("Edit", "Test")
     assert run.plan == ["Edit", "Test"]
