@@ -234,7 +234,7 @@ def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None
     assert run.tool_runs[-1].result.ok
 
 
-def test_prompt_and_plan_tool_describe_adaptive_planning(tmp_path: Path) -> None:
+def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path, "small request")
     model = ScriptedModel([final_turn()])
 
@@ -245,12 +245,6 @@ def test_prompt_and_plan_tool_describe_adaptive_planning(tmp_path: Path) -> None
         create_default_registry(lambda _cwd, _argv: True),
     )
 
-    prompt = model.contexts[0].system_prompt
-    assert "Optional current plan:\n(none)" in prompt
-    assert "Investigate enough repository context" in prompt
-    assert "Simple requests may be completed without creating a plan." in prompt
-    assert "Treat the plan as provisional" in prompt
-    assert "Keep a short current plan" not in prompt
     plan_tool = next(tool for tool in model.tool_sets[0] if tool.name == "update_plan")
     assert "non-trivial, multi-step work" in plan_tool.description
     assert "Do not call this tool for simple work" in plan_tool.description

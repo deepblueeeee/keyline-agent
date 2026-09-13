@@ -7,7 +7,8 @@ from collections.abc import Callable
 from typing import Any
 
 from handshake.models.base import ModelAdapter
-from handshake.models.protocol import ModelContext, ModelMessage, ToolCall
+from handshake.models.protocol import ModelMessage, ToolCall
+from handshake.runtime.context import AgentContextManager
 from handshake.runtime.errors import (
     AgentLoopError,
     HandshakeError,
@@ -43,55 +44,6 @@ from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
 
 EmitCallback = Callable[[str], None]
-
-
-def _system_prompt(session: Session, run: Run) -> str:
-    plan = "\n".join(f"- {step}" for step in run.plan) or "(none)"
-    return f"""You are Handshake, a local coding agent operating on one workspace.
-
-Current goal:
-{run.goal}
-
-Workspace:
-{session.workspace}
-
-Optional current plan:
-{plan}
-
-Rules:
-- Investigate enough repository context before choosing an approach or modifying files.
-- Use update_plan for non-trivial, multi-step work when it improves progress tracking.
-- Simple requests may be completed without creating a plan.
-- Treat the plan as provisional and revise it when tool results materially change the approach.
-- All file paths must be relative to the workspace.
-- Keep context use focused: discover with list_files/search_files, read only relevant line ranges,
-  and prefer edit_file for targeted changes to existing files.
-- Make targeted changes and run appropriate validation afterwards.
-- Shell tools require user approval. If denied, adapt instead of pretending they ran.
-- Ask for a non-sensitive user fact with wait_for_text only when it cannot be inferred from the
-  repository. Call wait_for_text by itself in a turn.
-- Never request passwords, API keys, tokens, or other secrets with wait_for_text.
-- A successful wait_for_text result means an input dependency was registered. The user's later
-  answer arrives as a new user continuation message, not as another result for the same tool call.
-- Request a test credential with wait_for_secret, never through normal messages or file tools.
-  Call wait_for_secret by itself. Its successful result provides an opaque handle, not the Secret.
-- Pass that opaque handle only to run_command_with_secret when the requested credential is
-  available. Handles are one-time: request a new one before rerunning a command that started.
-- Use tool results as evidence and correct failures when possible.
-- Do not claim a test passed unless its tool result says it passed.
-- When the current request is complete, respond without tool calls with a concise summary of
-  changes, validation performed, and any unresolved issue.
-"""
-
-
-def _context(session: Session, run: Run) -> ModelContext:
-    return ModelContext(
-        system_prompt=_system_prompt(session, run),
-        goal=run.goal,
-        workspace=str(session.workspace),
-        plan=tuple(run.plan),
-        messages=tuple(session.messages),
-    )
 
 
 def _result_content(result: ToolResult) -> str:
@@ -333,6 +285,7 @@ def _run_turns(
     emit: EmitCallback,
     store: RunStore | None,
 ) -> Run:
+    context_manager = AgentContextManager()
     definitions = (*runtime_tool_definitions(), *registry.definitions())
     while True:
         messages_after_checkpoint: list[str] = []
@@ -343,7 +296,7 @@ def _run_turns(
                     f"Agent exceeded the maximum of {run.max_steps} model turns"
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
-            turn = model.complete(_context(session, run), definitions)
+            turn = model.complete(context_manager.build(session, run), definitions)
             run.model_turns += 1
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
@@ -518,7 +471,13 @@ def start_run(
         store.create_run(session, run)
         output(f"Run started: {run.run_id}")
     return _run_turns(
-        session, run, model, registry, secret_command_runner, output, store
+        session,
+        run,
+        model,
+        registry,
+        secret_command_runner,
+        output,
+        store,
     )
 
 
@@ -560,5 +519,11 @@ def continue_run(
     output("Input received; resuming run")
     _resume_one_work_item(run)
     return _run_turns(
-        session, run, model, registry, secret_command_runner, output, store
+        session,
+        run,
+        model,
+        registry,
+        secret_command_runner,
+        output,
+        store,
     )
