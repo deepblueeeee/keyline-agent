@@ -1,8 +1,19 @@
 from pathlib import Path
 
+import pytest
+
+from handshake.context import (
+    AgentContextManager,
+    ContextView,
+    ContextViewError,
+    HistoryEpisode,
+    RawHistorySegment,
+    RecentContext,
+    SequencedMessage,
+    SourceRange,
+)
 from handshake.models.protocol import ModelMessage
-from handshake.runtime.context import AgentContextManager
-from handshake.runtime.state import Run, Session
+from handshake.runtime.state import Dependency, DependencyKind, Run, Session
 
 
 def _session_run(tmp_path: Path) -> tuple[Session, Run]:
@@ -56,7 +67,189 @@ def test_build_renders_current_plan(tmp_path: Path) -> None:
 
     assert context.plan == ("Inspect the implementation", "Run focused tests")
     assert (
-        "Optional current plan:\n"
-        "- Inspect the implementation\n"
-        "- Run focused tests"
+        "Optional current plan:\n- Inspect the implementation\n- Run focused tests"
     ) in context.system_prompt
+
+
+def test_capture_preserves_exact_state_and_sequences_complete_history(
+    tmp_path: Path,
+) -> None:
+    session, run = _session_run(tmp_path)
+    dependency = Dependency(
+        work_id=run.work_items[0].work_id,
+        tool_call_id="ask",
+        kind=DependencyKind.TEXT,
+        prompt="Which version must remain supported?",
+    )
+    run.add_dependency(run.work_items[0], dependency)
+    run.plan.append("Check compatibility")
+    session.messages.extend(
+        [
+            ModelMessage("user", ({"type": "text", "text": "request"},), "prior"),
+            ModelMessage("assistant", ({"type": "text", "text": "response"},), "prior"),
+        ]
+    )
+    manager = AgentContextManager()
+    view = manager.capture(
+        session,
+        run,
+        constraints=("Preserve the public API",),
+    )
+    run.plan.clear()
+    dependency.prompt = "changed after capture"
+
+    context = manager.render(view)
+
+    assert view.exact.plan == ("Check compatibility",)
+    assert view.exact.dependencies[0].prompt == "Which version must remain supported?"
+    assert view.exact.dependencies[0].dependency_id == dependency.dependency_id
+    assert view.exact.dependencies[0].status == "open"
+    assert view.exact.work_items[0].work_id == run.work_items[0].work_id
+    assert view.history == ()
+    assert view.source_message_count == 2
+    assert tuple(item.sequence for item in view.protected_recent.messages) == (0, 1)
+    assert tuple(item.message for item in view.protected_recent.messages) == tuple(session.messages)
+    assert "Preserve the public API" in context.system_prompt
+    assert dependency.dependency_id in context.system_prompt
+    assert context.messages == tuple(session.messages)
+
+
+def test_capture_and_render_do_not_alias_session_history(tmp_path: Path) -> None:
+    session, run = _session_run(tmp_path)
+    session.messages.append(
+        ModelMessage(
+            "user",
+            ({"type": "text", "text": "important original evidence"},),
+            run.run_id,
+        )
+    )
+    manager = AgentContextManager()
+    view = manager.capture(session, run)
+    context = manager.render(view)
+
+    assert context.messages == tuple(session.messages)
+    context.messages[0].content[0]["text"] = "provider mutation"
+    captured = view.protected_recent.messages[0].message
+    assert captured.content[0]["text"] == "important original evidence"
+    session.messages[0].content[0]["text"] = "later transcript mutation"
+    assert captured.content[0]["text"] == "important original evidence"
+
+
+def test_render_interleaves_raw_history_episode_and_protected_recent(
+    tmp_path: Path,
+) -> None:
+    session, run = _session_run(tmp_path)
+    exact = AgentContextManager().capture(session, run).exact
+    source = tuple(
+        SequencedMessage(
+            sequence,
+            ModelMessage(
+                "user" if sequence % 2 == 0 else "assistant",
+                ({"type": "text", "text": f"message {sequence}"},),
+                "source-run",
+            ),
+        )
+        for sequence in range(5)
+    )
+    view = ContextView(
+        exact=exact,
+        history=(
+            RawHistorySegment(source[:2]),
+            HistoryEpisode(
+                SourceRange(2, 3),
+                "Completed adapter investigation",
+                "Confirmed the fallback is required and its focused tests passed.",
+            ),
+        ),
+        protected_recent=RecentContext(source[4:]),
+        source_message_count=5,
+    )
+
+    context = AgentContextManager().render(view)
+
+    assert [message.content[0]["text"] for message in context.messages] == [
+        "message 0",
+        "message 1",
+        (
+            "[Compacted history episode; source messages 2-3]\n"
+            "Title: Completed adapter investigation\n"
+            "Summary: Confirmed the fallback is required and its focused tests passed."
+        ),
+        "message 4",
+    ]
+    assert context.messages[2].role == "user"
+    assert context.messages[2].run_id == ""
+    context.messages[0].content[0]["text"] = "mutated"
+    assert source[0].message.content[0]["text"] == "message 0"
+
+
+def _invalid_view(tmp_path: Path, case: str) -> ContextView:
+    session, run = _session_run(tmp_path)
+    exact = AgentContextManager().capture(session, run).exact
+
+    def item(sequence: int) -> SequencedMessage:
+        return SequencedMessage(
+            sequence,
+            ModelMessage("user", ({"type": "text", "text": str(sequence)},)),
+        )
+
+    if case == "missing":
+        return ContextView(
+            exact,
+            protected_recent=RecentContext((item(1),)),
+            source_message_count=2,
+        )
+    if case == "overlap":
+        return ContextView(
+            exact,
+            history=(HistoryEpisode(SourceRange(0, 1), "done", "done"),),
+            protected_recent=RecentContext((item(1),)),
+            source_message_count=2,
+        )
+    if case == "out_of_order":
+        return ContextView(
+            exact,
+            history=(
+                HistoryEpisode(SourceRange(1, 1), "later", "later"),
+                HistoryEpisode(SourceRange(0, 0), "earlier", "earlier"),
+            ),
+            source_message_count=2,
+        )
+    if case == "noncontinuous_raw":
+        return ContextView(
+            exact,
+            history=(RawHistorySegment((item(0), item(2))),),
+            source_message_count=3,
+        )
+    if case == "out_of_bounds":
+        return ContextView(
+            exact,
+            history=(HistoryEpisode(SourceRange(0, 2), "too far", "too far"),),
+            source_message_count=2,
+        )
+    if case == "invalid_range":
+        return ContextView(
+            exact,
+            history=(HistoryEpisode(SourceRange(1, 0), "invalid", "invalid"),),
+        )
+    if case == "empty_raw":
+        return ContextView(exact, history=(RawHistorySegment(()),))
+    return ContextView(exact, source_message_count=-1)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing",
+        "overlap",
+        "out_of_order",
+        "noncontinuous_raw",
+        "out_of_bounds",
+        "invalid_range",
+        "empty_raw",
+        "negative_count",
+    ],
+)
+def test_render_rejects_invalid_context_views(tmp_path: Path, case: str) -> None:
+    with pytest.raises(ContextViewError):
+        AgentContextManager().render(_invalid_view(tmp_path, case))

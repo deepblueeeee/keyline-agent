@@ -6,9 +6,9 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from handshake.context import AgentContextManager
 from handshake.models.base import ModelAdapter
 from handshake.models.protocol import ModelMessage, ToolCall
-from handshake.runtime.context import AgentContextManager
 from handshake.runtime.errors import (
     AgentLoopError,
     HandshakeError,
