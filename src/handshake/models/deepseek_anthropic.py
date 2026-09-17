@@ -19,7 +19,7 @@ class DeepSeekAnthropicModel:
         api_key: str,
         base_url: str = "https://api.deepseek.com/anthropic",
         model: str = "deepseek-v4-flash",
-        max_tokens: int = 8192,
+        max_tokens: int = 16_384,
         timeout_seconds: float = 120,
         max_retries: int = 2,
         client: Any | None = None,

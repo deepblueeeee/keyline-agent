@@ -71,6 +71,7 @@ def test_normalizes_thinking_text_and_tool_use() -> None:
     assert turn.content[0]["signature"] == "sig"
     request = client.messages.requests[0]
     assert request["model"] == "deepseek-v4-flash"
+    assert request["max_tokens"] == 16_384
     assert request["system"] == "system"
     assert request["tools"][0]["name"] == "read_file"
     assert "run_id" not in request["messages"][0]

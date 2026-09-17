@@ -1,6 +1,12 @@
 """Model-visible context management."""
 
-from handshake.context.errors import ContextViewError
+from handshake.context.budget import (
+    ContextBudgetPolicy,
+    TokenEstimator,
+    Utf8TokenEstimator,
+    estimate_model_context,
+)
+from handshake.context.errors import ContextPressureError, ContextViewError
 from handshake.context.manager import AgentContextManager
 from handshake.context.state import (
     ContextDependency,
@@ -17,7 +23,9 @@ from handshake.context.state import (
 
 __all__ = [
     "AgentContextManager",
+    "ContextBudgetPolicy",
     "ContextDependency",
+    "ContextPressureError",
     "ContextView",
     "ContextViewError",
     "ContextWorkItem",
@@ -28,4 +36,7 @@ __all__ = [
     "RecentContext",
     "SequencedMessage",
     "SourceRange",
+    "TokenEstimator",
+    "Utf8TokenEstimator",
+    "estimate_model_context",
 ]

@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 
-from handshake.context.errors import ContextViewError
+from handshake.context.budget import (
+    ContextBudgetPolicy,
+    TokenEstimator,
+    Utf8TokenEstimator,
+    compact_json,
+    estimate_model_context,
+)
+from handshake.context.errors import ContextPressureError, ContextViewError
 from handshake.context.state import (
     ContextDependency,
     ContextView,
@@ -19,8 +26,16 @@ from handshake.context.state import (
     SequencedMessage,
     SourceRange,
 )
+from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ModelContext, ModelMessage
 from handshake.runtime.state import Run, Session
+
+
+@dataclass(slots=True)
+class _ContextState:
+    message_count: int = 0
+    recent_start: int = 0
+    messages: list[ModelMessage] = field(default_factory=list)
 
 
 def _system_prompt(exact: ExactContext) -> str:
@@ -65,9 +80,76 @@ Rules:
 class AgentContextManager:
     """Expose the current model-visible view of a Session and Run."""
 
-    def build(self, session: Session, run: Run) -> ModelContext:
-        """Build the current uncompressed model context."""
+    def __init__(
+        self,
+        policy: ContextBudgetPolicy | None = None,
+        estimator: TokenEstimator | None = None,
+    ) -> None:
+        self.policy = policy or ContextBudgetPolicy()
+        self.estimator = estimator or Utf8TokenEstimator()
+        self._states: dict[str, _ContextState] = {}
+
+    def build(
+        self,
+        session: Session,
+        run: Run,
+    ) -> ModelContext:
+        """Render the already-maintained state without triggering compaction."""
         return self.render(self.capture(session, run))
+
+    def prepare(
+        self,
+        session: Session,
+        run: Run,
+        tools: tuple[ToolDefinition, ...],
+    ) -> ModelContext:
+        """Apply context pressure policy and return the next model-visible context."""
+        pressure = self.measure_pressure(session, run, tools)
+        if pressure >= self.policy.pressure_trigger_tokens:
+            while pressure > self.policy.pressure_target_tokens:
+                if not self.mask_oldest_stale_result(session):
+                    break
+                pressure = self.measure_pressure(session, run, tools)
+        self.ensure_below_hard_limit(pressure)
+        return self.build(session, run)
+
+    def ingest_pending(self, session: Session) -> None:
+        """Index externally appended messages at an explicit runtime boundary."""
+        current = self._states.get(session.session_id, _ContextState())
+        if current.message_count > len(session.messages):
+            raise ContextViewError("Context state is ahead of the Session transcript")
+        if current.message_count == len(session.messages):
+            self._states[session.session_id] = current
+            return
+        state = deepcopy(current)
+        for sequence in range(state.message_count, len(session.messages)):
+            message = deepcopy(session.messages[sequence])
+            if message.role == "user":
+                for block in message.content:
+                    if block.get("type") != "tool_result":
+                        continue
+                    call_id = block.get("tool_use_id")
+                    if not isinstance(call_id, str):
+                        continue
+                    content = block.get("content", "")
+                    text = content if isinstance(content, str) else compact_json(content)
+                    replacement = _ingress_content(
+                        sequence,
+                        call_id,
+                        block.get("is_error") is not False,
+                        text,
+                        self.policy,
+                        self.estimator,
+                    )
+                    if replacement is not None:
+                        block["content"] = replacement
+            state.messages.append(message)
+            state.message_count = sequence + 1
+        messages = tuple(
+            SequencedMessage(index, message) for index, message in enumerate(state.messages)
+        )
+        state.recent_start = _recent_start(messages, self.policy, self.estimator)
+        self._states[session.session_id] = state
 
     def capture(
         self,
@@ -76,7 +158,8 @@ class AgentContextManager:
         *,
         constraints: tuple[str, ...] = (),
     ) -> ContextView:
-        """Snapshot authoritative state and keep the full transcript protected."""
+        """Snapshot raw history using the incrementally maintained state."""
+        state = self._synchronized_state(session)
         exact = ExactContext(
             goal=run.goal,
             workspace=str(session.workspace),
@@ -98,15 +181,75 @@ class AgentContextManager:
                 for dependency in run.dependencies
             ),
         )
-        messages = deepcopy(tuple(session.messages))
+        messages = deepcopy(tuple(state.messages))
         recent = tuple(
             SequencedMessage(sequence, message) for sequence, message in enumerate(messages)
         )
+        cutoff = state.recent_start
+        history = (RawHistorySegment(recent[:cutoff]),) if cutoff else ()
         return ContextView(
             exact=exact,
-            protected_recent=RecentContext(recent),
-            source_message_count=len(messages),
+            history=history,
+            protected_recent=RecentContext(recent[cutoff:]),
+            source_message_count=len(session.messages),
         )
+
+    def measure_pressure(
+        self,
+        session: Session,
+        run: Run,
+        tools: tuple[ToolDefinition, ...],
+    ) -> int:
+        """Measure the current view without changing its compaction state."""
+        return estimate_model_context(
+            self.build(session, run),
+            tools,
+            self.estimator,
+        )
+
+    def mask_oldest_stale_result(self, session: Session) -> bool:
+        """Incrementally mask one oldest result outside protected recent context."""
+        state = self._synchronized_state(session)
+        for sequence, message in enumerate(state.messages[: state.recent_start]):
+            if message.role != "user":
+                continue
+            for block in message.content:
+                if block.get("type") != "tool_result":
+                    continue
+                content = block.get("content")
+                if isinstance(content, str) and content.startswith("[stale tool result masked;"):
+                    continue
+                status = "failure" if block.get("is_error") is not False else "success"
+                block["content"] = (
+                    f"[stale tool result masked; status={status}; "
+                    f"source_sequence={sequence}; details omitted from active context]"
+                )
+                return True
+        return False
+
+    def _synchronized_state(self, session: Session) -> _ContextState:
+        state = self._states.get(session.session_id)
+        if state is None:
+            if session.messages:
+                raise ContextViewError(
+                    "Session transcript contains messages that have not passed context ingress"
+                )
+            return _ContextState()
+        if state.message_count != len(session.messages):
+            raise ContextViewError(
+                "Session transcript contains messages that have not passed context ingress"
+            )
+        if not 0 <= state.recent_start <= state.message_count:
+            raise ContextViewError("Context state has an invalid protected recent boundary")
+        return state
+
+    def ensure_below_hard_limit(self, visible_tokens: int) -> None:
+        """Reject a provider request that remains at or above its hard input limit."""
+        if visible_tokens >= self.policy.hard_input_tokens:
+            raise ContextPressureError(
+                "Model input remains above the hard context limit after masking all "
+                "eligible stale tool results"
+            )
 
     def render(self, view: ContextView) -> ModelContext:
         """Validate and render a ContextView without changing its source data."""
@@ -135,6 +278,96 @@ class AgentContextManager:
             plan=exact.plan,
             messages=deepcopy(tuple(messages)),
         )
+
+
+def _ingress_content(
+    sequence: int,
+    call_id: str,
+    is_error: bool,
+    content: str,
+    policy: ContextBudgetPolicy,
+    estimator: TokenEstimator,
+) -> str | None:
+    original_tokens = _result_tokens(call_id, is_error, content, estimator)
+    if original_tokens <= policy.max_tool_result_tokens:
+        return None
+    marker = (
+        f"[tool result ingress-limited; "
+        f"status={'failure' if is_error else 'success'}; "
+        f"source_sequence={sequence}; original_estimated_tokens={original_tokens}]"
+    )
+    kept = len(content)
+    replacement = marker
+    while kept:
+        head, tail = (kept + 1) // 2, kept // 2
+        replacement = (
+            f"{marker}\n--- head ---\n{content[:head]}\n"
+            f"--- tail ---\n{content[-tail:] if tail else ''}"
+        )
+        if (
+            _result_tokens(call_id, is_error, replacement, estimator)
+            <= policy.max_tool_result_tokens
+        ):
+            break
+        kept //= 2
+    while replacement and _result_tokens(
+        call_id, is_error, replacement, estimator
+    ) > policy.max_tool_result_tokens:
+        replacement = replacement[: len(replacement) // 2]
+    return replacement
+
+
+def _result_tokens(
+    call_id: str,
+    is_error: bool,
+    content: str,
+    estimator: TokenEstimator,
+) -> int:
+    block = {
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": content,
+        "is_error": is_error,
+    }
+    return estimator.estimate_text(compact_json(block))
+
+
+def _recent_start(
+    messages: tuple[SequencedMessage, ...],
+    policy: ContextBudgetPolicy,
+    estimator: TokenEstimator,
+) -> int:
+    count = len(messages)
+    by_count = max(0, count - policy.protected_recent_messages)
+    by_tokens, tokens = count, 0
+    if policy.protected_recent_tokens:
+        for index in range(count - 1, -1, -1):
+            tokens += estimator.estimate_text(compact_json(messages[index].message.as_dict()))
+            by_tokens = index
+            if tokens >= policy.protected_recent_tokens:
+                break
+    cutoff = min(by_count, by_tokens)
+    if cutoff and _same_tool_round(messages[cutoff - 1], messages[cutoff]):
+        cutoff -= 1
+    return cutoff
+
+
+def _same_tool_round(previous: SequencedMessage, current: SequencedMessage) -> bool:
+    if previous.message.role != "assistant" or current.message.role != "user":
+        return False
+    if previous.message.run_id != current.message.run_id:
+        return False
+    calls = {
+        block.get("id")
+        for block in previous.message.content
+        if block.get("type") == "tool_use"
+    }
+    results = {
+        block.get("tool_use_id")
+        for block in current.message.content
+        if block.get("type") == "tool_result"
+    }
+    return bool(calls & results)
 
 
 def _segment_range(segment: HistorySegment) -> SourceRange:

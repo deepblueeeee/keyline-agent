@@ -51,7 +51,7 @@ class SourceRange:
 
 @dataclass(frozen=True, slots=True)
 class SequencedMessage:
-    """A raw protocol message paired with its durable source sequence."""
+    """A model-visible protocol message paired with its durable source sequence."""
 
     sequence: int
     message: ModelMessage
@@ -59,7 +59,7 @@ class SequencedMessage:
 
 @dataclass(frozen=True, slots=True)
 class RawHistorySegment:
-    """A continuous older history interval retained as original messages."""
+    """A continuous, semantically uncompressed older history interval."""
 
     messages: tuple[SequencedMessage, ...]
 
@@ -82,7 +82,7 @@ HistorySegment: TypeAlias = RawHistorySegment | HistoryEpisode
 
 @dataclass(frozen=True, slots=True)
 class RecentContext:
-    """Protected raw history that must be exposed without summarization."""
+    """Protected history exposed without semantic summarization."""
 
     messages: tuple[SequencedMessage, ...] = ()
 

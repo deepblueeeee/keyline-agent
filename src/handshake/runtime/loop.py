@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from handshake.context import AgentContextManager
+from handshake.context import AgentContextManager, ContextPressureError
 from handshake.models.base import ModelAdapter
 from handshake.models.protocol import ModelMessage, ToolCall
 from handshake.runtime.errors import (
@@ -284,8 +284,8 @@ def _run_turns(
     secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
     store: RunStore | None,
+    context_manager: AgentContextManager,
 ) -> Run:
-    context_manager = AgentContextManager()
     definitions = (*runtime_tool_definitions(), *registry.definitions())
     while True:
         messages_after_checkpoint: list[str] = []
@@ -296,7 +296,9 @@ def _run_turns(
                     f"Agent exceeded the maximum of {run.max_steps} model turns"
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
-            turn = model.complete(context_manager.build(session, run), definitions)
+            context_manager.ingest_pending(session)
+            context = context_manager.prepare(session, run, definitions)
+            turn = model.complete(context, definitions)
             run.model_turns += 1
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
@@ -342,7 +344,10 @@ def _run_turns(
                             ),
                         )
                         _append_tool_results(
-                            session, run, (dependency_call,), (result,)
+                            session,
+                            run,
+                            (dependency_call,),
+                            (result,),
                         )
                         messages_after_checkpoint.append(
                             f"Tool {dependency_call.name}: failed"
@@ -406,7 +411,7 @@ def _run_turns(
             _terminate_run(run, RunStatus.CANCELLED, str(exc))
             _checkpoint(session, run, store)
             raise
-        except HandshakeError as exc:
+        except (HandshakeError, ContextPressureError) as exc:
             _terminate_run(run, RunStatus.FAILED, str(exc))
             _checkpoint(session, run, store)
             raise
@@ -445,6 +450,7 @@ def start_run(
     emit: EmitCallback | None = None,
     store: RunStore | None = None,
     secret_command_runner: SecretCommandRunner | None = None,
+    context_manager: AgentContextManager | None = None,
 ) -> Run:
     """Start one user-request run and execute until terminal state or a wait."""
     if run.max_steps < 1:
@@ -457,6 +463,7 @@ def start_run(
         raise AgentLoopError(f"Run {run.run_id} already has session messages")
 
     output = emit or (lambda _message: None)
+    current_context_manager = context_manager or AgentContextManager()
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
     _resume_one_work_item(run)
@@ -478,6 +485,7 @@ def start_run(
         secret_command_runner,
         output,
         store,
+        current_context_manager,
     )
 
 
@@ -506,6 +514,7 @@ def continue_run(
     emit: EmitCallback | None = None,
     store: RunStore | None = None,
     secret_command_runner: SecretCommandRunner | None = None,
+    context_manager: AgentContextManager | None = None,
 ) -> Run:
     """Persist a resolved dependency, then continue its durable run."""
     if run.status is not RunStatus.RUNNING:
@@ -515,6 +524,7 @@ def continue_run(
     if not any(message.run_id == run.run_id for message in session.messages):
         raise AgentLoopError("A resumed run must have model protocol history")
     output = emit or (lambda _message: None)
+    current_context_manager = context_manager or AgentContextManager()
     _checkpoint(session, run, store)
     output("Input received; resuming run")
     _resume_one_work_item(run)
@@ -526,4 +536,5 @@ def continue_run(
         secret_command_runner,
         output,
         store,
+        current_context_manager,
     )

@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> 
     original_messages = list(session.messages)
     original_plan = list(run.plan)
     manager = AgentContextManager()
+    manager.ingest_pending(session)
 
     context = manager.build(session, run)
 
@@ -71,6 +73,28 @@ def test_build_renders_current_plan(tmp_path: Path) -> None:
     ) in context.system_prompt
 
 
+def test_build_is_read_only_and_requires_explicit_ingress(tmp_path: Path) -> None:
+    session, run = _session_run(tmp_path)
+    manager = AgentContextManager()
+
+    first = manager.build(session, run)
+
+    session.messages.append(
+        ModelMessage("user", ({"type": "text", "text": "new input"},), run.run_id)
+    )
+    with pytest.raises(ContextViewError, match="context ingress"):
+        manager.build(session, run)
+
+    manager.ingest_pending(session)
+    original_messages = deepcopy(session.messages)
+    second = manager.build(session, run)
+    third = manager.build(session, run)
+
+    assert first.messages == ()
+    assert second == third
+    assert session.messages == original_messages
+
+
 def test_capture_preserves_exact_state_and_sequences_complete_history(
     tmp_path: Path,
 ) -> None:
@@ -90,6 +114,7 @@ def test_capture_preserves_exact_state_and_sequences_complete_history(
         ]
     )
     manager = AgentContextManager()
+    manager.ingest_pending(session)
     view = manager.capture(
         session,
         run,
@@ -124,6 +149,7 @@ def test_capture_and_render_do_not_alias_session_history(tmp_path: Path) -> None
         )
     )
     manager = AgentContextManager()
+    manager.ingest_pending(session)
     view = manager.capture(session, run)
     context = manager.render(view)
 
