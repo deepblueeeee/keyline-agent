@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from handshake.config import DeepSeekConfig, handshake_home, read_deepseek_api_key
+from handshake.context import AgentContextManager, LLMHistoryCondenser
 from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
@@ -166,6 +167,7 @@ def _drive_run(
     store: SQLiteStateStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
+    context_manager: AgentContextManager | None = None,
 ) -> tuple[int, Run]:
     while run.status is RunStatus.WAITING:
         dependency = _single_open_dependency(run)
@@ -206,6 +208,7 @@ def _drive_run(
             emit=print,
             store=store,
             secret_command_runner=secret_command_runner,
+            context_manager=context_manager,
         )
     if run.status is not RunStatus.COMPLETED:
         raise HandshakeError(
@@ -257,6 +260,7 @@ def _process_current_run(
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
     model: ModelAdapter | None = None,
+    context_manager: AgentContextManager | None = None,
 ) -> tuple[int, Run]:
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         return _print_terminal_run(run), run
@@ -264,6 +268,8 @@ def _process_current_run(
         return _print_terminal_run(run), run
 
     current_model = model or _create_real_model(run.model_name)
+    current_context = context_manager or AgentContextManager()
+    current_context.condenser = LLMHistoryCondenser(current_model)
     try:
         if run.status is RunStatus.CREATED:
             run = start_run(
@@ -274,6 +280,7 @@ def _process_current_run(
                 emit=print,
                 store=store,
                 secret_command_runner=secret_command_runner,
+                context_manager=current_context,
             )
         return _drive_run(
             session,
@@ -283,6 +290,7 @@ def _process_current_run(
             store,
             secret_writer,
             secret_command_runner,
+            current_context,
         )
     except UserCancelledError:
         raise
@@ -305,6 +313,7 @@ def _drive_session(
     secret_command_runner: SecretCommandRunner,
     initial_model: ModelAdapter | None = None,
 ) -> int:
+    context_manager = AgentContextManager()
     result_code, run = _process_current_run(
         session,
         run,
@@ -313,6 +322,7 @@ def _drive_session(
         secret_writer,
         secret_command_runner,
         initial_model,
+        context_manager,
     )
     if result_code == _WAITING_EXIT_CODE or not sys.stdin.isatty():
         return result_code
@@ -330,6 +340,7 @@ def _drive_session(
             store,
             secret_writer,
             secret_command_runner,
+            context_manager=context_manager,
         )
         if result_code == _WAITING_EXIT_CODE:
             return result_code

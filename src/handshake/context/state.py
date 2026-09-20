@@ -66,11 +66,7 @@ class RawHistorySegment:
 
 @dataclass(frozen=True, slots=True)
 class HistoryEpisode:
-    """Semantic representation reserved for one continuous source interval.
-
-    Context capture does not create episodes. A future compactor may supply them
-    without changing the ContextView or provider interfaces.
-    """
+    """Semantic representation of a continuous source interval, eligible for roll-up."""
 
     source_range: SourceRange
     title: str

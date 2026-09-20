@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from handshake.context import AgentContextManager, ContextPressureError
+from handshake.context import AgentContextManager, ContextPressureError, LLMHistoryCondenser
 from handshake.models.base import ModelAdapter
 from handshake.models.protocol import ModelMessage, ToolCall
 from handshake.runtime.errors import (
@@ -463,7 +463,9 @@ def start_run(
         raise AgentLoopError(f"Run {run.run_id} already has session messages")
 
     output = emit or (lambda _message: None)
-    current_context_manager = context_manager or AgentContextManager()
+    current_context_manager = context_manager or AgentContextManager(
+        condenser=LLMHistoryCondenser(model)
+    )
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
     _resume_one_work_item(run)
@@ -524,7 +526,9 @@ def continue_run(
     if not any(message.run_id == run.run_id for message in session.messages):
         raise AgentLoopError("A resumed run must have model protocol history")
     output = emit or (lambda _message: None)
-    current_context_manager = context_manager or AgentContextManager()
+    current_context_manager = context_manager or AgentContextManager(
+        condenser=LLMHistoryCondenser(model)
+    )
     _checkpoint(session, run, store)
     output("Input received; resuming run")
     _resume_one_work_item(run)

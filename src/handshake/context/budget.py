@@ -33,7 +33,11 @@ class ContextBudgetPolicy:
     context_window_tokens: int = 1_000_000
     reserved_output_tokens: int = 16_384
     pressure_trigger_ratio: float = 0.80
-    pressure_target_ratio: float = 0.60
+    pressure_target_ratio: float = 0.50
+    raw_target_tokens: int = 48_000
+    background_episode_tokens: int = 8_000
+    rollup_episode_tokens: int = 48_000
+    condenser_input_tokens: int = 64_000
     protected_recent_messages: int = 8
     protected_recent_tokens: int = 16_000
     max_tool_result_tokens: int = 16_000

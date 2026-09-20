@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from handshake.context.budget import (
     ContextBudgetPolicy,
@@ -12,6 +12,12 @@ from handshake.context.budget import (
     Utf8TokenEstimator,
     compact_json,
     estimate_model_context,
+)
+from handshake.context.condenser import (
+    HistoryCondenser,
+    condenser_context,
+    episode_data,
+    raw_data,
 )
 from handshake.context.errors import ContextPressureError, ContextViewError
 from handshake.context.state import (
@@ -28,6 +34,7 @@ from handshake.context.state import (
 )
 from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ModelContext, ModelMessage
+from handshake.runtime.errors import ModelProtocolError, ModelProviderError
 from handshake.runtime.state import Run, Session
 
 
@@ -36,6 +43,7 @@ class _ContextState:
     message_count: int = 0
     recent_start: int = 0
     messages: list[ModelMessage] = field(default_factory=list)
+    episodes: tuple[HistoryEpisode, ...] = ()
 
 
 def _system_prompt(exact: ExactContext) -> str:
@@ -84,9 +92,11 @@ class AgentContextManager:
         self,
         policy: ContextBudgetPolicy | None = None,
         estimator: TokenEstimator | None = None,
+        condenser: HistoryCondenser | None = None,
     ) -> None:
         self.policy = policy or ContextBudgetPolicy()
         self.estimator = estimator or Utf8TokenEstimator()
+        self.condenser = condenser
         self._states: dict[str, _ContextState] = {}
 
     def build(
@@ -109,6 +119,9 @@ class AgentContextManager:
             while pressure > self.policy.pressure_target_tokens:
                 if not self.mask_oldest_stale_result(session):
                     break
+                pressure = self.measure_pressure(session, run, tools)
+            if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
+                self._compact(session, run, tools)
                 pressure = self.measure_pressure(session, run, tools)
         self.ensure_below_hard_limit(pressure)
         return self.build(session, run)
@@ -148,7 +161,10 @@ class AgentContextManager:
         messages = tuple(
             SequencedMessage(index, message) for index, message in enumerate(state.messages)
         )
-        state.recent_start = _recent_start(messages, self.policy, self.estimator)
+        compacted_end = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
+        state.recent_start = max(
+            compacted_end, _recent_start(messages, self.policy, self.estimator)
+        )
         self._states[session.session_id] = state
 
     def capture(
@@ -186,7 +202,10 @@ class AgentContextManager:
             SequencedMessage(sequence, message) for sequence, message in enumerate(messages)
         )
         cutoff = state.recent_start
-        history = (RawHistorySegment(recent[:cutoff]),) if cutoff else ()
+        compacted_end = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
+        history: tuple[HistorySegment, ...] = state.episodes
+        if compacted_end < cutoff:
+            history += (RawHistorySegment(recent[compacted_end:cutoff]),)
         return ContextView(
             exact=exact,
             history=history,
@@ -210,7 +229,9 @@ class AgentContextManager:
     def mask_oldest_stale_result(self, session: Session) -> bool:
         """Incrementally mask one oldest result outside protected recent context."""
         state = self._synchronized_state(session)
-        for sequence, message in enumerate(state.messages[: state.recent_start]):
+        start = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
+        for sequence in range(start, state.recent_start):
+            message = state.messages[sequence]
             if message.role != "user":
                 continue
             for block in message.content:
@@ -226,6 +247,126 @@ class AgentContextManager:
                 )
                 return True
         return False
+
+    def _fits_request(
+        self, episodes: tuple[HistoryEpisode, ...], target: tuple[SequencedMessage, ...] | None
+    ) -> bool:
+        return estimate_model_context(
+            condenser_context(episodes, target), (), self.estimator
+        ) <= self.policy.condenser_input_tokens
+
+    def _raw_candidate(
+        self, session: Session,
+    ) -> tuple[tuple[HistoryEpisode, ...], tuple[SequencedMessage, ...]]:
+        state = self._synchronized_state(session)
+        background: tuple[HistoryEpisode, ...] = ()
+        for episode in reversed(state.episodes):
+            proposed = (episode, *background)
+            if self.estimator.estimate_text(compact_json(episode_data(proposed))) > (
+                self.policy.background_episode_tokens
+            ):
+                break
+            background = proposed
+        start = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
+        target: tuple[SequencedMessage, ...] = ()
+        pending: list[SequencedMessage] = []
+        for sequence in range(start, state.recent_start):
+            message = deepcopy(state.messages[sequence])
+            if message.role == "user":
+                for index, block in enumerate(message.content):
+                    if block.get("type") == "tool_result" and block.get("is_error") is True:
+                        block["content"] = deepcopy(
+                            session.messages[sequence].content[index].get("content", "")
+                        )
+            pending.append(SequencedMessage(sequence, message))
+            if sequence + 1 < len(state.messages) and _same_tool_round(
+                pending[-1], SequencedMessage(sequence + 1, state.messages[sequence + 1])
+            ):
+                continue
+            proposed_target = (*target, *pending)
+            if self.estimator.estimate_text(compact_json(raw_data(proposed_target))) > (
+                self.policy.raw_target_tokens
+            ):
+                break
+            # Preserve target capacity when the total cap is tighter than the two sub-budgets.
+            while background and not self._fits_request(background, proposed_target):
+                background = background[1:]
+            if not self._fits_request(background, proposed_target):
+                break
+            target = proposed_target
+            pending = []
+        return background, target
+
+    def _accept_episodes(
+        self, session: Session, run: Run, tools: tuple[ToolDefinition, ...],
+        episodes: tuple[HistoryEpisode, ...],
+    ) -> bool:
+        view = self.capture(session, run)
+        end = episodes[-1].source_range.end_sequence + 1
+        state = self._synchronized_state(session)
+        history: tuple[HistorySegment, ...] = episodes
+        if end < state.recent_start:
+            history += (RawHistorySegment(tuple(
+                SequencedMessage(i, state.messages[i]) for i in range(end, state.recent_start)
+            )),)
+        proposed = self.render(replace(view, history=history))
+        if estimate_model_context(proposed, tools, self.estimator) >= (
+            estimate_model_context(self.render(view), tools, self.estimator)
+        ):
+            return False
+        state.episodes = episodes
+        return True
+
+    def _compact(self, session: Session, run: Run, tools: tuple[ToolDefinition, ...]) -> None:
+        assert self.condenser is not None
+        state = self._synchronized_state(session)
+        try:
+            while self.measure_pressure(session, run, tools) > self.policy.pressure_target_tokens:
+                background, target = self._raw_candidate(session)
+                if not target:
+                    break
+                episodes = self.condenser.compact_raw(background, target)
+                if not episodes:
+                    break
+                expected = target[0].sequence
+                for episode in episodes:
+                    _validate_episode(episode, expected, target[-1].sequence)
+                    end = episode.source_range.end_sequence
+                    if end + 1 < len(state.messages) and _same_tool_round(
+                        SequencedMessage(end, state.messages[end]),
+                        SequencedMessage(end + 1, state.messages[end + 1]),
+                    ):
+                        raise ContextViewError("Episode splits a tool round")
+                    expected = end + 1
+                if not self._accept_episodes(session, run, tools, state.episodes + episodes):
+                    break
+
+            while self.measure_pressure(session, run, tools) > self.policy.pressure_target_tokens:
+                selected: tuple[HistoryEpisode, ...] = ()
+                for episode in state.episodes:
+                    proposed = (*selected, episode)
+                    if (self.estimator.estimate_text(compact_json(episode_data(proposed)))
+                            > self.policy.rollup_episode_tokens
+                            or not self._fits_request(proposed, None)):
+                        break
+                    selected = proposed
+                if len(selected) < 2:
+                    break
+                merged = self.condenser.roll_up(selected)
+                if merged is None:
+                    break
+                start = selected[0].source_range.start_sequence
+                end = selected[-1].source_range.end_sequence
+                _validate_episode(merged, start, end)
+                if merged.source_range.end_sequence != end:
+                    raise ContextViewError("Roll-up must cover its complete input")
+                if not self._accept_episodes(
+                    session, run, tools, (merged, *state.episodes[len(selected):])
+                ):
+                    break
+        except (ContextViewError, ModelProtocolError, ModelProviderError):
+            # A failed condenser request never replaces the last validated view.
+            return
 
     def _synchronized_state(self, session: Session) -> _ContextState:
         state = self._states.get(session.session_id)
@@ -247,8 +388,7 @@ class AgentContextManager:
         """Reject a provider request that remains at or above its hard input limit."""
         if visible_tokens >= self.policy.hard_input_tokens:
             raise ContextPressureError(
-                "Model input remains above the hard context limit after masking all "
-                "eligible stale tool results"
+                "Model input remains above the hard context limit after context reduction"
             )
 
     def render(self, view: ContextView) -> ModelContext:
@@ -430,3 +570,12 @@ def _render_episode(episode: HistoryEpisode) -> ModelMessage:
         f"Summary: {episode.summary}"
     )
     return ModelMessage(role="user", content=({"type": "text", "text": text},))
+
+
+def _validate_episode(episode: HistoryEpisode, start: int, maximum: int) -> None:
+    source = episode.source_range
+    if (type(source.start_sequence) is not int or type(source.end_sequence) is not int
+            or source.start_sequence != start or not start <= source.end_sequence <= maximum
+            or not isinstance(episode.title, str) or not episode.title.strip()
+            or not isinstance(episode.summary, str) or not episode.summary.strip()):
+        raise ContextViewError("Invalid condenser episode range or content")

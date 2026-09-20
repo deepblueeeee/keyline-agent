@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+from collections import deque
+from copy import deepcopy
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from handshake.context import (
+    AgentContextManager,
+    ContextBudgetPolicy,
+    ContextPressureError,
+    HistoryEpisode,
+    LLMHistoryCondenser,
+    RawHistorySegment,
+    SequencedMessage,
+    SourceRange,
+)
+from handshake.context.budget import compact_json, estimate_model_context
+from handshake.context.condenser import condenser_context, episode_data, raw_data
+from handshake.models.protocol import ModelMessage, ModelTurn
+from handshake.models.scripted import ScriptedModel
+from handshake.runtime.errors import ModelProtocolError, ModelProviderError
+from handshake.runtime.loop import start_run
+from handshake.runtime.state import Run, Session
+from handshake.storage.sqlite import SQLiteStateStore
+from handshake.tools.registry import ToolRegistry
+
+
+class Characters:
+    def estimate_text(self, text: str) -> int:
+        return len(text)
+
+
+class Condenser:
+    def __init__(self, *responses: tuple[HistoryEpisode, ...] | Exception) -> None:
+        self.responses = deque(responses)
+        self.calls: list[tuple[str, object, object]] = []
+        self.rollups: deque[HistoryEpisode | None] = deque()
+
+    def compact_raw(
+        self, background: tuple[HistoryEpisode, ...], target: tuple[SequencedMessage, ...],
+    ) -> tuple[HistoryEpisode, ...]:
+        self.calls.append(("raw", background, target))
+        result = self.responses.popleft() if self.responses else ()
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def roll_up(self, episodes: tuple[HistoryEpisode, ...]) -> HistoryEpisode | None:
+        self.calls.append(("rollup", episodes, None))
+        return self.rollups.popleft() if self.rollups else None
+
+
+def episode(start: int, end: int, text: str = "Investigation complete.") -> HistoryEpisode:
+    return HistoryEpisode(SourceRange(start, end), "Stage", text)
+
+
+def setup(
+    tmp_path: Path, condenser: Condenser, **policy: int | float,
+) -> tuple[AgentContextManager, Session, Run]:
+    session = Session(workspace=tmp_path)
+    run = Run(goal="Continue", session_id=session.session_id)
+    session.messages.extend(
+        ModelMessage("user", ({"type": "text", "text": f"stage {i}: " + "x" * 2000},),
+                     run.run_id)
+        for i in range(7)
+    )
+    budget = replace(ContextBudgetPolicy(
+        context_window_tokens=100_000, reserved_output_tokens=0,
+        pressure_trigger_ratio=0.01, pressure_target_ratio=0.001,
+        protected_recent_messages=1, protected_recent_tokens=0,
+    ), **policy)
+    manager = AgentContextManager(budget, Characters(), condenser)
+    manager.ingest_pending(session)
+    return manager, session, run
+
+
+def test_frontier_background_suffix_and_incremental_growth(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 1), episode(2, 3)), (), ())
+    manager, session, run = setup(tmp_path, condenser)
+    original = deepcopy(session.messages)
+    manager.prepare(session, run, ())
+    view = manager.capture(session, run)
+    assert view.history[:2] == (episode(0, 1), episode(2, 3))
+    assert isinstance(view.history[2], RawHistorySegment)
+    assert [m.sequence for m in view.history[2].messages] == [4, 5]
+    assert condenser.calls[1][1] == view.history[:2]
+    assert [c[0] for c in condenser.calls] == ["raw", "raw", "rollup"]
+    assert session.messages == original
+    assert view.protected_recent.messages[0].message == original[6]
+    session.messages.append(ModelMessage("user", ({"type": "text", "text": "new"},)))
+    manager.ingest_pending(session)
+    manager.prepare(session, run, ())
+    target = condenser.calls[3][2]
+    assert isinstance(target, tuple)
+    assert [item.sequence for item in target] == [4, 5, 6]
+    calls = len(condenser.calls)
+    manager.build(session, run)
+    manager.capture(session, run)
+    assert len(condenser.calls) == calls
+
+
+def test_rollup_after_raw_exhaustion_and_repeated_rollup(tmp_path: Path) -> None:
+    condenser = Condenser(tuple(episode(i, i + 1) for i in (0, 2, 4)))
+    condenser.rollups.extend((episode(0, 3, "Merged."), episode(0, 5, "Done.")))
+    two_budget = len(compact_json(episode_data((episode(0, 1), episode(2, 3)))))
+    manager, session, run = setup(tmp_path, condenser, rollup_episode_tokens=two_budget)
+    manager.prepare(session, run, ())
+    assert [c[0] for c in condenser.calls] == ["raw", "rollup", "rollup"]
+    assert manager.capture(session, run).history == (episode(0, 5, "Done."),)
+
+
+def test_raw_no_progress_allows_rollup_without_crossing_suffix(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 1), episode(2, 3)), ())
+    condenser.rollups.append(episode(0, 3, "Done."))
+    manager, session, run = setup(tmp_path, condenser)
+    manager.prepare(session, run, ())
+    assert manager.capture(session, run).history[0] == episode(0, 3, "Done.")
+    assert [c[0] for c in condenser.calls] == ["raw", "raw", "rollup"]
+    assert condenser.calls[-1][1] == (episode(0, 1), episode(2, 3))
+
+
+@pytest.mark.parametrize("result", [
+    (episode(1, 3),), (episode(0, 1), episode(1, 3)),
+    (episode(0, 1), episode(3, 4)), (episode(0, 6),),
+    (episode(0, 2, ""),), ModelProtocolError("bad JSON"), ModelProviderError("unavailable"),
+])
+def test_invalid_response_preserves_view_and_stops(
+    tmp_path: Path, result: tuple[HistoryEpisode, ...] | Exception,
+) -> None:
+    condenser = Condenser(result)
+    manager, session, run = setup(tmp_path, condenser)
+    before = manager.capture(session, run)
+    manager.prepare(session, run, ())
+    assert manager.capture(session, run) == before
+    assert len(condenser.calls) == 1
+
+
+def tool_round(failed: bool, text: str) -> tuple[ModelMessage, ModelMessage]:
+    return (
+        ModelMessage("assistant", ({"type": "tool_use", "id": "same", "name": "test",
+                                    "input": {}},), "run"),
+        ModelMessage("user", ({"type": "tool_result", "tool_use_id": "same",
+                               "is_error": failed, "content": text},), "run"),
+    )
+
+
+def test_masked_success_and_full_failure_and_durable_history(tmp_path: Path) -> None:
+    condenser = Condenser()
+    manager, session, run = setup(tmp_path, condenser, max_tool_result_tokens=300)
+    session.messages = [*tool_round(False, "SUCCESS" * 1000),
+                        *tool_round(True, "ERROR DETAILS" * 1000),
+                        ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    session.messages = [replace(message, run_id=run.run_id) for message in session.messages]
+    manager = AgentContextManager(manager.policy, Characters(), condenser)
+    manager.ingest_pending(session)
+    original = deepcopy(session.messages)
+    store = SQLiteStateStore(tmp_path / "state.db")
+    session.messages = []
+    store.create_session(session)
+    session.messages = original
+    store.create_run(session, run)
+    manager.prepare(session, run, ())
+    target = condenser.calls[0][2]
+    assert isinstance(target, tuple)
+    assert target[1].message.content[0]["content"].startswith("[stale tool result masked;")
+    assert target[3].message.content[0]["content"] == "ERROR DETAILS" * 1000
+    assert session.messages == original
+    assert store.load_session(session.session_id).messages == original
+
+
+def test_candidate_budget_and_tool_round_boundaries(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 0),))  # Cannot split the tool round.
+    manager, session, run = setup(tmp_path, condenser)
+    session.messages = [*tool_round(True, "details" * 100),
+                        ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    manager = AgentContextManager(manager.policy, Characters(), condenser)
+    manager.ingest_pending(session)
+    manager.prepare(session, run, ())
+    assert all(isinstance(s, RawHistorySegment) for s in manager.capture(session, run).history)
+    assert len(condenser.calls) == 1
+    target = condenser.calls[0][2]
+    assert isinstance(target, tuple)
+    manager.policy = replace(manager.policy,
+                             raw_target_tokens=len(compact_json(raw_data(target))) - 1)
+    manager.prepare(session, run, ())
+    assert len(condenser.calls) == 1  # Full failure cannot fit; do not truncate or skip it.
+
+
+def test_independent_background_raw_and_total_budgets(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 0), episode(1, 1)), ())
+    manager, session, run = setup(tmp_path, condenser, background_episode_tokens=1)
+    manager.prepare(session, run, ())
+    assert condenser.calls[1][1] == ()
+    background, target = manager._raw_candidate(session)
+    assert len(target) == 4
+    first_size = len(compact_json(raw_data(target[:1])))
+    manager.policy = replace(manager.policy, raw_target_tokens=first_size)
+    assert len(manager._raw_candidate(session)[1]) == 1
+    total = estimate_model_context(condenser_context((), target[:1]), (), Characters())
+    manager.policy = replace(manager.policy, condenser_input_tokens=total - 1)
+    assert manager._raw_candidate(session)[1] == ()
+
+
+def test_masking_reaches_target_without_condenser(tmp_path: Path) -> None:
+    condenser = Condenser()
+    manager, session, run = setup(tmp_path, condenser, context_window_tokens=15_000,
+                                 pressure_trigger_ratio=0.8, pressure_target_ratio=0.5)
+    session.messages = [*tool_round(False, "x" * 12_000),
+                        ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    manager = AgentContextManager(manager.policy, Characters(), condenser)
+    manager.ingest_pending(session)
+    manager.prepare(session, run, ())
+    assert not condenser.calls
+    assert manager.measure_pressure(session, run, ()) <= 7500
+
+
+def test_no_gain_and_hard_limit(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 5, "x" * 30_000),))
+    manager, session, run = setup(tmp_path, condenser, context_window_tokens=10_000)
+    before = manager.capture(session, run)
+    with pytest.raises(ContextPressureError):
+        manager.prepare(session, run, ())
+    assert manager.capture(session, run) == before
+
+
+def test_stop_after_raw_reaches_target(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 5),))
+    manager, session, run = setup(tmp_path, condenser, context_window_tokens=20_000,
+                                 pressure_trigger_ratio=0.8, pressure_target_ratio=0.5)
+    manager.prepare(session, run, ())
+    assert [c[0] for c in condenser.calls] == ["raw"]
+
+
+def test_llm_request_and_json_protocol() -> None:
+    model = ScriptedModel([ModelTurn(({"type": "text", "text":
+        '{"episodes":[{"start_sequence":0,"end_sequence":1,"title":"Stage",'
+        '"summary":"Investigation complete."}]}'},))])
+    condenser = LLMHistoryCondenser(model)
+    assert condenser.compact_raw((), ()) == (episode(0, 1),)
+    assert model.tool_sets == [()]
+    assert model.contexts[0].goal == ""
+    assert model.contexts[0].plan == ()
+
+
+@pytest.mark.parametrize("text,stop", [
+    ("not json", None), ('{"episodes":[{}]}', None),
+    ('{"episodes":[]}', "max_tokens"),
+    ('{"episodes":[{"start_sequence":true,"end_sequence":1,"title":"x",'
+     '"summary":"y"}]}', None),
+])
+def test_llm_rejects_malformed_or_truncated_output(text: str, stop: str | None) -> None:
+    model = ScriptedModel([ModelTurn(({"type": "text", "text": text},), stop_reason=stop)])
+    with pytest.raises(ModelProtocolError):
+        LLMHistoryCondenser(model).compact_raw((), ())
+
+
+def test_loop_compaction_does_not_count_as_agent_turn_and_restart_rebuilds(tmp_path: Path) -> None:
+    condenser = Condenser((episode(0, 5),))
+    manager, session, old_run = setup(tmp_path, condenser)
+    run = Run(goal="Next request", session_id=session.session_id)
+    model = ScriptedModel([ModelTurn(({"type": "text", "text": "Done"},),
+                                    stop_reason="end_turn")])
+    start_run(session, run, model, ToolRegistry(), context_manager=manager)
+    assert run.model_turns == 1
+    assert condenser.calls
+    restored = AgentContextManager(manager.policy, Characters(), Condenser())
+    restored.ingest_pending(session)
+    assert all(isinstance(s, RawHistorySegment)
+               for s in restored.capture(session, run).history)
+    assert old_run.model_turns == 0
+
+
+def test_below_trigger_preserves_history_without_requests(tmp_path: Path) -> None:
+    condenser = Condenser()
+    manager, session, run = setup(tmp_path, condenser, pressure_trigger_ratio=0.8,
+                                 pressure_target_ratio=0.5)
+    before = manager.capture(session, run)
+    manager.prepare(session, run, ())
+    assert manager.capture(session, run) == before
+    assert not condenser.calls
+
+
+@pytest.mark.parametrize("merged", [episode(0, 2), episode(1, 3),
+                                     episode(0, 3, "x" * 5000)])
+def test_invalid_or_larger_rollup_keeps_accepted_raw_compaction(
+    tmp_path: Path, merged: HistoryEpisode,
+) -> None:
+    condenser = Condenser((episode(0, 1), episode(2, 3)), ())
+    condenser.rollups.append(merged)
+    manager, session, run = setup(tmp_path, condenser)
+    manager.prepare(session, run, ())
+    assert manager.capture(session, run).history[:2] == (episode(0, 1), episode(2, 3))
+    assert len(condenser.calls) == 3
+
+
+def test_multiple_results_repeated_ids_restore_by_sequence_and_block(tmp_path: Path) -> None:
+    condenser = Condenser()
+    manager, session, run = setup(tmp_path, condenser)
+    first = tool_round(False, "success")
+    failure = tool_round(True, "first failure")[1]
+    second = tuple(replace(m, run_id="other-run") for m in tool_round(True, "second failure"))
+    session.messages = [first[0], replace(first[1], content=first[1].content + failure.content),
+                        *second, ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    manager = AgentContextManager(manager.policy, Characters(), condenser)
+    manager.ingest_pending(session)
+    manager.prepare(session, run, ())
+    target = condenser.calls[0][2]
+    assert isinstance(target, tuple)
+    assert "masked" in target[1].message.content[0]["content"]
+    assert target[1].message.content[1]["content"] == "first failure"
+    assert target[3].message.content[0]["content"] == "second failure"
+
+
+def test_shared_model_summary_never_enters_transcript_or_turn_count(tmp_path: Path) -> None:
+    manager, session, _ = setup(tmp_path, Condenser(), context_window_tokens=20_000,
+                                pressure_trigger_ratio=0.8, pressure_target_ratio=0.5)
+    model = ScriptedModel([
+        ModelTurn(({"type": "text", "text": compact_json({"episodes": [{
+            "start_sequence": 0, "end_sequence": 6, "title": "Summary",
+            "summary": "Earlier work completed.",
+        }]})},), stop_reason="end_turn"),
+        ModelTurn(({"type": "text", "text": "Done"},), stop_reason="end_turn"),
+    ])
+    manager.condenser = LLMHistoryCondenser(model)
+    run = Run(goal="Next request", session_id=session.session_id)
+    original = deepcopy(session.messages)
+    start_run(session, run, model, ToolRegistry(), context_manager=manager)
+    assert run.model_turns == 1
+    assert len(model.contexts) == 2
+    assert model.tool_sets[0] == ()
+    assert model.tool_sets[1]
+    assert "Compacted history episode" in repr(model.contexts[1].messages)
+    assert session.messages[:7] == original
+    assert len(session.messages) == 9

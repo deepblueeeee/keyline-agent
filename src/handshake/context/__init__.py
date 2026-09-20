@@ -6,6 +6,7 @@ from handshake.context.budget import (
     Utf8TokenEstimator,
     estimate_model_context,
 )
+from handshake.context.condenser import HistoryCondenser, LLMHistoryCondenser
 from handshake.context.errors import ContextPressureError, ContextViewError
 from handshake.context.manager import AgentContextManager
 from handshake.context.state import (
@@ -31,6 +32,8 @@ __all__ = [
     "ContextWorkItem",
     "ExactContext",
     "HistoryEpisode",
+    "HistoryCondenser",
+    "LLMHistoryCondenser",
     "HistorySegment",
     "RawHistorySegment",
     "RecentContext",
