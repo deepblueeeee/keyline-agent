@@ -24,8 +24,10 @@ from handshake.models.scripted import ScriptedModel
 from handshake.runtime.errors import ModelProtocolError, ModelProviderError
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, Session
-from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools.registry import ToolRegistry
+from tests.history_support import fresh_store, history, ingest
+
+_HISTORY: dict[str, list[ModelMessage]] = {}
 
 
 class Characters:
@@ -62,37 +64,55 @@ def setup(
 ) -> tuple[AgentContextManager, Session, Run]:
     session = Session(workspace=tmp_path)
     run = Run(goal="Continue", session_id=session.session_id)
-    session.messages.extend(
+    messages = list(
         ModelMessage("user", ({"type": "text", "text": f"stage {i}: " + "x" * 2000},),
                      run.run_id)
         for i in range(7)
     )
+    _HISTORY[session.session_id] = messages
     budget = replace(ContextBudgetPolicy(
         context_window_tokens=100_000, reserved_output_tokens=0,
         pressure_trigger_ratio=0.01, pressure_target_ratio=0.001,
         protected_recent_messages=1, protected_recent_tokens=0,
     ), **policy)
     manager = AgentContextManager(budget, Characters(), condenser)
-    manager.ingest_pending(session)
+    ingest(manager, session, messages)
     return manager, session, run
+
+
+def _messages(session: Session) -> list[ModelMessage]:
+    return _HISTORY[session.session_id]
+
+
+def _prepare(
+    manager: AgentContextManager,
+    session: Session,
+    run: Run,
+) -> None:
+    manager.prepare(
+        session,
+        run,
+        (),
+        raw_message_reader=lambda _session_id, sequence: _messages(session)[sequence],
+    )
 
 
 def test_frontier_background_suffix_and_incremental_growth(tmp_path: Path) -> None:
     condenser = Condenser((episode(0, 1), episode(2, 3)), (), ())
     manager, session, run = setup(tmp_path, condenser)
-    original = deepcopy(session.messages)
-    manager.prepare(session, run, ())
+    original = deepcopy(_messages(session))
+    _prepare(manager, session, run)
     view = manager.capture(session, run)
     assert view.history[:2] == (episode(0, 1), episode(2, 3))
     assert isinstance(view.history[2], RawHistorySegment)
     assert [m.sequence for m in view.history[2].messages] == [4, 5]
     assert condenser.calls[1][1] == view.history[:2]
     assert [c[0] for c in condenser.calls] == ["raw", "raw", "rollup"]
-    assert session.messages == original
+    assert _messages(session) == original
     assert view.protected_recent.messages[0].message == original[6]
-    session.messages.append(ModelMessage("user", ({"type": "text", "text": "new"},)))
-    manager.ingest_pending(session)
-    manager.prepare(session, run, ())
+    _messages(session).append(ModelMessage("user", ({"type": "text", "text": "new"},)))
+    ingest(manager, session, _messages(session)[-1:], start=7)
+    _prepare(manager, session, run)
     target = condenser.calls[3][2]
     assert isinstance(target, tuple)
     assert [item.sequence for item in target] == [4, 5, 6]
@@ -107,7 +127,7 @@ def test_rollup_after_raw_exhaustion_and_repeated_rollup(tmp_path: Path) -> None
     condenser.rollups.extend((episode(0, 3, "Merged."), episode(0, 5, "Done.")))
     two_budget = len(compact_json(episode_data((episode(0, 1), episode(2, 3)))))
     manager, session, run = setup(tmp_path, condenser, rollup_episode_tokens=two_budget)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert [c[0] for c in condenser.calls] == ["raw", "rollup", "rollup"]
     assert manager.capture(session, run).history == (episode(0, 5, "Done."),)
 
@@ -116,7 +136,7 @@ def test_raw_no_progress_allows_rollup_without_crossing_suffix(tmp_path: Path) -
     condenser = Condenser((episode(0, 1), episode(2, 3)), ())
     condenser.rollups.append(episode(0, 3, "Done."))
     manager, session, run = setup(tmp_path, condenser)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert manager.capture(session, run).history[0] == episode(0, 3, "Done.")
     assert [c[0] for c in condenser.calls] == ["raw", "raw", "rollup"]
     assert condenser.calls[-1][1] == (episode(0, 1), episode(2, 3))
@@ -133,7 +153,7 @@ def test_invalid_response_preserves_view_and_stops(
     condenser = Condenser(result)
     manager, session, run = setup(tmp_path, condenser)
     before = manager.capture(session, run)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert manager.capture(session, run) == before
     assert len(condenser.calls) == 1
 
@@ -150,69 +170,74 @@ def tool_round(failed: bool, text: str) -> tuple[ModelMessage, ModelMessage]:
 def test_masked_success_and_full_failure_and_durable_history(tmp_path: Path) -> None:
     condenser = Condenser()
     manager, session, run = setup(tmp_path, condenser, max_tool_result_tokens=300)
-    session.messages = [*tool_round(False, "SUCCESS" * 1000),
-                        *tool_round(True, "ERROR DETAILS" * 1000),
-                        ModelMessage("user", ({"type": "text", "text": "recent"},))]
-    session.messages = [replace(message, run_id=run.run_id) for message in session.messages]
+    _HISTORY[session.session_id] = [
+        *tool_round(False, "SUCCESS" * 1000),
+        *tool_round(True, "ERROR DETAILS" * 1000),
+        ModelMessage("user", ({"type": "text", "text": "recent"},)),
+    ]
+    _HISTORY[session.session_id] = [
+        replace(message, run_id=run.run_id) for message in _messages(session)
+    ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    manager.ingest_pending(session)
-    original = deepcopy(session.messages)
-    store = SQLiteStateStore(tmp_path / "state.db")
-    session.messages = []
-    store.create_session(session)
-    session.messages = original
-    store.create_run(session, run)
-    manager.prepare(session, run, ())
+    ingest(manager, session, _messages(session))
+    original = deepcopy(_messages(session))
+    store = fresh_store(tmp_path, session)
+    store.create_run(session, run, tuple(original))
+    _prepare(manager, session, run)
     target = condenser.calls[0][2]
     assert isinstance(target, tuple)
     assert target[1].message.content[0]["content"].startswith("[stale tool result masked;")
     assert target[3].message.content[0]["content"] == "ERROR DETAILS" * 1000
-    assert session.messages == original
-    assert store.load_session(session.session_id).messages == original
+    assert _messages(session) == original
+    assert history(store, session) == original
 
 
 def test_candidate_budget_and_tool_round_boundaries(tmp_path: Path) -> None:
     condenser = Condenser((episode(0, 0),))  # Cannot split the tool round.
     manager, session, run = setup(tmp_path, condenser)
-    session.messages = [*tool_round(True, "details" * 100),
-                        ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    _HISTORY[session.session_id] = [
+        *tool_round(True, "details" * 100),
+        ModelMessage("user", ({"type": "text", "text": "recent"},)),
+    ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    manager.ingest_pending(session)
-    manager.prepare(session, run, ())
+    ingest(manager, session, _messages(session))
+    _prepare(manager, session, run)
     assert all(isinstance(s, RawHistorySegment) for s in manager.capture(session, run).history)
     assert len(condenser.calls) == 1
     target = condenser.calls[0][2]
     assert isinstance(target, tuple)
     manager.policy = replace(manager.policy,
                              raw_target_tokens=len(compact_json(raw_data(target))) - 1)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert len(condenser.calls) == 1  # Full failure cannot fit; do not truncate or skip it.
 
 
 def test_independent_background_raw_and_total_budgets(tmp_path: Path) -> None:
     condenser = Condenser((episode(0, 0), episode(1, 1)), ())
     manager, session, run = setup(tmp_path, condenser, background_episode_tokens=1)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert condenser.calls[1][1] == ()
-    background, target = manager._raw_candidate(session)
+    background, target = manager._raw_candidate(session, None)
     assert len(target) == 4
     first_size = len(compact_json(raw_data(target[:1])))
     manager.policy = replace(manager.policy, raw_target_tokens=first_size)
-    assert len(manager._raw_candidate(session)[1]) == 1
+    assert len(manager._raw_candidate(session, None)[1]) == 1
     total = estimate_model_context(condenser_context((), target[:1]), (), Characters())
     manager.policy = replace(manager.policy, condenser_input_tokens=total - 1)
-    assert manager._raw_candidate(session)[1] == ()
+    assert manager._raw_candidate(session, None)[1] == ()
 
 
 def test_masking_reaches_target_without_condenser(tmp_path: Path) -> None:
     condenser = Condenser()
     manager, session, run = setup(tmp_path, condenser, context_window_tokens=15_000,
                                  pressure_trigger_ratio=0.8, pressure_target_ratio=0.5)
-    session.messages = [*tool_round(False, "x" * 12_000),
-                        ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    _HISTORY[session.session_id] = [
+        *tool_round(False, "x" * 12_000),
+        ModelMessage("user", ({"type": "text", "text": "recent"},)),
+    ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    manager.ingest_pending(session)
-    manager.prepare(session, run, ())
+    ingest(manager, session, _messages(session))
+    _prepare(manager, session, run)
     assert not condenser.calls
     assert manager.measure_pressure(session, run, ()) <= 7500
 
@@ -222,7 +247,7 @@ def test_no_gain_and_hard_limit(tmp_path: Path) -> None:
     manager, session, run = setup(tmp_path, condenser, context_window_tokens=10_000)
     before = manager.capture(session, run)
     with pytest.raises(ContextPressureError):
-        manager.prepare(session, run, ())
+        _prepare(manager, session, run)
     assert manager.capture(session, run) == before
 
 
@@ -230,7 +255,7 @@ def test_stop_after_raw_reaches_target(tmp_path: Path) -> None:
     condenser = Condenser((episode(0, 5),))
     manager, session, run = setup(tmp_path, condenser, context_window_tokens=20_000,
                                  pressure_trigger_ratio=0.8, pressure_target_ratio=0.5)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert [c[0] for c in condenser.calls] == ["raw"]
 
 
@@ -260,14 +285,28 @@ def test_llm_rejects_malformed_or_truncated_output(text: str, stop: str | None) 
 def test_loop_compaction_does_not_count_as_agent_turn_and_restart_rebuilds(tmp_path: Path) -> None:
     condenser = Condenser((episode(0, 5),))
     manager, session, old_run = setup(tmp_path, condenser)
-    run = Run(goal="Next request", session_id=session.session_id)
+    store = fresh_store(tmp_path, session)
+    store.create_run(session, old_run, tuple(_messages(session)))
+    run = Run(
+        goal="Next request",
+        session_id=session.session_id,
+        sequence=2,
+        previous_run_id=old_run.run_id,
+    )
     model = ScriptedModel([ModelTurn(({"type": "text", "text": "Done"},),
                                     stop_reason="end_turn")])
-    start_run(session, run, model, ToolRegistry(), context_manager=manager)
+    start_run(
+        session,
+        run,
+        model,
+        ToolRegistry(),
+        context_manager=manager,
+        store=store,
+    )
     assert run.model_turns == 1
     assert condenser.calls
     restored = AgentContextManager(manager.policy, Characters(), Condenser())
-    restored.ingest_pending(session)
+    restored.ingest_messages(session, store.read_messages(session.session_id))
     assert all(isinstance(s, RawHistorySegment)
                for s in restored.capture(session, run).history)
     assert old_run.model_turns == 0
@@ -278,7 +317,7 @@ def test_below_trigger_preserves_history_without_requests(tmp_path: Path) -> Non
     manager, session, run = setup(tmp_path, condenser, pressure_trigger_ratio=0.8,
                                  pressure_target_ratio=0.5)
     before = manager.capture(session, run)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert manager.capture(session, run) == before
     assert not condenser.calls
 
@@ -291,7 +330,7 @@ def test_invalid_or_larger_rollup_keeps_accepted_raw_compaction(
     condenser = Condenser((episode(0, 1), episode(2, 3)), ())
     condenser.rollups.append(merged)
     manager, session, run = setup(tmp_path, condenser)
-    manager.prepare(session, run, ())
+    _prepare(manager, session, run)
     assert manager.capture(session, run).history[:2] == (episode(0, 1), episode(2, 3))
     assert len(condenser.calls) == 3
 
@@ -302,11 +341,15 @@ def test_multiple_results_repeated_ids_restore_by_sequence_and_block(tmp_path: P
     first = tool_round(False, "success")
     failure = tool_round(True, "first failure")[1]
     second = tuple(replace(m, run_id="other-run") for m in tool_round(True, "second failure"))
-    session.messages = [first[0], replace(first[1], content=first[1].content + failure.content),
-                        *second, ModelMessage("user", ({"type": "text", "text": "recent"},))]
+    _HISTORY[session.session_id] = [
+        first[0],
+        replace(first[1], content=first[1].content + failure.content),
+        *second,
+        ModelMessage("user", ({"type": "text", "text": "recent"},)),
+    ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    manager.ingest_pending(session)
-    manager.prepare(session, run, ())
+    ingest(manager, session, _messages(session))
+    _prepare(manager, session, run)
     target = condenser.calls[0][2]
     assert isinstance(target, tuple)
     assert "masked" in target[1].message.content[0]["content"]
@@ -326,12 +369,25 @@ def test_shared_model_summary_never_enters_transcript_or_turn_count(tmp_path: Pa
     ])
     manager.condenser = LLMHistoryCondenser(model)
     run = Run(goal="Next request", session_id=session.session_id)
-    original = deepcopy(session.messages)
-    start_run(session, run, model, ToolRegistry(), context_manager=manager)
+    original = deepcopy(_messages(session))
+    store = fresh_store(tmp_path, session)
+    old_run = Run(goal="Earlier", session_id=session.session_id, run_id=original[0].run_id)
+    store.create_run(session, old_run, tuple(original))
+    run.sequence = 2
+    run.previous_run_id = old_run.run_id
+    start_run(
+        session,
+        run,
+        model,
+        ToolRegistry(),
+        context_manager=manager,
+        store=store,
+    )
     assert run.model_turns == 1
     assert len(model.contexts) == 2
     assert model.tool_sets[0] == ()
     assert model.tool_sets[1]
     assert "Compacted history episode" in repr(model.contexts[1].messages)
-    assert session.messages[:7] == original
-    assert len(session.messages) == 9
+    persisted = history(store, session)
+    assert persisted[:7] == original
+    assert len(persisted) == 9

@@ -15,6 +15,7 @@ from handshake.context import (
 )
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import Dependency, DependencyKind, Run, Session
+from tests.history_support import ingest
 
 
 def _session_run(tmp_path: Path) -> tuple[Session, Run]:
@@ -25,8 +26,7 @@ def _session_run(tmp_path: Path) -> tuple[Session, Run]:
 
 def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(
-        [
+    messages = [
             ModelMessage(
                 role="user",
                 content=({"type": "text", "text": "first request"},),
@@ -38,11 +38,10 @@ def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> 
                 run_id="earlier-run",
             ),
         ]
-    )
-    original_messages = list(session.messages)
+    original_messages = list(messages)
     original_plan = list(run.plan)
     manager = AgentContextManager()
-    manager.ingest_pending(session)
+    ingest(manager, session, messages)
 
     context = manager.build(session, run)
 
@@ -57,7 +56,7 @@ def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> 
     assert "list_files/search_files" in context.system_prompt
     assert "prefer edit_file" in context.system_prompt
     assert "Keep a short current plan" not in context.system_prompt
-    assert session.messages == original_messages
+    assert messages == original_messages
     assert run.plan == original_plan
 
 
@@ -79,20 +78,19 @@ def test_build_is_read_only_and_requires_explicit_ingress(tmp_path: Path) -> Non
 
     first = manager.build(session, run)
 
-    session.messages.append(
+    messages = [
         ModelMessage("user", ({"type": "text", "text": "new input"},), run.run_id)
-    )
-    with pytest.raises(ContextViewError, match="context ingress"):
-        manager.build(session, run)
+    ]
+    assert manager.build(session, run) == first
 
-    manager.ingest_pending(session)
-    original_messages = deepcopy(session.messages)
+    ingest(manager, session, messages)
+    original_messages = deepcopy(messages)
     second = manager.build(session, run)
     third = manager.build(session, run)
 
     assert first.messages == ()
     assert second == third
-    assert session.messages == original_messages
+    assert messages == original_messages
 
 
 def test_capture_preserves_exact_state_and_sequences_complete_history(
@@ -107,14 +105,12 @@ def test_capture_preserves_exact_state_and_sequences_complete_history(
     )
     run.add_dependency(run.work_items[0], dependency)
     run.plan.append("Check compatibility")
-    session.messages.extend(
-        [
+    messages = [
             ModelMessage("user", ({"type": "text", "text": "request"},), "prior"),
             ModelMessage("assistant", ({"type": "text", "text": "response"},), "prior"),
         ]
-    )
     manager = AgentContextManager()
-    manager.ingest_pending(session)
+    ingest(manager, session, messages)
     view = manager.capture(
         session,
         run,
@@ -133,31 +129,31 @@ def test_capture_preserves_exact_state_and_sequences_complete_history(
     assert view.history == ()
     assert view.source_message_count == 2
     assert tuple(item.sequence for item in view.protected_recent.messages) == (0, 1)
-    assert tuple(item.message for item in view.protected_recent.messages) == tuple(session.messages)
+    assert tuple(item.message for item in view.protected_recent.messages) == tuple(messages)
     assert "Preserve the public API" in context.system_prompt
     assert dependency.dependency_id in context.system_prompt
-    assert context.messages == tuple(session.messages)
+    assert context.messages == tuple(messages)
 
 
 def test_capture_and_render_do_not_alias_session_history(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.append(
+    messages = [
         ModelMessage(
             "user",
             ({"type": "text", "text": "important original evidence"},),
             run.run_id,
         )
-    )
+    ]
     manager = AgentContextManager()
-    manager.ingest_pending(session)
+    ingest(manager, session, messages)
     view = manager.capture(session, run)
     context = manager.render(view)
 
-    assert context.messages == tuple(session.messages)
+    assert context.messages == tuple(messages)
     context.messages[0].content[0]["text"] = "provider mutation"
     captured = view.protected_recent.messages[0].message
     assert captured.content[0]["text"] == "important original evidence"
-    session.messages[0].content[0]["text"] = "later transcript mutation"
+    messages[0].content[0]["text"] = "later transcript mutation"
     assert captured.content[0]["text"] == "important original evidence"
 
 

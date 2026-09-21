@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 
@@ -36,6 +37,8 @@ from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ModelContext, ModelMessage
 from handshake.runtime.errors import ModelProtocolError, ModelProviderError
 from handshake.runtime.state import Run, Session
+
+RawMessageReader = Callable[[str, int], ModelMessage]
 
 
 @dataclass(slots=True)
@@ -107,11 +110,17 @@ class AgentContextManager:
         """Render the already-maintained state without triggering compaction."""
         return self.render(self.capture(session, run))
 
+    def message_count(self, session: Session) -> int:
+        """Return the durable history prefix already represented by this view."""
+        return self._synchronized_state(session).message_count
+
     def prepare(
         self,
         session: Session,
         run: Run,
         tools: tuple[ToolDefinition, ...],
+        *,
+        raw_message_reader: RawMessageReader | None = None,
     ) -> ModelContext:
         """Apply context pressure policy and return the next model-visible context."""
         pressure = self.measure_pressure(session, run, tools)
@@ -121,22 +130,27 @@ class AgentContextManager:
                     break
                 pressure = self.measure_pressure(session, run, tools)
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
-                self._compact(session, run, tools)
+                self._compact(session, run, tools, raw_message_reader)
                 pressure = self.measure_pressure(session, run, tools)
         self.ensure_below_hard_limit(pressure)
         return self.build(session, run)
 
-    def ingest_pending(self, session: Session) -> None:
-        """Index externally appended messages at an explicit runtime boundary."""
+    def ingest_messages(
+        self,
+        session: Session,
+        messages: Iterable[SequencedMessage],
+    ) -> None:
+        """Add newly committed durable messages to the model-visible view."""
         current = self._states.get(session.session_id, _ContextState())
-        if current.message_count > len(session.messages):
-            raise ContextViewError("Context state is ahead of the Session transcript")
-        if current.message_count == len(session.messages):
-            self._states[session.session_id] = current
-            return
         state = deepcopy(current)
-        for sequence in range(state.message_count, len(session.messages)):
-            message = deepcopy(session.messages[sequence])
+        changed = False
+        for item in messages:
+            sequence = item.sequence
+            if sequence != state.message_count:
+                raise ContextViewError(
+                    "Context messages must extend the durable transcript contiguously"
+                )
+            message = deepcopy(item.message)
             if message.role == "user":
                 for block in message.content:
                     if block.get("type") != "tool_result":
@@ -158,6 +172,10 @@ class AgentContextManager:
                         block["content"] = replacement
             state.messages.append(message)
             state.message_count = sequence + 1
+            changed = True
+        if not changed:
+            self._states[session.session_id] = state
+            return
         messages = tuple(
             SequencedMessage(index, message) for index, message in enumerate(state.messages)
         )
@@ -210,7 +228,7 @@ class AgentContextManager:
             exact=exact,
             history=history,
             protected_recent=RecentContext(recent[cutoff:]),
-            source_message_count=len(session.messages),
+            source_message_count=state.message_count,
         )
 
     def measure_pressure(
@@ -256,7 +274,9 @@ class AgentContextManager:
         ) <= self.policy.condenser_input_tokens
 
     def _raw_candidate(
-        self, session: Session,
+        self,
+        session: Session,
+        raw_message_reader: RawMessageReader | None,
     ) -> tuple[tuple[HistoryEpisode, ...], tuple[SequencedMessage, ...]]:
         state = self._synchronized_state(session)
         background: tuple[HistoryEpisode, ...] = ()
@@ -275,9 +295,12 @@ class AgentContextManager:
             if message.role == "user":
                 for index, block in enumerate(message.content):
                     if block.get("type") == "tool_result" and block.get("is_error") is True:
-                        block["content"] = deepcopy(
-                            session.messages[sequence].content[index].get("content", "")
+                        raw = (
+                            raw_message_reader(session.session_id, sequence)
+                            if raw_message_reader is not None
+                            else state.messages[sequence]
                         )
+                        block["content"] = deepcopy(raw.content[index].get("content", ""))
             pending.append(SequencedMessage(sequence, message))
             if sequence + 1 < len(state.messages) and _same_tool_round(
                 pending[-1], SequencedMessage(sequence + 1, state.messages[sequence + 1])
@@ -317,12 +340,18 @@ class AgentContextManager:
         state.episodes = episodes
         return True
 
-    def _compact(self, session: Session, run: Run, tools: tuple[ToolDefinition, ...]) -> None:
+    def _compact(
+        self,
+        session: Session,
+        run: Run,
+        tools: tuple[ToolDefinition, ...],
+        raw_message_reader: RawMessageReader | None,
+    ) -> None:
         assert self.condenser is not None
         state = self._synchronized_state(session)
         try:
             while self.measure_pressure(session, run, tools) > self.policy.pressure_target_tokens:
-                background, target = self._raw_candidate(session)
+                background, target = self._raw_candidate(session, raw_message_reader)
                 if not target:
                     break
                 episodes = self.condenser.compact_raw(background, target)
@@ -371,15 +400,7 @@ class AgentContextManager:
     def _synchronized_state(self, session: Session) -> _ContextState:
         state = self._states.get(session.session_id)
         if state is None:
-            if session.messages:
-                raise ContextViewError(
-                    "Session transcript contains messages that have not passed context ingress"
-                )
             return _ContextState()
-        if state.message_count != len(session.messages):
-            raise ContextViewError(
-                "Session transcript contains messages that have not passed context ingress"
-            )
         if not 0 <= state.recent_start <= state.message_count:
             raise ContextViewError("Context state has an invalid protected recent boundary")
         return state

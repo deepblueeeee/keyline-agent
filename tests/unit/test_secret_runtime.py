@@ -18,6 +18,7 @@ from handshake.runtime.state import (
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.secret_command import SecretCommandRunner
+from tests.history_support import fresh_store, history
 
 
 def _tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -85,7 +86,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
     assert handle.status is SecretHandleStatus.REQUESTED
     assert handle.secret_handle.startswith("secret_")
     assert len(handle.secret_handle) > 30
-    immediate = session.messages[-1].content[0]
+    immediate = history(state_store, session)[-1].content[0]
     assert immediate["tool_use_id"] == wait_call.id
     assert handle.secret_handle in immediate["content"]
     assert handle.consumer in immediate["content"]
@@ -99,10 +100,10 @@ def test_secret_dependency_and_command_complete_without_model_leak(
         "environment_variable",
     ]
 
-    resolve_secret_dependency(
+    continuation = resolve_secret_dependency(
         session, run, dependency.dependency_id, canary, writer
     )
-    assert canary not in repr(session.messages)
+    assert canary not in repr(continuation)
     assert canary.encode() not in state_store.database_path.read_bytes()
 
     secure_call = ToolCall(
@@ -125,13 +126,14 @@ def test_secret_dependency_and_command_complete_without_model_leak(
         create_default_registry(lambda _cwd, _argv: True),
         store=state_store,
         secret_command_runner=runner,
+        pending_messages=(continuation,),
     )
 
     assert run.status is RunStatus.COMPLETED
     assert handle.status is SecretHandleStatus.CONSUMED
     assert run.tool_runs_for(run.work_items[0])[-1].arguments == secure_call.arguments
     assert canary not in repr(second_model.contexts)
-    assert canary not in repr(session.messages)
+    assert canary not in repr(history(state_store, session))
     assert canary not in repr(run.tool_runs)
     assert canary.encode() not in state_store.database_path.read_bytes()
     secure_result = second_model.contexts[-1].messages[-1].content[0]
@@ -197,12 +199,14 @@ def test_secret_command_without_capability_fails_without_shell_fallback(
     )
     session = Session(workspace=tmp_path)
     run = Run(goal="no fallback", session_id=session.session_id)
+    state_store = fresh_store(tmp_path, session)
 
     start_run(
         session,
         run,
         model,
         create_default_registry(lambda _cwd, _argv: True),
+        store=state_store,
     )
 
     result = run.tool_runs[-1].result

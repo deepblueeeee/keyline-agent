@@ -63,14 +63,14 @@ def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> N
     assert requested_snapshot.secret_handles[0].status is SecretHandleStatus.REQUESTED
     original_dependency = run.dependencies[0]
     original_handle = run.secret_handles[0]
-    resolve_secret_dependency(
+    continuation = resolve_secret_dependency(
         session,
         run,
         original_dependency.dependency_id,
         canary,
         first_secret_store.writer(),
     )
-    state_store.checkpoint_run(session, run)
+    state_store.checkpoint_run(session, run, (continuation,))
 
     resumed_session = state_store.load_session(session.session_id)
     resumed_run = state_store.load_run(run.run_id)

@@ -9,6 +9,7 @@ from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
+from tests.history_support import fresh_store
 
 
 @pytest.mark.live
@@ -39,6 +40,7 @@ def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
         run,
         model,
         create_default_registry(lambda _cwd, _argv: True),
+        store=fresh_store(tmp_path, session),
     )
 
     assert run.status is RunStatus.COMPLETED

@@ -6,7 +6,11 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from handshake.context import AgentContextManager, ContextPressureError, LLMHistoryCondenser
+from handshake.context import (
+    AgentContextManager,
+    ContextPressureError,
+    LLMHistoryCondenser,
+)
 from handshake.models.base import ModelAdapter
 from handshake.models.protocol import ModelMessage, ToolCall
 from handshake.runtime.errors import (
@@ -155,12 +159,12 @@ def _execute_tool_call(
 
 
 def _append_tool_results(
-    session: Session,
+    pending_messages: list[ModelMessage],
     run: Run,
     calls: tuple[ToolCall, ...],
     results: tuple[ToolResult, ...],
 ) -> None:
-    session.messages.append(
+    pending_messages.append(
         ModelMessage(
             role="user",
             content=tuple(
@@ -184,6 +188,7 @@ def _execute_tool_calls(
     registry: ToolRegistry,
     secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
+    pending_messages: list[ModelMessage],
 ) -> tuple[ToolResult, ...]:
     results: list[ToolResult] = []
     for index, call in enumerate(calls):
@@ -207,25 +212,59 @@ def _execute_tool_calls(
                 )
                 for _call in calls[index + 1 :]
             )
-            _append_tool_results(session, run, calls, tuple(results))
+            _append_tool_results(pending_messages, run, calls, tuple(results))
             raise
     return tuple(results)
 
 
-def _checkpoint(session: Session, run: Run, store: RunStore | None) -> None:
-    if store is not None:
-        store.checkpoint_run(session, run)
+def _sync_context(
+    session: Session,
+    store: RunStore,
+    context_manager: AgentContextManager,
+) -> None:
+    start = context_manager.message_count(session)
+    end = store.message_count(session.session_id)
+    if start > end:
+        raise AgentLoopError("Context view is ahead of the durable transcript")
+    context_manager.ingest_messages(
+        session, store.read_messages(session.session_id, start, end)
+    )
+
+
+def _read_raw_message(store: RunStore, session_id: str, sequence: int) -> ModelMessage:
+    messages = tuple(store.read_messages(session_id, sequence, sequence + 1))
+    if len(messages) != 1 or messages[0].sequence != sequence:
+        raise AgentLoopError(f"Missing durable message sequence {sequence}")
+    return messages[0].message
+
+
+def _checkpoint(
+    session: Session,
+    run: Run,
+    store: RunStore,
+    context_manager: AgentContextManager,
+    pending_messages: list[ModelMessage],
+    *,
+    create: bool = False,
+) -> None:
+    messages = tuple(pending_messages)
+    if create:
+        appended = store.create_run(session, run, messages)
+    else:
+        appended = store.checkpoint_run(session, run, messages)
+    pending_messages.clear()
+    context_manager.ingest_messages(session, appended)
 
 
 def _create_text_dependency(
-    session: Session,
     run: Run,
     call: ToolCall,
+    pending_messages: list[ModelMessage],
 ) -> Dependency | None:
     work_item = _running_work_item(run)
     prepared = prepare_text_dependency(call, work_item)
     if isinstance(prepared, ToolResult):
-        _append_tool_results(session, run, (call,), (prepared,))
+        _append_tool_results(pending_messages, run, (call,), (prepared,))
         return None
 
     dependency = prepared
@@ -238,7 +277,7 @@ def _create_text_dependency(
             f"for work item {work_item.work_id}"
         ),
     )
-    _append_tool_results(session, run, (call,), (result,))
+    _append_tool_results(pending_messages, run, (call,), (result,))
 
     if not _runnable_work_items(run) and run.open_dependencies():
         run.transition(RunStatus.WAITING)
@@ -246,14 +285,14 @@ def _create_text_dependency(
 
 
 def _create_secret_dependency(
-    session: Session,
     run: Run,
     call: ToolCall,
+    pending_messages: list[ModelMessage],
 ) -> Dependency | None:
     work_item = _running_work_item(run)
     prepared = prepare_secret_dependency(call, work_item)
     if isinstance(prepared, ToolResult):
-        _append_tool_results(session, run, (call,), (prepared,))
+        _append_tool_results(pending_messages, run, (call,), (prepared,))
         return None
 
     dependency, handle = prepared
@@ -269,7 +308,7 @@ def _create_secret_dependency(
             f"Environment variable: {handle.environment_variable}"
         ),
     )
-    _append_tool_results(session, run, (call,), (result,))
+    _append_tool_results(pending_messages, run, (call,), (result,))
 
     if not _runnable_work_items(run) and run.open_dependencies():
         run.transition(RunStatus.WAITING)
@@ -283,11 +322,12 @@ def _run_turns(
     registry: ToolRegistry,
     secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
-    store: RunStore | None,
+    store: RunStore,
     context_manager: AgentContextManager,
 ) -> Run:
     definitions = (*runtime_tool_definitions(), *registry.definitions())
     while True:
+        pending_messages: list[ModelMessage] = []
         messages_after_checkpoint: list[str] = []
         return_after_checkpoint = False
         try:
@@ -296,14 +336,20 @@ def _run_turns(
                     f"Agent exceeded the maximum of {run.max_steps} model turns"
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
-            context_manager.ingest_pending(session)
-            context = context_manager.prepare(session, run, definitions)
+            context = context_manager.prepare(
+                session,
+                run,
+                definitions,
+                raw_message_reader=lambda session_id, sequence: _read_raw_message(
+                    store, session_id, sequence
+                ),
+            )
             turn = model.complete(context, definitions)
             run.model_turns += 1
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
             _validate_turn_tool_calls(turn.content, turn.tool_calls)
-            session.messages.append(
+            pending_messages.append(
                 ModelMessage(role="assistant", content=turn.content, run_id=run.run_id)
             )
 
@@ -326,7 +372,7 @@ def _run_turns(
                         ),
                     )
                     _append_tool_results(
-                        session,
+                        pending_messages,
                         run,
                         turn.tool_calls,
                         tuple(dependency_error for _call in turn.tool_calls),
@@ -336,42 +382,25 @@ def _run_turns(
                     )
                 elif dependency_calls:
                     dependency_call = dependency_calls[0]
-                    if store is None:
-                        result = ToolResult(
-                            ok=False,
-                            stderr=(
-                                f"{dependency_call.name} requires durable session storage"
-                            ),
+                    if dependency_call.name == TEXT_WAIT_TOOL.name:
+                        dependency = _create_text_dependency(
+                            run, dependency_call, pending_messages
                         )
-                        _append_tool_results(
-                            session,
-                            run,
-                            (dependency_call,),
-                            (result,),
+                        wait_message = "Waiting for text"
+                    else:
+                        dependency = _create_secret_dependency(
+                            run, dependency_call, pending_messages
                         )
+                        wait_message = "Waiting for Secret input"
+                    if dependency is None:
                         messages_after_checkpoint.append(
                             f"Tool {dependency_call.name}: failed"
                         )
-                    else:
-                        if dependency_call.name == TEXT_WAIT_TOOL.name:
-                            dependency = _create_text_dependency(
-                                session, run, dependency_call
-                            )
-                            wait_message = "Waiting for text"
-                        else:
-                            dependency = _create_secret_dependency(
-                                session, run, dependency_call
-                            )
-                            wait_message = "Waiting for Secret input"
-                        if dependency is None:
-                            messages_after_checkpoint.append(
-                                f"Tool {dependency_call.name}: failed"
-                            )
-                        elif run.status is RunStatus.WAITING:
-                            messages_after_checkpoint.append(
-                                f"{wait_message}: {dependency.prompt}"
-                            )
-                            return_after_checkpoint = True
+                    elif run.status is RunStatus.WAITING:
+                        messages_after_checkpoint.append(
+                            f"{wait_message}: {dependency.prompt}"
+                        )
+                        return_after_checkpoint = True
                 else:
                     results = _execute_tool_calls(
                         session,
@@ -380,8 +409,11 @@ def _run_turns(
                         registry,
                         secret_command_runner,
                         emit,
+                        pending_messages,
                     )
-                    _append_tool_results(session, run, turn.tool_calls, results)
+                    _append_tool_results(
+                        pending_messages, run, turn.tool_calls, results
+                    )
                     for call, result in zip(turn.tool_calls, results, strict=True):
                         if call.name == PLAN_TOOL.name:
                             if result.ok:
@@ -409,19 +441,19 @@ def _run_turns(
                 )
         except UserCancelledError as exc:
             _terminate_run(run, RunStatus.CANCELLED, str(exc))
-            _checkpoint(session, run, store)
+            _checkpoint(session, run, store, context_manager, pending_messages)
             raise
         except (HandshakeError, ContextPressureError) as exc:
             _terminate_run(run, RunStatus.FAILED, str(exc))
-            _checkpoint(session, run, store)
+            _checkpoint(session, run, store, context_manager, pending_messages)
             raise
         except Exception as exc:
             unexpected_error = f"Unexpected runtime failure ({type(exc).__name__})"
             _terminate_run(run, RunStatus.FAILED, unexpected_error)
-            _checkpoint(session, run, store)
+            _checkpoint(session, run, store, context_manager, pending_messages)
             raise AgentLoopError(unexpected_error) from None
 
-        _checkpoint(session, run, store)
+        _checkpoint(session, run, store, context_manager, pending_messages)
         for message in messages_after_checkpoint:
             emit(message)
         if return_after_checkpoint:
@@ -448,7 +480,7 @@ def start_run(
     registry: ToolRegistry,
     *,
     emit: EmitCallback | None = None,
-    store: RunStore | None = None,
+    store: RunStore,
     secret_command_runner: SecretCommandRunner | None = None,
     context_manager: AgentContextManager | None = None,
 ) -> Run:
@@ -459,26 +491,33 @@ def start_run(
         raise AgentLoopError("Only a newly created run can be started")
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if any(message.run_id == run.run_id for message in session.messages):
+    if store.has_run_messages(session.session_id, run.run_id):
         raise AgentLoopError(f"Run {run.run_id} already has session messages")
 
     output = emit or (lambda _message: None)
     current_context_manager = context_manager or AgentContextManager(
         condenser=LLMHistoryCondenser(model)
     )
+    _sync_context(session, store, current_context_manager)
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
     _resume_one_work_item(run)
-    session.messages.append(
+    pending_messages = [
         ModelMessage(
             role="user",
             content=({"type": "text", "text": run.goal},),
             run_id=run.run_id,
         )
+    ]
+    _checkpoint(
+        session,
+        run,
+        store,
+        current_context_manager,
+        pending_messages,
+        create=True,
     )
-    if store is not None:
-        store.create_run(session, run)
-        output(f"Run started: {run.run_id}")
+    output(f"Run started: {run.run_id}")
     return _run_turns(
         session,
         run,
@@ -503,7 +542,7 @@ def prepare_run_for_resume(
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
     changed = reissue_lost_secret_dependencies(run, secret_command_runner)
     if changed:
-        _checkpoint(session, run, store)
+        store.checkpoint_run(session, run)
     return changed
 
 
@@ -514,7 +553,8 @@ def continue_run(
     registry: ToolRegistry,
     *,
     emit: EmitCallback | None = None,
-    store: RunStore | None = None,
+    store: RunStore,
+    pending_messages: tuple[ModelMessage, ...],
     secret_command_runner: SecretCommandRunner | None = None,
     context_manager: AgentContextManager | None = None,
 ) -> Run:
@@ -523,13 +563,15 @@ def continue_run(
         raise AgentLoopError("Only a running run can continue")
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if not any(message.run_id == run.run_id for message in session.messages):
+    if not store.has_run_messages(session.session_id, run.run_id):
         raise AgentLoopError("A resumed run must have model protocol history")
     output = emit or (lambda _message: None)
     current_context_manager = context_manager or AgentContextManager(
         condenser=LLMHistoryCondenser(model)
     )
-    _checkpoint(session, run, store)
+    _sync_context(session, store, current_context_manager)
+    pending = list(pending_messages)
+    _checkpoint(session, run, store, current_context_manager, pending)
     output("Input received; resuming run")
     _resume_one_work_item(run)
     return _run_turns(

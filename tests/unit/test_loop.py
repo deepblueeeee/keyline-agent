@@ -3,7 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from handshake.models.protocol import ModelTurn, ToolCall
+import handshake.runtime.loop as runtime_loop
+from handshake.context import SequencedMessage
+from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import (
@@ -24,6 +26,7 @@ from handshake.runtime.state import (
 from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
+from tests.history_support import fresh_store, history
 
 
 def tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -49,7 +52,9 @@ def final_turn(text: str = "done") -> ModelTurn:
     )
 
 
-def _session_run(tmp_path: Path, goal: str, *, max_steps: int = 50) -> tuple[Session, Run]:
+def _session_run(
+    tmp_path: Path, goal: str, *, max_steps: int = 50
+) -> tuple[Session, Run, SQLiteStateStore]:
     session = Session(workspace=tmp_path)
     run = Run(
         goal=goal,
@@ -57,22 +62,35 @@ def _session_run(tmp_path: Path, goal: str, *, max_steps: int = 50) -> tuple[Ses
         model_name="scripted",
         max_steps=max_steps,
     )
-    return session, run
+    return session, run, fresh_store(tmp_path, session)
 
 
-class _RecordingStore:
-    def __init__(self, events: list[str], *, fail_checkpoint: bool = False) -> None:
+class _RecordingStore(SQLiteStateStore):
+    def __init__(
+        self, events: list[str], database: Path, *, fail_checkpoint: bool = False
+    ) -> None:
+        super().__init__(database)
         self.events = events
         self.fail_checkpoint = fail_checkpoint
         self.snapshots: list[
             tuple[RunStatus, WorkItemStatus, DependencyStatus | None, int]
         ] = []
 
-    def create_run(self, session: Session, run: Run) -> None:
-        del session, run
+    def create_run(
+        self,
+        session: Session,
+        run: Run,
+        messages: tuple[ModelMessage, ...] = (),
+    ) -> tuple[SequencedMessage, ...]:
         self.events.append("create-run")
+        return super().create_run(session, run, messages)
 
-    def checkpoint_run(self, session: Session, run: Run) -> None:
+    def checkpoint_run(
+        self,
+        session: Session,
+        run: Run,
+        messages: tuple[ModelMessage, ...] = (),
+    ) -> tuple[SequencedMessage, ...]:
         dependency_status = (
             run.dependencies[-1].status if run.dependencies else None
         )
@@ -81,12 +99,46 @@ class _RecordingStore:
                 run.status,
                 run.work_items[0].status,
                 dependency_status,
-                len(session.messages),
+                self.message_count(session.session_id) + len(messages),
             )
         )
         self.events.append(f"checkpoint:{run.status.value}")
         if self.fail_checkpoint:
             raise StorageError("checkpoint unavailable")
+        return super().checkpoint_run(session, run, messages)
+
+
+class _FailingIngress:
+    def ingest_messages(
+        self,
+        _session: Session,
+        _messages: tuple[SequencedMessage, ...],
+    ) -> None:
+        raise RuntimeError("view ingress failed")
+
+
+def test_checkpoint_clears_committed_pending_before_view_ingress(tmp_path: Path) -> None:
+    session, run, store = _session_run(tmp_path, "persist once")
+    pending = [
+        ModelMessage(
+            role="user",
+            content=({"type": "text", "text": run.goal},),
+            run_id=run.run_id,
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="view ingress failed"):
+        runtime_loop._checkpoint(
+            session,
+            run,
+            store,
+            _FailingIngress(),  # type: ignore[arg-type]
+            pending,
+            create=True,
+        )
+
+    assert pending == []
+    assert store.message_count(session.session_id) == 1
 
 
 def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: Path) -> None:
@@ -100,9 +152,15 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
             final_turn("finished"),
         ]
     )
-    session, run = _session_run(tmp_path, "copy knowledge")
+    session, run, store = _session_run(tmp_path, "copy knowledge")
 
-    start_run(session, run, model, create_default_registry(lambda _cwd, _argv: True))
+    start_run(
+        session,
+        run,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+    )
 
     assert run.status is RunStatus.COMPLETED
     assert [tool_run.tool_name for tool_run in run.tool_runs] == [
@@ -122,9 +180,15 @@ def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) 
     model = ScriptedModel(
         [tool_turn(ToolCall("missing", "not_registered", {})), final_turn()]
     )
-    session, run = _session_run(tmp_path, "recover")
+    session, run, store = _session_run(tmp_path, "recover")
 
-    start_run(session, run, model, create_default_registry(lambda _cwd, _argv: True))
+    start_run(
+        session,
+        run,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+    )
 
     assert run.status is RunStatus.COMPLETED
     assert run.tool_runs[0].result is not None
@@ -138,7 +202,7 @@ def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
         tool_calls=(ToolCall("b", "read_file", {}),),
         stop_reason="tool_use",
     )
-    session, run = _session_run(tmp_path, "bad")
+    session, run, store = _session_run(tmp_path, "bad")
 
     with pytest.raises(ModelProtocolError):
         start_run(
@@ -146,13 +210,14 @@ def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
             run,
             ScriptedModel([bad_turn]),
             create_default_registry(lambda _cwd, _argv: True),
+            store=store,
         )
 
     assert run.status is RunStatus.FAILED
 
 
 def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
-    session, run = _session_run(tmp_path, "bad")
+    session, run, store = _session_run(tmp_path, "bad")
 
     with pytest.raises(ModelProviderError):
         start_run(
@@ -160,13 +225,14 @@ def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
             run,
             ScriptedModel([]),
             create_default_registry(lambda _cwd, _argv: True),
+            store=store,
         )
 
     assert run.status is RunStatus.FAILED
 
 
 def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
-    session, run = _session_run(tmp_path, "too long", max_steps=1)
+    session, run, store = _session_run(tmp_path, "too long", max_steps=1)
     model = ScriptedModel(
         [
             tool_turn(
@@ -185,6 +251,7 @@ def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
             run,
             model,
             create_default_registry(lambda _cwd, _argv: True),
+            store=store,
         )
 
     assert run.status is RunStatus.FAILED
@@ -192,7 +259,7 @@ def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
 
 def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None:
     (tmp_path / "value.txt").write_text("old", encoding="utf-8")
-    session, run = _session_run(tmp_path, "replace one value")
+    session, run, store = _session_run(tmp_path, "replace one value")
     model = ScriptedModel(
         [
             tool_turn(ToolCall("read", "read_file", {"path": "value.txt"})),
@@ -225,6 +292,7 @@ def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None
         run,
         model,
         create_default_registry(lambda _cwd, _argv: True),
+        store=store,
     )
 
     assert run.status is RunStatus.COMPLETED
@@ -235,7 +303,7 @@ def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None
 
 
 def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
-    session, run = _session_run(tmp_path, "small request")
+    session, run, store = _session_run(tmp_path, "small request")
     model = ScriptedModel([final_turn()])
 
     start_run(
@@ -243,6 +311,7 @@ def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
         run,
         model,
         create_default_registry(lambda _cwd, _argv: True),
+        store=store,
     )
 
     plan_tool = next(tool for tool in model.tool_sets[0] if tool.name == "update_plan")
@@ -254,16 +323,16 @@ def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) ->
     def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
         raise UserCancelledError("cancelled")
 
-    session, run = _session_run(tmp_path, "cancel")
+    session, run, store = _session_run(tmp_path, "cancel")
     model = ScriptedModel(
         [tool_turn(ToolCall("shell", "run_shell", {"argv": ["true"]}))]
     )
 
     with pytest.raises(UserCancelledError):
-        start_run(session, run, model, create_default_registry(cancel))
+        start_run(session, run, model, create_default_registry(cancel), store=store)
 
     assert run.status is RunStatus.CANCELLED
-    result = session.messages[-1].content[0]
+    result = history(store, session)[-1].content[0]
     assert result["type"] == "tool_result"
     assert result["tool_use_id"] == "shell"
     assert result["is_error"] is True
@@ -273,7 +342,7 @@ def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
     def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
         raise UserCancelledError("cancelled")
 
-    session, run = _session_run(tmp_path, "several tools")
+    session, run, store = _session_run(tmp_path, "several tools")
     calls = (
         ToolCall("write-a", "write_file", {"path": "a.txt", "content": "done"}),
         ToolCall("shell", "run_shell", {"argv": ["true"]}),
@@ -286,9 +355,10 @@ def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
             run,
             ScriptedModel([tool_turn(*calls)]),
             create_default_registry(cancel),
+            store=store,
         )
 
-    results = session.messages[-1].content
+    results = history(store, session)[-1].content
     assert [block["tool_use_id"] for block in results] == [
         "write-a",
         "shell",
@@ -303,7 +373,7 @@ def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
 
 def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("value", encoding="utf-8")
-    session, first = _session_run(tmp_path, "inspect")
+    session, first, store = _session_run(tmp_path, "inspect")
     first_model = ScriptedModel(
         [
             ModelTurn(
@@ -323,11 +393,11 @@ def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -
         ]
     )
     registry = create_default_registry(lambda _cwd, _argv: True)
-    start_run(session, first, first_model, registry)
+    start_run(session, first, first_model, registry, store=store)
     second = create_followup_run(session, [first], "continue")
     second_model = ScriptedModel([final_turn("second complete")])
 
-    start_run(session, second, second_model, registry)
+    start_run(session, second, second_model, registry, store=store)
 
     messages = second_model.contexts[0].messages
     assert [message.run_id for message in messages] == [
@@ -363,9 +433,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         ),
         stop_reason="tool_use",
     )
-    store = SQLiteStateStore(tmp_path / "handshake.db")
-    session, run = _session_run(tmp_path, "style the button")
-    store.create_session(session)
+    session, run, store = _session_run(tmp_path, "style the button")
     first_model = ScriptedModel([wait_turn])
 
     start_run(
@@ -379,7 +447,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
     assert run.status is RunStatus.WAITING
     assert run.work_items[0].status is WorkItemStatus.READY
     assert run.dependencies[0].status is DependencyStatus.OPEN
-    immediate_result = session.messages[-1].content[0]
+    immediate_result = history(store, session)[-1].content[0]
     assert immediate_result["type"] == "tool_result"
     assert immediate_result["tool_use_id"] == "ask-color"
     assert immediate_result["is_error"] is False
@@ -390,7 +458,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
 
     resumed_session = store.load_session(session.session_id)
     resumed_run = store.load_run(run.run_id)
-    resolve_text_dependency(
+    continuation = resolve_text_dependency(
         resumed_session,
         resumed_run,
         resumed_run.dependencies[0].dependency_id,
@@ -403,6 +471,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         second_model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        pending_messages=(continuation,),
     )
 
     context = second_model.contexts[0]
@@ -428,8 +497,9 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
-    store = _RecordingStore(events)
-    session, run = _session_run(tmp_path, "choose a color")
+    session, run, _unused_store = _session_run(tmp_path, "choose a color")
+    store = _RecordingStore(events, tmp_path / "recording.db")
+    store.create_session(session)
     wait_model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
     )
@@ -446,7 +516,9 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     assert events.index("checkpoint:waiting") < events.index(
         "Waiting for text: Which color?"
     )
-    resolve_text_dependency(session, run, run.dependencies[0].dependency_id, "navy")
+    continuation = resolve_text_dependency(
+        session, run, run.dependencies[0].dependency_id, "navy"
+    )
     continue_run(
         session,
         run,
@@ -454,6 +526,7 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
         create_default_registry(lambda _cwd, _argv: True),
         emit=events.append,
         store=store,
+        pending_messages=(continuation,),
     )
 
     assert store.snapshots == [
@@ -469,8 +542,11 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
 
 def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -> None:
     events: list[str] = []
-    store = _RecordingStore(events, fail_checkpoint=True)
-    session, run = _session_run(tmp_path, "choose a color")
+    session, run, _unused_store = _session_run(tmp_path, "choose a color")
+    store = _RecordingStore(
+        events, tmp_path / "recording-failure.db", fail_checkpoint=True
+    )
+    store.create_session(session)
     model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
     )
@@ -497,9 +573,7 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
         ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}),
     )
     model = ScriptedModel([mixed, final_turn("corrected")])
-    store = SQLiteStateStore(tmp_path / "handshake.db")
-    session, run = _session_run(tmp_path, "safe")
-    store.create_session(session)
+    session, run, store = _session_run(tmp_path, "safe")
 
     start_run(
         session,
@@ -517,9 +591,7 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
 
 
 def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
-    store = SQLiteStateStore(tmp_path / "handshake.db")
-    session, run = _session_run(tmp_path, "ask once", max_steps=1)
-    store.create_session(session)
+    session, run, store = _session_run(tmp_path, "ask once", max_steps=1)
     model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}))]
     )
@@ -532,7 +604,7 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
     )
     resumed_session = store.load_session(session.session_id)
     resumed_run = store.load_run(run.run_id)
-    resolve_text_dependency(
+    continuation = resolve_text_dependency(
         resumed_session,
         resumed_run,
         resumed_run.dependencies[0].dependency_id,
@@ -546,6 +618,7 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
             ScriptedModel([final_turn()]),
             create_default_registry(lambda _cwd, _argv: True),
             store=store,
+            pending_messages=(continuation,),
         )
 
     assert resumed_run.status is RunStatus.FAILED

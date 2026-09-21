@@ -21,6 +21,9 @@ from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, Session, ToolResult
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools.registry import ToolBinding, ToolRegistry
+from tests.history_support import fresh_store, history, ingest
+
+_HISTORY: dict[str, list[ModelMessage]] = {}
 
 
 class CharacterTokenEstimator:
@@ -54,8 +57,13 @@ def _policy(
 
 def _session_run(tmp_path: Path) -> tuple[Session, Run]:
     session = Session(workspace=tmp_path)
+    _HISTORY[session.session_id] = []
     run = Run(goal="Keep working", session_id=session.session_id)
     return session, run
+
+
+def _messages(session: Session) -> list[ModelMessage]:
+    return _HISTORY[session.session_id]
 
 
 def _capture_after_ingress(
@@ -63,7 +71,8 @@ def _capture_after_ingress(
     session: Session,
     run: Run,
 ) -> ContextView:
-    manager.ingest_pending(session)
+    start = manager.message_count(session)
+    ingest(manager, session, _messages(session)[start:], start=start)
     return manager.capture(session, run)
 
 
@@ -73,7 +82,8 @@ def _apply_pressure(
     run: Run,
     tools: tuple[ToolDefinition, ...] = (),
 ) -> ContextView:
-    manager.ingest_pending(session)
+    start = manager.message_count(session)
+    ingest(manager, session, _messages(session)[start:], start=start)
     pressure = manager.measure_pressure(session, run, tools)
     if pressure >= manager.policy.pressure_trigger_tokens:
         while (
@@ -127,8 +137,10 @@ def test_ingress_limits_every_large_result_but_preserves_raw_history(
     session, run = _session_run(tmp_path)
     successful = "HEAD-success-" + "x" * 1_000 + "-TAIL-success"
     failed = "HEAD-failed-" + "y" * 1_000 + "-TAIL-failed"
-    session.messages.extend(_tool_round(run.run_id, "read", "read_file", successful))
-    session.messages.extend(_tool_round(run.run_id, "shell", "run_shell", failed, is_error=True))
+    _messages(session).extend(_tool_round(run.run_id, "read", "read_file", successful))
+    _messages(session).extend(
+        _tool_round(run.run_id, "shell", "run_shell", failed, is_error=True)
+    )
     estimator = CharacterTokenEstimator()
     manager = AgentContextManager(_policy(recent_messages=8, ingress_tokens=300), estimator)
 
@@ -148,14 +160,14 @@ def test_ingress_limits_every_large_result_but_preserves_raw_history(
     assert visible_results[1]["is_error"] is True
     assert "status=success" in visible_results[0]["content"]
     assert "status=failure" in visible_results[1]["content"]
-    assert session.messages[1].content[0]["content"] == successful
-    assert session.messages[3].content[0]["content"] == failed
+    assert _messages(session)[1].content[0]["content"] == successful
+    assert _messages(session)[3].content[0]["content"] == failed
     assert "ingress-limited" in view.protected_recent.messages[1].message.content[0]["content"]
 
 
 def test_recent_boundary_uses_larger_message_or_token_window(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(
+    _messages(session).extend(
         ModelMessage("user", ({"type": "text", "text": "x"},), run.run_id) for _ in range(12)
     )
     fixed_manager = AgentContextManager(
@@ -175,8 +187,10 @@ def test_recent_boundary_uses_larger_message_or_token_window(tmp_path: Path) -> 
 
 def test_recent_boundary_does_not_split_tool_round(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.append(ModelMessage("user", ({"type": "text", "text": "old"},), run.run_id))
-    session.messages.extend(_tool_round(run.run_id, "read", "read_file", "result"))
+    _messages(session).append(
+        ModelMessage("user", ({"type": "text", "text": "old"},), run.run_id)
+    )
+    _messages(session).extend(_tool_round(run.run_id, "read", "read_file", "result"))
     manager = AgentContextManager(_policy(recent_messages=1), CharacterTokenEstimator())
 
     view = _capture_after_ingress(manager, session, run)
@@ -189,7 +203,7 @@ def test_pressure_masks_stale_results_oldest_first_until_target(
 ) -> None:
     session, run = _session_run(tmp_path)
     for index in range(5):
-        session.messages.extend(
+        _messages(session).extend(
             _tool_round(
                 run.run_id,
                 f"read-{index}",
@@ -226,8 +240,8 @@ def test_pressure_masks_stale_results_oldest_first_until_target(
 
 def test_stale_candidates_remain_visible_below_pressure_trigger(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(_tool_round(run.run_id, "read", "read_file", "old result"))
-    session.messages.extend(
+    _messages(session).extend(_tool_round(run.run_id, "read", "read_file", "old result"))
+    _messages(session).extend(
         ModelMessage("user", ({"type": "text", "text": f"recent-{index}"},), run.run_id)
         for index in range(2)
     )
@@ -244,8 +258,8 @@ def test_stale_candidates_remain_visible_below_pressure_trigger(tmp_path: Path) 
 
 def test_pressure_measurement_does_not_execute_masking(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(_tool_round(run.run_id, "read", "read_file", "x" * 2_000))
-    session.messages.append(
+    _messages(session).extend(_tool_round(run.run_id, "read", "read_file", "x" * 2_000))
+    _messages(session).append(
         ModelMessage("user", ({"type": "text", "text": "z" * 6_000},), run.run_id)
     )
     manager = AgentContextManager(
@@ -257,7 +271,7 @@ def test_pressure_measurement_does_not_execute_masking(tmp_path: Path) -> None:
         ),
         CharacterTokenEstimator(),
     )
-    manager.ingest_pending(session)
+    ingest(manager, session, _messages(session))
 
     pressure = manager.measure_pressure(session, run, ())
     before = manager.build(session, run)
@@ -289,10 +303,12 @@ def test_pressure_eligibility_depends_only_on_stale_boundary(
     tmp_path: Path,
 ) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(_tool_round("one", "same", "read_file", "tiny"))
-    session.messages.extend(_tool_round("two", "same", "read_file", "failed", is_error=True))
-    session.messages.extend(_tool_round(run.run_id, "edit", "edit_file", "edited"))
-    session.messages.append(
+    _messages(session).extend(_tool_round("one", "same", "read_file", "tiny"))
+    _messages(session).extend(
+        _tool_round("two", "same", "read_file", "failed", is_error=True)
+    )
+    _messages(session).extend(_tool_round(run.run_id, "edit", "edit_file", "edited"))
+    _messages(session).append(
         ModelMessage("user", ({"type": "text", "text": "z" * 6_000},), run.run_id)
     )
     manager = AgentContextManager(
@@ -323,7 +339,7 @@ def test_pressure_masks_every_stale_block_in_multi_result_message(
     tmp_path: Path,
 ) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(
+    _messages(session).extend(
         [
             ModelMessage(
                 "assistant",
@@ -375,8 +391,8 @@ def test_ingress_projection_is_replaced_when_result_becomes_stale_mask(
     tmp_path: Path,
 ) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.extend(_tool_round(run.run_id, "read", "read_file", "x" * 4_000))
-    session.messages.append(
+    _messages(session).extend(_tool_round(run.run_id, "read", "read_file", "x" * 4_000))
+    _messages(session).append(
         ModelMessage("user", ({"type": "text", "text": "y" * 5_000},), run.run_id)
     )
     manager = AgentContextManager(
@@ -396,7 +412,7 @@ def test_ingress_projection_is_replaced_when_result_becomes_stale_mask(
 
 def test_pressure_exhaustion_only_fails_at_hard_limit(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
-    session.messages.append(
+    _messages(session).append(
         ModelMessage("user", ({"type": "text", "text": "x" * 4_000},), run.run_id)
     )
     estimator = CharacterTokenEstimator()
@@ -417,6 +433,7 @@ def test_pressure_exhaustion_only_fails_at_hard_limit(tmp_path: Path) -> None:
 
 def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
+    store = fresh_store(tmp_path, session)
     model = ScriptedModel([])
     manager = AgentContextManager(
         _policy(context_window=500, trigger=0.5, target=0.3),
@@ -430,6 +447,7 @@ def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> No
             model,
             ToolRegistry(),
             context_manager=manager,
+            store=store,
         )
     assert model.contexts == []
 
@@ -479,7 +497,7 @@ def test_loop_limits_model_ingress_but_persists_complete_result(tmp_path: Path) 
 
     visible = model.contexts[1].messages[-1].content[0]["content"]
     loaded_session = store.load_session(session.session_id)
-    persisted = loaded_session.messages[-2].content[0]["content"]
+    persisted = history(store, loaded_session)[-2].content[0]["content"]
     assert "ingress-limited" in visible
     assert len(visible) <= 300
     assert json.loads(persisted)["stdout"] == original
@@ -500,13 +518,13 @@ def test_new_manager_rebuilds_masking_state_from_raw_sqlite_history(
         ),
         CharacterTokenEstimator(),
     )
-    session.messages.extend(_tool_round(run.run_id, "shell", "run_shell", "raw-output"))
-    manager.ingest_pending(session)
-    session.messages.append(
+    _messages(session).extend(_tool_round(run.run_id, "shell", "run_shell", "raw-output"))
+    ingest(manager, session, _messages(session))
+    _messages(session).append(
         ModelMessage("user", ({"type": "text", "text": "z" * 6_000},), run.run_id),
     )
-    manager.ingest_pending(session)
-    store.create_run(session, run)
+    ingest(manager, session, _messages(session)[2:], start=2)
+    store.create_run(session, run, tuple(_messages(session)))
 
     pressure = manager.measure_pressure(session, run, ())
     assert pressure >= manager.policy.pressure_trigger_tokens
@@ -516,10 +534,12 @@ def test_new_manager_rebuilds_masking_state_from_raw_sqlite_history(
     loaded_session = store.load_session(session.session_id)
     loaded_run = store.load_run(run.run_id)
     restored = AgentContextManager(manager.policy, manager.estimator)
-    restored.ingest_pending(loaded_session)
+    restored.ingest_messages(
+        loaded_session, store.read_messages(loaded_session.session_id)
+    )
     restored_pressure = restored.measure_pressure(loaded_session, loaded_run, ())
     assert restored_pressure >= restored.policy.pressure_trigger_tokens
     assert restored.mask_oldest_stale_result(loaded_session)
     context = restored.build(loaded_session, loaded_run)
     assert "stale tool result masked" in context.messages[1].content[0]["content"]
-    assert loaded_session.messages[1].content[0]["content"] == "raw-output"
+    assert history(store, loaded_session)[1].content[0]["content"] == "raw-output"

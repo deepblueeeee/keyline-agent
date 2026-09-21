@@ -18,6 +18,7 @@ from handshake.runtime.state import (
     SecretHandleStatus,
 )
 from handshake.storage.sqlite import SQLiteStateStore
+from tests.history_support import history
 
 
 class _TTY:
@@ -186,8 +187,9 @@ def test_run_answers_text_wait_and_finishes_in_same_process(
     assert len(runs) == 1
     assert runs[0].status is RunStatus.COMPLETED
     assert runs[0].dependencies[0].status is DependencyStatus.SATISFIED
-    session = _store(home).load_session(runs[0].session_id)
-    assert "User response: navy" in session.messages[-2].content[0]["text"]
+    store = _store(home)
+    session = store.load_session(runs[0].session_id)
+    assert "User response: navy" in history(store, session)[-2].content[0]["text"]
 
 
 def test_wait_survives_noninteractive_exit_interrupt_and_resume(
@@ -227,10 +229,12 @@ def test_wait_survives_noninteractive_exit_interrupt_and_resume(
     )
     assert cli.main(["resume", session_id]) == 0
     resumed = _store(home).load_run(run.run_id)
-    resumed_session = _store(home).load_session(session_id)
+    store = _store(home)
+    resumed_session = store.load_session(session_id)
+    resumed_messages = history(store, resumed_session)
     assert resumed.status is RunStatus.COMPLETED
-    assert resumed_session.messages[-3].content[0]["tool_use_id"] == "ask-color"
-    assert "User response: navy" in resumed_session.messages[-2].content[0]["text"]
+    assert resumed_messages[-3].content[0]["tool_use_id"] == "ask-color"
+    assert "User response: navy" in resumed_messages[-2].content[0]["text"]
 
 
 def test_interactive_session_creates_followup_run_with_full_history(
@@ -371,7 +375,7 @@ with urllib.request.urlopen(request, timeout=3) as response:
     assert canary not in captured.out
     assert canary not in captured.err
     assert canary not in repr(model.contexts)
-    assert canary not in repr(session.messages)
+    assert canary not in repr(history(state_store, session))
     assert canary.encode() not in state_store.database_path.read_bytes()
     assert canary not in workspace_text
     assert canary not in git_diff

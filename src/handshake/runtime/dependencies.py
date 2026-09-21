@@ -17,8 +17,10 @@ from handshake.runtime.state import (
 
 def resolve_text_dependency(
     session: Session, run: Run, dependency_id: str, response: str
-) -> None:
-    """Satisfy one text dependency and append a continuation message."""
+) -> ModelMessage:
+    """Satisfy one text dependency and return its uncommitted continuation."""
+    if run.session_id != session.session_id:
+        raise WaitResolutionError(f"Run {run.run_id} does not belong to the session")
     normalized = response.strip()
     if not normalized:
         raise WaitResolutionError("Text response must not be empty")
@@ -44,21 +46,19 @@ def resolve_text_dependency(
     dependency.transition(DependencyStatus.SATISFIED)
     dependency.resolved_at = utc_now()
     run.transition(RunStatus.RUNNING)
-    session.messages.append(
-        ModelMessage(
-            role="user",
-            content=(
-                {
-                    "type": "text",
-                    "text": (
-                        "A requested text dependency has been resolved.\n"
-                        f"Dependency ID: {dependency.dependency_id}\n"
-                        f"Question: {dependency.prompt}\n"
-                        f"User response: {normalized}\n"
-                        "Continue the associated work using this information."
-                    ),
-                },
-            ),
-            run_id=run.run_id,
-        )
+    return ModelMessage(
+        role="user",
+        content=(
+            {
+                "type": "text",
+                "text": (
+                    "A requested text dependency has been resolved.\n"
+                    f"Dependency ID: {dependency.dependency_id}\n"
+                    f"Question: {dependency.prompt}\n"
+                    f"User response: {normalized}\n"
+                    "Continue the associated work using this information."
+                ),
+            },
+        ),
+        run_id=run.run_id,
     )

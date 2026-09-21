@@ -10,7 +10,6 @@ from secrets import token_urlsafe
 from typing import Any
 from uuid import uuid4
 
-from handshake.models.protocol import ModelMessage
 from handshake.runtime.errors import InvalidStateTransitionError
 
 
@@ -201,7 +200,6 @@ class SecretHandle:
 class Session:
     workspace: Path
     session_id: str = field(default_factory=lambda: str(uuid4()))
-    messages: list[ModelMessage] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 

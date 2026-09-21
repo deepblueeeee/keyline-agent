@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
+from handshake.context.state import SequencedMessage
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import (
     Dependency,
@@ -49,8 +51,6 @@ class SQLiteStateStore:
     def create_session(self, session: Session) -> None:
         try:
             workspace = session.workspace.expanduser().resolve()
-            if session.messages:
-                raise StorageError("A new session cannot contain messages before its first run")
             with self._connect() as connection:
                 connection.execute(
                     """
@@ -96,7 +96,12 @@ class SQLiteStateStore:
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def create_run(self, session: Session, run: Run) -> None:
+    def create_run(
+        self,
+        session: Session,
+        run: Run,
+        messages: tuple[ModelMessage, ...] = (),
+    ) -> tuple[SequencedMessage, ...]:
         """Atomically append a run and the session transcript containing its prompt."""
         try:
             updated_at = utc_now()
@@ -119,14 +124,22 @@ class SQLiteStateStore:
                     )
                 self._insert_run(connection, run, updated_at)
                 self._update_session(connection, session, updated_at=updated_at)
-                self._replace_session_messages(connection, session)
+                appended = self._append_messages(
+                    connection, session.session_id, messages
+                )
                 self._replace_run_children(connection, run)
             session.updated_at = updated_at
             run.updated_at = updated_at
+            return appended
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def checkpoint_run(self, session: Session, run: Run) -> None:
+    def checkpoint_run(
+        self,
+        session: Session,
+        run: Run,
+        messages: tuple[ModelMessage, ...] = (),
+    ) -> tuple[SequencedMessage, ...]:
         """Atomically checkpoint one run and the conversation it has extended."""
         try:
             updated_at = utc_now()
@@ -135,10 +148,13 @@ class SQLiteStateStore:
                 self._validate_run_membership(connection, session, run)
                 self._update_session(connection, session, updated_at=updated_at)
                 self._update_run(connection, run, updated_at=updated_at)
-                self._replace_session_messages(connection, session)
+                appended = self._append_messages(
+                    connection, session.session_id, messages
+                )
                 self._replace_run_children(connection, run)
             session.updated_at = updated_at
             run.updated_at = updated_at
+            return appended
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
@@ -181,23 +197,9 @@ class SQLiteStateStore:
         if row is None:
             raise SessionNotFoundError(f"Session not found: {session_id}")
         try:
-            messages = [
-                ModelMessage(
-                    role=message_row["role"],
-                    content=tuple(
-                        _load_json(message_row["content_json"], "message content")
-                    ),
-                    run_id=str(message_row["run_id"]),
-                )
-                for message_row in connection.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY sequence",
-                    (session_id,),
-                )
-            ]
             return Session(
                 session_id=str(row["session_id"]),
                 workspace=Path(row["workspace"]),
-                messages=messages,
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
             )
@@ -392,11 +394,27 @@ class SQLiteStateStore:
         if cursor.rowcount != 1:
             raise RunNotFoundError(f"Run not found: {run.run_id}")
 
-    def _replace_session_messages(
-        self, connection: sqlite3.Connection, session: Session
-    ) -> None:
-        connection.execute(
-            "DELETE FROM messages WHERE session_id = ?", (session.session_id,)
+    @staticmethod
+    def _message_count(connection: sqlite3.Connection, session_id: str) -> int:
+        row = connection.execute(
+            "SELECT COUNT(*), MAX(sequence) FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        count = int(row[0])
+        if count and int(row[1]) != count - 1:
+            raise StorageError("Message sequences are not contiguous")
+        return count
+
+    def _append_messages(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        messages: tuple[ModelMessage, ...],
+    ) -> tuple[SequencedMessage, ...]:
+        start = self._message_count(connection, session_id)
+        appended = tuple(
+            SequencedMessage(start + index, message)
+            for index, message in enumerate(messages)
         )
         connection.executemany(
             """
@@ -405,15 +423,90 @@ class SQLiteStateStore:
             """,
             (
                 (
-                    session.session_id,
-                    index,
+                    session_id,
+                    start + index,
                     message.run_id,
                     message.role,
                     _dump_json(list(message.content)),
                 )
-                for index, message in enumerate(session.messages)
+                for index, message in enumerate(messages)
             ),
         )
+        return appended
+
+    def append_messages(
+        self, session_id: str, messages: tuple[ModelMessage, ...]
+    ) -> tuple[SequencedMessage, ...]:
+        """Append a batch without replacing any existing transcript rows."""
+        try:
+            with self._connect() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone() is None:
+                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                return self._append_messages(connection, session_id, messages)
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def read_messages(
+        self, session_id: str, start: int = 0, end: int | None = None
+    ) -> Iterator[SequencedMessage]:
+        """Stream decoded messages in the half-open range [start, end)."""
+        if start < 0 or (end is not None and end < start):
+            raise StorageError("Invalid history range")
+        try:
+            with self._connect() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone() is None:
+                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                rows = connection.execute(
+                    """
+                    SELECT sequence, run_id, role, content_json
+                    FROM messages
+                    WHERE session_id = ? AND sequence >= ?
+                      AND (? IS NULL OR sequence < ?)
+                    ORDER BY sequence
+                    """,
+                    (session_id, start, end, end),
+                )
+                for row in rows:
+                    yield SequencedMessage(
+                        sequence=int(row["sequence"]),
+                        message=ModelMessage(
+                            role=cast(Literal["user", "assistant"], str(row["role"])),
+                            content=tuple(
+                                _load_json(row["content_json"], "message content")
+                            ),
+                            run_id=str(row["run_id"]),
+                        ),
+                    )
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def message_count(self, session_id: str, run_id: str | None = None) -> int:
+        try:
+            with self._connect() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone() is None:
+                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                if run_id is None:
+                    return self._message_count(connection, session_id)
+                return int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM messages
+                        WHERE session_id = ? AND run_id = ?
+                        """,
+                        (session_id, run_id),
+                    ).fetchone()[0]
+                )
+        except (OSError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def has_run_messages(self, session_id: str, run_id: str) -> bool:
+        return self.message_count(session_id, run_id) > 0
 
     def _replace_run_children(
         self, connection: sqlite3.Connection, run: Run

@@ -178,7 +178,7 @@ def _drive_run(
             if not response.strip():
                 print("Response must not be empty; the run is still waiting.")
                 continue
-            resolve_text_dependency(
+            continuation = resolve_text_dependency(
                 session, run, dependency.dependency_id, response
             )
         elif dependency.kind is DependencyKind.SECRET:
@@ -188,7 +188,7 @@ def _drive_run(
             if secret_value == "":
                 print("Secret must not be empty; the run is still waiting.")
                 continue
-            resolve_secret_dependency(
+            continuation = resolve_secret_dependency(
                 session,
                 run,
                 dependency.dependency_id,
@@ -209,6 +209,7 @@ def _drive_run(
             store=store,
             secret_command_runner=secret_command_runner,
             context_manager=context_manager,
+            pending_messages=(continuation,),
         )
     if run.status is not RunStatus.COMPLETED:
         raise HandshakeError(
@@ -429,7 +430,7 @@ def _inspect_session(args: argparse.Namespace) -> int:
     print(f"Session:   {session.session_id}")
     print(f"Workspace: {session.workspace}")
     print(f"Created:   {session.created_at}")
-    print(f"Messages:  {len(session.messages)}")
+    print(f"Messages:  {store.message_count(session.session_id)}")
     print("Runs:")
     for run in runs:
         goal = run.goal.replace("\n", " ")
@@ -449,7 +450,7 @@ def _inspect_run(args: argparse.Namespace) -> int:
     store = _state_store()
     run = store.load_run(args.run_id)
     session = store.load_session(run.session_id)
-    message_count = sum(message.run_id == run.run_id for message in session.messages)
+    message_count = store.message_count(session.session_id, run.run_id)
     print(f"Run:         {run.run_id}")
     print(f"Session:     {run.session_id}")
     print(f"Sequence:    {run.sequence}")
@@ -579,7 +580,9 @@ def _run_demo(_args: argparse.Namespace) -> int:
             model_name="scripted",
         )
         registry = create_default_registry(lambda _cwd, _argv: True)
-        start_run(session, run, _demo_model(), registry, emit=print)
+        store = SQLiteStateStore(Path(temporary) / "demo.db")
+        store.create_session(session)
+        start_run(session, run, _demo_model(), registry, emit=print, store=store)
         _print_final_summary(run)
         return 0
 

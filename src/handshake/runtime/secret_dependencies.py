@@ -33,8 +33,10 @@ def resolve_secret_dependency(
     dependency_id: str,
     raw_value: str,
     writer: SecretWriter,
-) -> None:
-    """Route one raw Secret to its handle without adding it to the transcript."""
+) -> ModelMessage:
+    """Route a Secret and return an opaque, uncommitted continuation."""
+    if run.session_id != session.session_id:
+        raise SecretInputError(f"Run {run.run_id} does not belong to the session")
     if raw_value == "":
         raise SecretInputError("Secret value must not be empty")
     dependency = run.dependency_by_id(dependency_id)
@@ -62,26 +64,24 @@ def resolve_secret_dependency(
     dependency.transition(DependencyStatus.SATISFIED)
     dependency.resolved_at = utc_now()
     run.transition(RunStatus.RUNNING)
-    session.messages.append(
-        ModelMessage(
-            role="user",
-            content=(
-                {
-                    "type": "text",
-                    "text": (
-                        "A requested Secret dependency is now available through its "
-                        "opaque handle. The Secret value is not included here.\n"
-                        f"Dependency ID: {dependency.dependency_id}\n"
-                        f"Secret handle: {handle.secret_handle}\n"
-                        f"Purpose: {handle.purpose}\n"
-                        f"Consumer: {handle.consumer}\n"
-                        f"Environment variable: {handle.environment_variable}\n"
-                        "Continue the associated work using the designated consumer."
-                    ),
-                },
-            ),
-            run_id=run.run_id,
-        )
+    return ModelMessage(
+        role="user",
+        content=(
+            {
+                "type": "text",
+                "text": (
+                    "A requested Secret dependency is now available through its "
+                    "opaque handle. The Secret value is not included here.\n"
+                    f"Dependency ID: {dependency.dependency_id}\n"
+                    f"Secret handle: {handle.secret_handle}\n"
+                    f"Purpose: {handle.purpose}\n"
+                    f"Consumer: {handle.consumer}\n"
+                    f"Environment variable: {handle.environment_variable}\n"
+                    "Continue the associated work using the designated consumer."
+                ),
+            },
+        ),
+        run_id=run.run_id,
     )
 
 

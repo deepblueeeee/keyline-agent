@@ -10,7 +10,7 @@ from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 
 
-def _completed_initial_run(session: Session) -> Run:
+def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, ...]]:
     run = create_initial_run(
         session,
         "first goal",
@@ -19,29 +19,27 @@ def _completed_initial_run(session: Session) -> Run:
     )
     run.transition(RunStatus.RUNNING)
     run.work_items[0].transition(WorkItemStatus.RUNNING)
-    session.messages.extend(
-        [
-            ModelMessage(
-                role="user",
-                content=({"type": "text", "text": run.goal},),
-                run_id=run.run_id,
-            ),
-            ModelMessage(
-                role="assistant",
-                content=({"type": "text", "text": "first result"},),
-                run_id=run.run_id,
-            ),
-        ]
+    messages = (
+        ModelMessage(
+            role="user",
+            content=({"type": "text", "text": run.goal},),
+            run_id=run.run_id,
+        ),
+        ModelMessage(
+            role="assistant",
+            content=({"type": "text", "text": "first result"},),
+            run_id=run.run_id,
+        ),
     )
     run.final_summary = "first result"
     run.work_items[0].transition(WorkItemStatus.COMPLETED)
     run.transition(RunStatus.COMPLETED)
-    return run
+    return run, messages
 
 
 def test_followup_run_inherits_config_without_owning_messages(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
-    first = _completed_initial_run(session)
+    first, messages = _completed_initial_run(session)
 
     second = create_followup_run(session, [first], "second goal")
 
@@ -51,7 +49,7 @@ def test_followup_run_inherits_config_without_owning_messages(tmp_path: Path) ->
     assert second.max_steps == 17
     assert second.model_turns == 0
     assert not hasattr(second, "messages")
-    assert [message.run_id for message in session.messages] == [
+    assert [message.run_id for message in messages] == [
         first.run_id,
         first.run_id,
     ]
@@ -99,29 +97,30 @@ def test_competing_followup_run_cannot_fork_session_history(tmp_path: Path) -> N
     store = SQLiteStateStore(tmp_path / "handshake.db")
     session = Session(workspace=tmp_path)
     store.create_session(session)
-    first = _completed_initial_run(session)
-    store.create_run(session, first)
+    first, messages = _completed_initial_run(session)
+    store.create_run(session, first, messages)
 
     session_a = store.load_session(session.session_id)
     session_b = store.load_session(session.session_id)
     first_snapshot = store.load_run(first.run_id)
     candidate_a = create_followup_run(session_a, [first_snapshot], "candidate A")
     candidate_b = create_followup_run(session_b, [first_snapshot], "candidate B")
-    for candidate, snapshot in ((candidate_a, session_a), (candidate_b, session_b)):
+    pending: dict[str, tuple[ModelMessage, ...]] = {}
+    for candidate in (candidate_a, candidate_b):
         candidate.transition(RunStatus.RUNNING)
         candidate.work_items[0].transition(WorkItemStatus.RUNNING)
-        snapshot.messages.append(
+        pending[candidate.run_id] = (
             ModelMessage(
                 role="user",
                 content=({"type": "text", "text": candidate.goal},),
                 run_id=candidate.run_id,
-            )
+            ),
         )
 
-    store.create_run(session_a, candidate_a)
+    store.create_run(session_a, candidate_a, pending[candidate_a.run_id])
 
     with pytest.raises(StorageError, match="is not the next run"):
-        store.create_run(session_b, candidate_b)
+        store.create_run(session_b, candidate_b, pending[candidate_b.run_id])
 
     runs = store.list_runs(session.session_id)
     assert [run.goal for run in runs] == ["first goal", "candidate A"]
