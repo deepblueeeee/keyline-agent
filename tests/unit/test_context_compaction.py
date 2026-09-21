@@ -108,6 +108,8 @@ def test_frontier_background_suffix_and_incremental_growth(tmp_path: Path) -> No
     assert [m.sequence for m in view.history[2].messages] == [4, 5]
     assert condenser.calls[1][1] == view.history[:2]
     assert [c[0] for c in condenser.calls] == ["raw", "raw", "rollup"]
+    assert tuple(manager._states[session.session_id].messages) == (4, 5, 6)
+    assert manager._states[session.session_id].message_count == 7
     assert _messages(session) == original
     assert view.protected_recent.messages[0].message == original[6]
     _messages(session).append(ModelMessage("user", ({"type": "text", "text": "new"},)))
@@ -116,6 +118,8 @@ def test_frontier_background_suffix_and_incremental_growth(tmp_path: Path) -> No
     target = condenser.calls[3][2]
     assert isinstance(target, tuple)
     assert [item.sequence for item in target] == [4, 5, 6]
+    assert tuple(manager._states[session.session_id].messages) == (4, 5, 6, 7)
+    assert manager._states[session.session_id].message_count == 8
     calls = len(condenser.calls)
     manager.build(session, run)
     manager.capture(session, run)
@@ -130,6 +134,7 @@ def test_rollup_after_raw_exhaustion_and_repeated_rollup(tmp_path: Path) -> None
     _prepare(manager, session, run)
     assert [c[0] for c in condenser.calls] == ["raw", "rollup", "rollup"]
     assert manager.capture(session, run).history == (episode(0, 5, "Done."),)
+    assert tuple(manager._states[session.session_id].messages) == (6,)
 
 
 def test_raw_no_progress_allows_rollup_without_crossing_suffix(tmp_path: Path) -> None:

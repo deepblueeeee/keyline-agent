@@ -43,9 +43,11 @@ RawMessageReader = Callable[[str, int], ModelMessage]
 
 @dataclass(slots=True)
 class _ContextState:
+    """Bounded view state: Episodes cover a prefix; messages hold its raw tail."""
+
     message_count: int = 0
     recent_start: int = 0
-    messages: list[ModelMessage] = field(default_factory=list)
+    messages: dict[int, ModelMessage] = field(default_factory=dict)
     episodes: tuple[HistoryEpisode, ...] = ()
 
 
@@ -170,19 +172,24 @@ class AgentContextManager:
                     )
                     if replacement is not None:
                         block["content"] = replacement
-            state.messages.append(message)
+            state.messages[sequence] = message
             state.message_count = sequence + 1
             changed = True
         if not changed:
             self._states[session.session_id] = state
             return
-        messages = tuple(
-            SequencedMessage(index, message) for index, message in enumerate(state.messages)
-        )
         compacted_end = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
-        state.recent_start = max(
-            compacted_end, _recent_start(messages, self.policy, self.estimator)
+        messages = tuple(
+            SequencedMessage(sequence, state.messages[sequence])
+            for sequence in range(compacted_end, state.message_count)
         )
+        relative_cutoff = _recent_start(messages, self.policy, self.estimator)
+        cutoff = (
+            state.message_count
+            if relative_cutoff == len(messages)
+            else messages[relative_cutoff].sequence
+        )
+        state.recent_start = max(state.recent_start, compacted_end, cutoff)
         self._states[session.session_id] = state
 
     def capture(
@@ -192,7 +199,7 @@ class AgentContextManager:
         *,
         constraints: tuple[str, ...] = (),
     ) -> ContextView:
-        """Snapshot raw history using the incrementally maintained state."""
+        """Snapshot the incrementally maintained bounded model view."""
         state = self._synchronized_state(session)
         exact = ExactContext(
             goal=run.goal,
@@ -215,19 +222,25 @@ class AgentContextManager:
                 for dependency in run.dependencies
             ),
         )
-        messages = deepcopy(tuple(state.messages))
-        recent = tuple(
-            SequencedMessage(sequence, message) for sequence, message in enumerate(messages)
-        )
         cutoff = state.recent_start
         compacted_end = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
+        messages = tuple(
+            SequencedMessage(sequence, deepcopy(state.messages[sequence]))
+            for sequence in range(compacted_end, state.message_count)
+        )
         history: tuple[HistorySegment, ...] = state.episodes
         if compacted_end < cutoff:
-            history += (RawHistorySegment(recent[compacted_end:cutoff]),)
+            history += (
+                RawHistorySegment(
+                    tuple(item for item in messages if item.sequence < cutoff)
+                ),
+            )
         return ContextView(
             exact=exact,
             history=history,
-            protected_recent=RecentContext(recent[cutoff:]),
+            protected_recent=RecentContext(
+                tuple(item for item in messages if item.sequence >= cutoff)
+            ),
             source_message_count=state.message_count,
         )
 
@@ -302,7 +315,7 @@ class AgentContextManager:
                         )
                         block["content"] = deepcopy(raw.content[index].get("content", ""))
             pending.append(SequencedMessage(sequence, message))
-            if sequence + 1 < len(state.messages) and _same_tool_round(
+            if sequence + 1 < state.message_count and _same_tool_round(
                 pending[-1], SequencedMessage(sequence + 1, state.messages[sequence + 1])
             ):
                 continue
@@ -338,6 +351,9 @@ class AgentContextManager:
         ):
             return False
         state.episodes = episodes
+        for sequence in tuple(state.messages):
+            if sequence < end:
+                del state.messages[sequence]
         return True
 
     def _compact(
@@ -361,7 +377,7 @@ class AgentContextManager:
                 for episode in episodes:
                     _validate_episode(episode, expected, target[-1].sequence)
                     end = episode.source_range.end_sequence
-                    if end + 1 < len(state.messages) and _same_tool_round(
+                    if end + 1 < state.message_count and _same_tool_round(
                         SequencedMessage(end, state.messages[end]),
                         SequencedMessage(end + 1, state.messages[end + 1]),
                     ):
@@ -403,6 +419,22 @@ class AgentContextManager:
             return _ContextState()
         if not 0 <= state.recent_start <= state.message_count:
             raise ContextViewError("Context state has an invalid protected recent boundary")
+        compacted_end = (
+            state.episodes[-1].source_range.end_sequence + 1
+            if state.episodes
+            else 0
+        )
+        if compacted_end > state.recent_start:
+            raise ContextViewError("Compacted history overlaps protected recent context")
+        if len(state.messages) != state.message_count - compacted_end:
+            raise ContextViewError(
+                "Context raw tail must cover every uncompacted source sequence"
+            )
+        for sequence in range(compacted_end, state.message_count):
+            if sequence not in state.messages:
+                raise ContextViewError(
+                    "Context raw tail must cover every uncompacted source sequence"
+                )
         return state
 
     def ensure_below_hard_limit(self, visible_tokens: int) -> None:
