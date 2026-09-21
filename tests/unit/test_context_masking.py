@@ -142,7 +142,9 @@ def test_ingress_limits_every_large_result_but_preserves_raw_history(
         _tool_round(run.run_id, "shell", "run_shell", failed, is_error=True)
     )
     estimator = CharacterTokenEstimator()
-    manager = AgentContextManager(_policy(recent_messages=8, ingress_tokens=300), estimator)
+    manager = AgentContextManager(
+        _policy(recent_messages=8, ingress_tokens=300), estimator
+    )
 
     view = _capture_after_ingress(manager, session, run)
     context = manager.render(view)
@@ -417,7 +419,8 @@ def test_pressure_exhaustion_only_fails_at_hard_limit(tmp_path: Path) -> None:
     )
     estimator = CharacterTokenEstimator()
     above_target = AgentContextManager(
-        _policy(context_window=10_000, trigger=0.5, target=0.3), estimator
+        _policy(context_window=10_000, trigger=0.5, target=0.3),
+        estimator,
     )
 
     view = _apply_pressure(above_target, session, run)
@@ -425,7 +428,8 @@ def test_pressure_exhaustion_only_fails_at_hard_limit(tmp_path: Path) -> None:
     assert estimate_model_context(above_target.render(view), (), estimator) < 10_000
 
     hard_limit = AgentContextManager(
-        _policy(context_window=4_000, trigger=0.5, target=0.3), estimator
+        _policy(context_window=4_000, trigger=0.5, target=0.3),
+        estimator,
     )
     with pytest.raises(ContextPressureError):
         _apply_pressure(hard_limit, session, run)

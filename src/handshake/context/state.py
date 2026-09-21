@@ -91,3 +91,16 @@ class ContextView:
     history: tuple[HistorySegment, ...] = ()
     protected_recent: RecentContext = field(default_factory=RecentContext)
     source_message_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCheckpoint:
+    """Persisted recipe for rebuilding a bounded model-visible context."""
+
+    source_message_count: int = 0
+    recent_start: int = 0
+    episodes: tuple[HistoryEpisode, ...] = ()
+    stale_mask_through: tuple[int, int] | None = None
+    max_tool_result_tokens: int = 16_000
+    reduced_message_count: int = 0
+    revision: int = 0

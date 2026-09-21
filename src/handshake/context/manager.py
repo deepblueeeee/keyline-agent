@@ -22,6 +22,7 @@ from handshake.context.condenser import (
 )
 from handshake.context.errors import ContextPressureError, ContextViewError
 from handshake.context.state import (
+    ContextCheckpoint,
     ContextDependency,
     ContextView,
     ContextWorkItem,
@@ -39,6 +40,7 @@ from handshake.runtime.errors import ModelProtocolError, ModelProviderError
 from handshake.runtime.state import Run, Session
 
 RawMessageReader = Callable[[str, int], ModelMessage]
+ContextMessageReader = Callable[[int, int | None], Iterable[SequencedMessage]]
 
 
 @dataclass(slots=True)
@@ -49,6 +51,11 @@ class _ContextState:
     recent_start: int = 0
     messages: dict[int, ModelMessage] = field(default_factory=dict)
     episodes: tuple[HistoryEpisode, ...] = ()
+    stale_mask_through: tuple[int, int] | None = None
+    max_tool_result_tokens: int = 16_000
+    reduced_message_count: int = 0
+    checkpoint_revision: int = 0
+    reduction_dirty: bool = False
 
 
 def _system_prompt(exact: ExactContext) -> str:
@@ -116,6 +123,10 @@ class AgentContextManager:
         """Return the durable history prefix already represented by this view."""
         return self._synchronized_state(session).message_count
 
+    def is_initialized(self, session: Session) -> bool:
+        """Return whether this process has reconstructed the Session view."""
+        return session.session_id in self._states
+
     def prepare(
         self,
         session: Session,
@@ -126,7 +137,11 @@ class AgentContextManager:
     ) -> ModelContext:
         """Apply context pressure policy and return the next model-visible context."""
         pressure = self.measure_pressure(session, run, tools)
-        if pressure >= self.policy.pressure_trigger_tokens:
+        state = self._synchronized_state(session)
+        if (
+            pressure >= self.policy.pressure_trigger_tokens
+            and state.reduced_message_count < state.message_count
+        ):
             while pressure > self.policy.pressure_target_tokens:
                 if not self.mask_oldest_stale_result(session):
                     break
@@ -134,50 +149,133 @@ class AgentContextManager:
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
                 self._compact(session, run, tools, raw_message_reader)
                 pressure = self.measure_pressure(session, run, tools)
+            state.reduced_message_count = state.message_count
+            state.reduction_dirty = True
         self.ensure_below_hard_limit(pressure)
         return self.build(session, run)
 
-    def ingest_messages(
+    def restore(
         self,
         session: Session,
-        messages: Iterable[SequencedMessage],
+        checkpoint: ContextCheckpoint | None,
+        source_message_count: int,
+        read_messages: ContextMessageReader,
     ) -> None:
-        """Add newly committed durable messages to the model-visible view."""
-        current = self._states.get(session.session_id, _ContextState())
-        state = deepcopy(current)
-        changed = False
-        for item in messages:
-            sequence = item.sequence
-            if sequence != state.message_count:
-                raise ContextViewError(
-                    "Context messages must extend the durable transcript contiguously"
+        """Rebuild a bounded view from metadata plus only its uncovered raw tail."""
+        if session.session_id in self._states:
+            raise ContextViewError("Context state is already initialized")
+        if source_message_count < 0:
+            raise ContextViewError("Durable message count cannot be negative")
+        if checkpoint is None:
+            checkpoint = ContextCheckpoint(
+                max_tool_result_tokens=self.policy.max_tool_result_tokens,
+            )
+        _validate_checkpoint(checkpoint, source_message_count)
+        compacted_end = (
+            checkpoint.episodes[-1].source_range.end_sequence + 1
+            if checkpoint.episodes
+            else 0
+        )
+        state = _ContextState(
+            message_count=compacted_end,
+            recent_start=checkpoint.recent_start,
+            episodes=checkpoint.episodes,
+            stale_mask_through=checkpoint.stale_mask_through,
+            max_tool_result_tokens=checkpoint.max_tool_result_tokens,
+            reduced_message_count=checkpoint.reduced_message_count,
+            checkpoint_revision=checkpoint.revision,
+        )
+        cursor_seen = (
+            checkpoint.stale_mask_through is None
+            or checkpoint.stale_mask_through[0] < compacted_end
+        )
+        for item in read_messages(compacted_end, source_message_count):
+            if item.sequence != state.message_count:
+                raise ContextViewError("Durable history contains missing sequences")
+            if (
+                checkpoint.stale_mask_through is not None
+                and item.sequence == checkpoint.stale_mask_through[0]
+            ):
+                index = checkpoint.stale_mask_through[1]
+                cursor_seen = (
+                    item.message.role == "user"
+                    and index < len(item.message.content)
+                    and item.message.content[index].get("type") == "tool_result"
                 )
-            message = deepcopy(item.message)
-            if message.role == "user":
-                for block in message.content:
-                    if block.get("type") != "tool_result":
-                        continue
-                    call_id = block.get("tool_use_id")
-                    if not isinstance(call_id, str):
-                        continue
-                    content = block.get("content", "")
-                    text = content if isinstance(content, str) else compact_json(content)
-                    replacement = _ingress_content(
-                        sequence,
-                        call_id,
-                        block.get("is_error") is not False,
-                        text,
-                        self.policy,
-                        self.estimator,
-                    )
-                    if replacement is not None:
-                        block["content"] = replacement
-            state.messages[sequence] = message
-            state.message_count = sequence + 1
-            changed = True
-        if not changed:
-            self._states[session.session_id] = state
-            return
+            state.messages[item.sequence] = self._project_message(
+                state, item.sequence, item.message
+            )
+            state.message_count += 1
+        if state.message_count != source_message_count:
+            raise ContextViewError("Durable history ended before its reported tail")
+        if not cursor_seen:
+            raise ContextViewError("Stale mask cursor does not reference a tool result")
+        if source_message_count > checkpoint.source_message_count:
+            self._update_recent(state)
+        self._states[session.session_id] = state
+
+    def pending_checkpoint(self, session: Session) -> ContextCheckpoint | None:
+        """Return unsaved reduction metadata, if this view changed semantically."""
+        state = self._synchronized_state(session)
+        if not state.reduction_dirty:
+            return None
+        return ContextCheckpoint(
+            source_message_count=state.message_count,
+            recent_start=state.recent_start,
+            episodes=state.episodes,
+            stale_mask_through=state.stale_mask_through,
+            max_tool_result_tokens=state.max_tool_result_tokens,
+            reduced_message_count=state.reduced_message_count,
+            revision=state.checkpoint_revision,
+        )
+
+    def checkpoint_saved(
+        self, session: Session, checkpoint: ContextCheckpoint
+    ) -> None:
+        """Acknowledge a storage-owned successful checkpoint transaction."""
+        state = self._synchronized_state(session)
+        pending = self.pending_checkpoint(session)
+        if pending is None or replace(checkpoint, revision=pending.revision) != pending:
+            raise ContextViewError("Saved context checkpoint does not match current view")
+        state.checkpoint_revision = checkpoint.revision
+        state.reduction_dirty = False
+
+    def _project_message(
+        self, state: _ContextState, sequence: int, raw: ModelMessage
+    ) -> ModelMessage:
+        message = deepcopy(raw)
+        if message.role != "user":
+            return message
+        policy = replace(
+            self.policy, max_tool_result_tokens=state.max_tool_result_tokens
+        )
+        for index, block in enumerate(message.content):
+            if block.get("type") != "tool_result":
+                continue
+            if (
+                state.stale_mask_through is not None
+                and (sequence, index) <= state.stale_mask_through
+            ):
+                block["content"] = _stale_marker(sequence, block.get("is_error"))
+                continue
+            call_id = block.get("tool_use_id")
+            if not isinstance(call_id, str):
+                continue
+            content = block.get("content", "")
+            text = content if isinstance(content, str) else compact_json(content)
+            replacement = _ingress_content(
+                sequence,
+                call_id,
+                block.get("is_error") is not False,
+                text,
+                policy,
+                self.estimator,
+            )
+            if replacement is not None:
+                block["content"] = replacement
+        return message
+
+    def _update_recent(self, state: _ContextState) -> None:
         compacted_end = state.episodes[-1].source_range.end_sequence + 1 if state.episodes else 0
         messages = tuple(
             SequencedMessage(sequence, state.messages[sequence])
@@ -190,6 +288,33 @@ class AgentContextManager:
             else messages[relative_cutoff].sequence
         )
         state.recent_start = max(state.recent_start, compacted_end, cutoff)
+
+    def ingest_messages(
+        self,
+        session: Session,
+        messages: Iterable[SequencedMessage],
+    ) -> None:
+        """Add newly committed durable messages to the model-visible view."""
+        current = self._states.get(
+            session.session_id,
+            _ContextState(max_tool_result_tokens=self.policy.max_tool_result_tokens),
+        )
+        state = deepcopy(current)
+        changed = False
+        for item in messages:
+            sequence = item.sequence
+            if sequence != state.message_count:
+                raise ContextViewError(
+                    "Context messages must extend the durable transcript contiguously"
+                )
+            message = self._project_message(state, sequence, item.message)
+            state.messages[sequence] = message
+            state.message_count = sequence + 1
+            changed = True
+        if not changed:
+            self._states[session.session_id] = state
+            return
+        self._update_recent(state)
         self._states[session.session_id] = state
 
     def capture(
@@ -265,17 +390,17 @@ class AgentContextManager:
             message = state.messages[sequence]
             if message.role != "user":
                 continue
-            for block in message.content:
+            for index, block in enumerate(message.content):
                 if block.get("type") != "tool_result":
                     continue
-                content = block.get("content")
-                if isinstance(content, str) and content.startswith("[stale tool result masked;"):
+                if (
+                    state.stale_mask_through is not None
+                    and (sequence, index) <= state.stale_mask_through
+                ):
                     continue
-                status = "failure" if block.get("is_error") is not False else "success"
-                block["content"] = (
-                    f"[stale tool result masked; status={status}; "
-                    f"source_sequence={sequence}; details omitted from active context]"
-                )
+                block["content"] = _stale_marker(sequence, block.get("is_error"))
+                state.stale_mask_through = (sequence, index)
+                state.reduction_dirty = True
                 return True
         return False
 
@@ -354,6 +479,7 @@ class AgentContextManager:
         for sequence in tuple(state.messages):
             if sequence < end:
                 del state.messages[sequence]
+        state.reduction_dirty = True
         return True
 
     def _compact(
@@ -416,7 +542,9 @@ class AgentContextManager:
     def _synchronized_state(self, session: Session) -> _ContextState:
         state = self._states.get(session.session_id)
         if state is None:
-            return _ContextState()
+            return _ContextState(
+                max_tool_result_tokens=self.policy.max_tool_result_tokens
+            )
         if not 0 <= state.recent_start <= state.message_count:
             raise ContextViewError("Context state has an invalid protected recent boundary")
         compacted_end = (
@@ -508,6 +636,14 @@ def _ingress_content(
     ) > policy.max_tool_result_tokens:
         replacement = replacement[: len(replacement) // 2]
     return replacement
+
+
+def _stale_marker(sequence: int, is_error: object) -> str:
+    status = "failure" if is_error is not False else "success"
+    return (
+        f"[stale tool result masked; status={status}; "
+        f"source_sequence={sequence}; details omitted from active context]"
+    )
 
 
 def _result_tokens(
@@ -632,3 +768,42 @@ def _validate_episode(episode: HistoryEpisode, start: int, maximum: int) -> None
             or not isinstance(episode.title, str) or not episode.title.strip()
             or not isinstance(episode.summary, str) or not episode.summary.strip()):
         raise ContextViewError("Invalid condenser episode range or content")
+
+
+def _validate_checkpoint(
+    checkpoint: ContextCheckpoint,
+    durable_message_count: int,
+) -> None:
+    integer_values = (
+        checkpoint.source_message_count,
+        checkpoint.recent_start,
+        checkpoint.max_tool_result_tokens,
+        checkpoint.reduced_message_count,
+        checkpoint.revision,
+    )
+    if any(type(value) is not int for value in integer_values):
+        raise ContextViewError("Context checkpoint contains invalid metadata types")
+    if (
+        not 0 <= checkpoint.recent_start <= checkpoint.source_message_count
+        or checkpoint.source_message_count > durable_message_count
+        or not 0 <= checkpoint.reduced_message_count <= checkpoint.source_message_count
+        or checkpoint.max_tool_result_tokens <= 0
+        or checkpoint.revision < 0
+    ):
+        raise ContextViewError("Context checkpoint contains invalid boundaries")
+    expected = 0
+    for episode in checkpoint.episodes:
+        _validate_episode(episode, expected, checkpoint.recent_start - 1)
+        expected = episode.source_range.end_sequence + 1
+    if expected > checkpoint.recent_start:
+        raise ContextViewError("Compacted history overlaps protected recent context")
+    cursor = checkpoint.stale_mask_through
+    if cursor is not None and (
+        not isinstance(cursor, tuple)
+        or len(cursor) != 2
+        or any(type(value) is not int for value in cursor)
+        or cursor[0] < 0
+        or cursor[0] >= checkpoint.recent_start
+        or cursor[1] < 0
+    ):
+        raise ContextViewError("Context checkpoint contains an invalid stale mask cursor")

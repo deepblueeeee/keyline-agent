@@ -10,6 +10,7 @@ from handshake.context.condenser import HistoryCondenser, LLMHistoryCondenser
 from handshake.context.errors import ContextPressureError, ContextViewError
 from handshake.context.manager import AgentContextManager
 from handshake.context.state import (
+    ContextCheckpoint,
     ContextDependency,
     ContextView,
     ContextWorkItem,
@@ -25,6 +26,7 @@ from handshake.context.state import (
 __all__ = [
     "AgentContextManager",
     "ContextBudgetPolicy",
+    "ContextCheckpoint",
     "ContextDependency",
     "ContextPressureError",
     "ContextView",

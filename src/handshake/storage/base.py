@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Protocol
 
-from handshake.context.state import SequencedMessage
+from handshake.context.state import ContextCheckpoint, SequencedMessage
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import Run, Session
 
@@ -29,6 +29,16 @@ class RunStore(Protocol):
 
     def has_run_messages(self, session_id: str, run_id: str) -> bool:
         """Return whether a run has any durable protocol messages."""
+        ...
+
+    def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        """Load the latest model-view recipe without reading raw messages."""
+        ...
+
+    def save_context_checkpoint(
+        self, session_id: str, checkpoint: ContextCheckpoint
+    ) -> ContextCheckpoint:
+        """CAS-save a recipe for the exact durable transcript prefix it describes."""
         ...
 
     def create_run(

@@ -5,10 +5,16 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from handshake.context.state import SequencedMessage
+from handshake.context.state import (
+    ContextCheckpoint,
+    HistoryEpisode,
+    SequencedMessage,
+    SourceRange,
+)
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import (
     Dependency,
@@ -25,6 +31,11 @@ from handshake.runtime.state import (
 )
 from handshake.storage.errors import RunNotFoundError, SessionNotFoundError, StorageError
 from handshake.storage.schema import initialize_schema
+
+_CONTEXT_CHECKPOINT_FORMAT = {
+    "version": 1,
+    "token_estimator": {"name": "utf8-bytes", "version": 1},
+}
 
 
 class SQLiteStateStore:
@@ -508,6 +519,64 @@ class SQLiteStateStore:
     def has_run_messages(self, session_id: str, run_id: str) -> bool:
         return self.message_count(session_id, run_id) > 0
 
+    def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        """Load view metadata without loading any raw transcript rows."""
+        try:
+            with self._connect() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone() is None:
+                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                row = connection.execute(
+                    "SELECT revision, snapshot_json FROM context_checkpoints WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return _load_context_checkpoint(
+                    str(row["snapshot_json"]), int(row["revision"])
+                )
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def save_context_checkpoint(
+        self, session_id: str, checkpoint: ContextCheckpoint
+    ) -> ContextCheckpoint:
+        """Save one projection recipe with tail and revision checks."""
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone() is None:
+                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                count = self._message_count(connection, session_id)
+                if count != checkpoint.source_message_count:
+                    raise StorageError(
+                        "Context checkpoint does not describe the current transcript tail"
+                    )
+                row = connection.execute(
+                    "SELECT revision FROM context_checkpoints WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                revision = 0 if row is None else int(row["revision"])
+                if checkpoint.revision != revision:
+                    raise StorageError("Context checkpoint revision is stale")
+                saved = replace(checkpoint, revision=revision + 1)
+                connection.execute(
+                    """
+                    INSERT INTO context_checkpoints (session_id, revision, snapshot_json)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        revision = excluded.revision,
+                        snapshot_json = excluded.snapshot_json
+                    """,
+                    (session_id, saved.revision, _dump_context_checkpoint(saved)),
+                )
+                return saved
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
     def _replace_run_children(
         self, connection: sqlite3.Connection, run: Run
     ) -> None:
@@ -581,6 +650,66 @@ class SQLiteStateStore:
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _dump_context_checkpoint(checkpoint: ContextCheckpoint) -> str:
+    return _dump_json(
+        {
+            "format": _CONTEXT_CHECKPOINT_FORMAT,
+            "state": {
+                "source_message_count": checkpoint.source_message_count,
+                "recent_start": checkpoint.recent_start,
+                "episodes": [
+                    {
+                        "start_sequence": item.source_range.start_sequence,
+                        "end_sequence": item.source_range.end_sequence,
+                        "title": item.title,
+                        "summary": item.summary,
+                    }
+                    for item in checkpoint.episodes
+                ],
+                "stale_mask_through": checkpoint.stale_mask_through,
+                "max_tool_result_tokens": checkpoint.max_tool_result_tokens,
+                "reduced_message_count": checkpoint.reduced_message_count,
+            },
+        }
+    )
+
+
+def _load_context_checkpoint(value: str, revision: int) -> ContextCheckpoint:
+    data = _load_json(value, "context checkpoint")
+    if not isinstance(data, dict):
+        raise StorageError("Stored context checkpoint is not an object")
+    if data.get("format") != _CONTEXT_CHECKPOINT_FORMAT:
+        raise StorageError("Stored context checkpoint format is unsupported")
+    state = data.get("state")
+    if not isinstance(state, dict):
+        raise StorageError("Stored context checkpoint state is not an object")
+    episodes_data = state.get("episodes")
+    if not isinstance(episodes_data, list):
+        raise StorageError("Stored context checkpoint episodes are invalid")
+    try:
+        episodes = tuple(
+            HistoryEpisode(
+                SourceRange(item["start_sequence"], item["end_sequence"]),
+                item["title"],
+                item["summary"],
+            )
+            for item in episodes_data
+        )
+        cursor = state.get("stale_mask_through")
+        stale_mask_through = None if cursor is None else tuple(cursor)
+        return ContextCheckpoint(
+            source_message_count=state["source_message_count"],
+            recent_start=state["recent_start"],
+            episodes=episodes,
+            stale_mask_through=cast(tuple[int, int] | None, stale_mask_through),
+            max_tool_result_tokens=state["max_tool_result_tokens"],
+            reduced_message_count=state["reduced_message_count"],
+            revision=revision,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise StorageError("Stored context checkpoint fields are invalid") from None
 
 
 def _load_json(value: str, description: str) -> Any:

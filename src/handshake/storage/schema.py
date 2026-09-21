@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -45,6 +45,12 @@ CREATE TABLE messages (
     PRIMARY KEY (session_id, sequence),
     FOREIGN KEY (run_id, session_id) REFERENCES runs(run_id, session_id)
         ON DELETE CASCADE
+);
+
+CREATE TABLE context_checkpoints (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL
 );
 
 CREATE TABLE work_items (

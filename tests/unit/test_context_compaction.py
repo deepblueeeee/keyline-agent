@@ -287,7 +287,7 @@ def test_llm_rejects_malformed_or_truncated_output(text: str, stop: str | None) 
         LLMHistoryCondenser(model).compact_raw((), ())
 
 
-def test_loop_compaction_does_not_count_as_agent_turn_and_restart_rebuilds(tmp_path: Path) -> None:
+def test_loop_persists_compaction_and_restart_restores_without_llm(tmp_path: Path) -> None:
     condenser = Condenser((episode(0, 5),))
     manager, session, old_run = setup(tmp_path, condenser)
     store = fresh_store(tmp_path, session)
@@ -310,10 +310,19 @@ def test_loop_compaction_does_not_count_as_agent_turn_and_restart_rebuilds(tmp_p
     )
     assert run.model_turns == 1
     assert condenser.calls
-    restored = AgentContextManager(manager.policy, Characters(), Condenser())
-    restored.ingest_messages(session, store.read_messages(session.session_id))
-    assert all(isinstance(s, RawHistorySegment)
-               for s in restored.capture(session, run).history)
+    checkpoint = store.load_context_checkpoint(session.session_id)
+    assert checkpoint is not None
+    restored_condenser = Condenser()
+    restored = AgentContextManager(manager.policy, Characters(), restored_condenser)
+    restored.restore(
+        session,
+        checkpoint,
+        store.message_count(session.session_id),
+        lambda start, end: store.read_messages(session.session_id, start, end),
+    )
+    assert restored.build(session, run) == manager.build(session, run)
+    assert restored.capture(session, run).history[0] == episode(0, 5)
+    assert restored_condenser.calls == []
     assert old_run.model_turns == 0
 
 

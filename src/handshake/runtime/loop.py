@@ -11,8 +11,8 @@ from handshake.context import (
     ContextPressureError,
     LLMHistoryCondenser,
 )
-from handshake.models.base import ModelAdapter
-from handshake.models.protocol import ModelMessage, ToolCall
+from handshake.models.base import ModelAdapter, ToolDefinition
+from handshake.models.protocol import ModelContext, ModelMessage, ToolCall
 from handshake.runtime.errors import (
     AgentLoopError,
     HandshakeError,
@@ -222,6 +222,17 @@ def _sync_context(
     store: RunStore,
     context_manager: AgentContextManager,
 ) -> None:
+    if not context_manager.is_initialized(session):
+        end = store.message_count(session.session_id)
+        context_manager.restore(
+            session,
+            store.load_context_checkpoint(session.session_id),
+            end,
+            lambda start, stop: store.read_messages(
+                session.session_id, start, stop
+            ),
+        )
+        return
     start = context_manager.message_count(session)
     end = store.message_count(session.session_id)
     if start > end:
@@ -229,6 +240,30 @@ def _sync_context(
     context_manager.ingest_messages(
         session, store.read_messages(session.session_id, start, end)
     )
+
+
+def _prepare_model_context(
+    session: Session,
+    run: Run,
+    tools: tuple[ToolDefinition, ...],
+    store: RunStore,
+    context_manager: AgentContextManager,
+) -> ModelContext:
+    """Prepare a view and durably save only newly reduced projection state."""
+    try:
+        return context_manager.prepare(
+            session,
+            run,
+            tools,
+            raw_message_reader=lambda session_id, sequence: _read_raw_message(
+                store, session_id, sequence
+            ),
+        )
+    finally:
+        checkpoint = context_manager.pending_checkpoint(session)
+        if checkpoint is not None:
+            saved = store.save_context_checkpoint(session.session_id, checkpoint)
+            context_manager.checkpoint_saved(session, saved)
 
 
 def _read_raw_message(store: RunStore, session_id: str, sequence: int) -> ModelMessage:
@@ -336,13 +371,8 @@ def _run_turns(
                     f"Agent exceeded the maximum of {run.max_steps} model turns"
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
-            context = context_manager.prepare(
-                session,
-                run,
-                definitions,
-                raw_message_reader=lambda session_id, sequence: _read_raw_message(
-                    store, session_id, sequence
-                ),
+            context = _prepare_model_context(
+                session, run, definitions, store, context_manager
             )
             turn = model.complete(context, definitions)
             run.model_turns += 1

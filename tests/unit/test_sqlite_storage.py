@@ -1,8 +1,10 @@
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from handshake.context import ContextCheckpoint, HistoryEpisode, SourceRange
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import (
     Dependency,
@@ -154,6 +156,60 @@ def test_messages_are_append_only_and_support_range_queries(tmp_path: Path) -> N
         assert connection.execute(
             "SELECT sequence, content_json FROM messages WHERE sequence < 2 ORDER BY sequence"
         ).fetchall() == original_rows
+
+
+def test_context_checkpoint_is_small_separate_metadata_with_revision_cas(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "handshake.db"
+    store = SQLiteStateStore(database)
+    session = Session(workspace=tmp_path)
+    store.create_session(session)
+    run, messages = _waiting_run(session)
+    store.create_run(session, run, tuple(messages))
+    checkpoint = ContextCheckpoint(
+        source_message_count=3,
+        recent_start=2,
+        episodes=(
+            HistoryEpisode(SourceRange(0, 0), "Investigation", "The fact was established."),
+        ),
+        reduced_message_count=3,
+    )
+
+    saved = store.save_context_checkpoint(session.session_id, checkpoint)
+
+    assert saved.revision == 1
+    assert store.load_context_checkpoint(session.session_id) == saved
+    with sqlite3.connect(database) as connection:
+        snapshot = connection.execute(
+            "SELECT snapshot_json FROM context_checkpoints WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()[0]
+    assert "The fact was established." in snapshot
+    assert "需要用户决定" not in snapshot
+    assert json.loads(snapshot)["format"]["token_estimator"] == {
+        "name": "utf8-bytes",
+        "version": 1,
+    }
+    with pytest.raises(StorageError, match="revision is stale"):
+        store.save_context_checkpoint(session.session_id, checkpoint)
+
+    store.append_messages(
+        session.session_id,
+        (ModelMessage("user", ({"type": "text", "text": "suffix"},), run.run_id),),
+    )
+    with pytest.raises(StorageError, match="current transcript tail"):
+        store.save_context_checkpoint(session.session_id, saved)
+
+    payload = json.loads(snapshot)
+    payload["format"]["token_estimator"]["version"] = 99
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE context_checkpoints SET snapshot_json = ? WHERE session_id = ?",
+            (json.dumps(payload), session.session_id),
+        )
+    with pytest.raises(StorageError, match="format is unsupported"):
+        store.load_context_checkpoint(session.session_id)
 
 
 def test_incompatible_development_schema_is_rejected(tmp_path: Path) -> None:

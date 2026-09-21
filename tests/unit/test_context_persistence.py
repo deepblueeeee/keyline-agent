@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from handshake.context import (
+    AgentContextManager,
+    ContextBudgetPolicy,
+    ContextCheckpoint,
+    ContextViewError,
+    HistoryEpisode,
+    RawHistorySegment,
+    SourceRange,
+)
+from handshake.models.protocol import ModelMessage
+from handshake.runtime.state import Run, Session
+from tests.history_support import fresh_store, history
+
+
+class Characters:
+    def estimate_text(self, text: str) -> int:
+        return len(text)
+
+
+def _messages(run: Run, count: int) -> tuple[ModelMessage, ...]:
+    return tuple(
+        ModelMessage(
+            "user",
+            ({"type": "text", "text": f"message {index}"},),
+            run.run_id,
+        )
+        for index in range(count)
+    )
+
+
+def test_restore_skips_episode_sources_and_streams_incremental_suffix(
+    tmp_path: Path,
+) -> None:
+    session = Session(workspace=tmp_path)
+    run = Run(goal="continue", session_id=session.session_id)
+    store = fresh_store(tmp_path, session)
+    store.create_run(session, run, _messages(run, 6))
+    checkpoint = ContextCheckpoint(
+        source_message_count=6,
+        recent_start=5,
+        episodes=(
+            HistoryEpisode(SourceRange(0, 3), "Completed stage", "The stage is done."),
+        ),
+        reduced_message_count=6,
+    )
+    saved = store.save_context_checkpoint(session.session_id, checkpoint)
+    store.append_messages(
+        session.session_id,
+        (ModelMessage("user", ({"type": "text", "text": "new suffix"},), run.run_id),),
+    )
+    reads: list[tuple[int, int | None]] = []
+
+    def read(start: int, end: int | None):
+        reads.append((start, end))
+        yield from store.read_messages(session.session_id, start, end)
+
+    manager = AgentContextManager(
+        ContextBudgetPolicy(protected_recent_messages=1, protected_recent_tokens=0),
+        Characters(),
+    )
+    manager.restore(session, saved, store.message_count(session.session_id), read)
+
+    view = manager.capture(session, run)
+    assert reads == [(4, 7)]
+    assert view.history[0] == checkpoint.episodes[0]
+    assert isinstance(view.history[1], RawHistorySegment)
+    assert tuple(manager._states[session.session_id].messages) == (4, 5, 6)
+    assert manager.pending_checkpoint(session) is None
+
+
+def test_masking_checkpoint_restores_identical_view_without_changing_raw_history(
+    tmp_path: Path,
+) -> None:
+    session = Session(workspace=tmp_path)
+    run = Run(goal="inspect", session_id=session.session_id)
+    store = fresh_store(tmp_path, session)
+    messages = (
+        ModelMessage(
+            "assistant",
+            ({"type": "tool_use", "id": "read", "name": "read_file", "input": {}},),
+            run.run_id,
+        ),
+        ModelMessage(
+            "user",
+            (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "read",
+                    "content": "large durable result " * 100,
+                    "is_error": False,
+                },
+            ),
+            run.run_id,
+        ),
+        ModelMessage("user", ({"type": "text", "text": "recent"},), run.run_id),
+    )
+    appended = store.create_run(session, run, messages)
+    policy = ContextBudgetPolicy(
+        protected_recent_messages=1,
+        protected_recent_tokens=0,
+        max_tool_result_tokens=300,
+    )
+    manager = AgentContextManager(policy, Characters())
+    manager.ingest_messages(session, appended)
+    assert manager.mask_oldest_stale_result(session)
+    pending = manager.pending_checkpoint(session)
+    assert pending is not None
+    saved = store.save_context_checkpoint(session.session_id, pending)
+    manager.checkpoint_saved(session, saved)
+
+    restored = AgentContextManager(policy, Characters())
+    restored.restore(
+        session,
+        store.load_context_checkpoint(session.session_id),
+        store.message_count(session.session_id),
+        lambda start, end: store.read_messages(session.session_id, start, end),
+    )
+
+    assert restored.build(session, run) == manager.build(session, run)
+    assert restored.pending_checkpoint(session) is None
+    assert "stale tool result masked" in restored.build(session, run).messages[1].content[0][
+        "content"
+    ]
+    assert "large durable result" in history(store, session)[1].content[0]["content"]
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    (
+        ContextCheckpoint(source_message_count=4),
+        ContextCheckpoint(
+            source_message_count=3,
+            recent_start=2,
+            episodes=(HistoryEpisode(SourceRange(1, 1), "gap", "invalid"),),
+        ),
+    ),
+)
+def test_restore_rejects_incompatible_or_invalid_metadata(
+    tmp_path: Path, checkpoint: ContextCheckpoint
+) -> None:
+    session = Session(workspace=tmp_path)
+    run = Run(goal="inspect", session_id=session.session_id)
+    store = fresh_store(tmp_path, session)
+    store.create_run(session, run, _messages(run, 3))
+    manager = AgentContextManager(estimator=Characters())
+
+    with pytest.raises(ContextViewError):
+        manager.restore(
+            session,
+            replace(checkpoint, revision=1),
+            store.message_count(session.session_id),
+            lambda start, end: store.read_messages(session.session_id, start, end),
+        )
