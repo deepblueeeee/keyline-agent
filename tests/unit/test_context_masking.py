@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from handshake.artifacts import resolve_artifact_reference
 from handshake.config import DeepSeekConfig
 from handshake.context import (
     AgentContextManager,
@@ -20,6 +21,7 @@ from handshake.models.scripted import ScriptedModel
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, Session, ToolResult
 from handshake.storage.sqlite import SQLiteStateStore
+from handshake.tools.files import read_file
 from handshake.tools.registry import ToolBinding, ToolRegistry
 from tests.history_support import fresh_store, history, ingest
 
@@ -131,9 +133,10 @@ def _tool_round(
     )
 
 
-def test_ingress_limits_every_large_result_but_preserves_raw_history(
-    tmp_path: Path,
+def test_ingress_externalizes_every_large_result_but_preserves_raw_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
     session, run = _session_run(tmp_path)
     successful = "HEAD-success-" + "x" * 1_000 + "-TAIL-success"
     failed = "HEAD-failed-" + "y" * 1_000 + "-TAIL-failed"
@@ -143,7 +146,8 @@ def test_ingress_limits_every_large_result_but_preserves_raw_history(
     )
     estimator = CharacterTokenEstimator()
     manager = AgentContextManager(
-        _policy(recent_messages=8, ingress_tokens=300), estimator
+        _policy(recent_messages=8, ingress_tokens=600),
+        estimator,
     )
 
     view = _capture_after_ingress(manager, session, run)
@@ -151,20 +155,33 @@ def test_ingress_limits_every_large_result_but_preserves_raw_history(
 
     visible_results = [context.messages[1].content[0], context.messages[3].content[0]]
     assert all(
-        estimator.estimate_text(json.dumps(block, ensure_ascii=False, separators=(",", ":"))) <= 300
+        estimator.estimate_text(json.dumps(block, ensure_ascii=False, separators=(",", ":"))) <= 600
         for block in visible_results
     )
-    assert "HEAD-success" in visible_results[0]["content"]
-    assert "TAIL-success" in visible_results[0]["content"]
-    assert "HEAD-failed" in visible_results[1]["content"]
-    assert "TAIL-failed" in visible_results[1]["content"]
+    assert "HEAD-success" not in visible_results[0]["content"]
+    assert "HEAD-failed" not in visible_results[1]["content"]
     assert visible_results[0]["is_error"] is False
     assert visible_results[1]["is_error"] is True
     assert "status=success" in visible_results[0]["content"]
     assert "status=failure" in visible_results[1]["content"]
     assert _messages(session)[1].content[0]["content"] == successful
     assert _messages(session)[3].content[0]["content"] == failed
-    assert "ingress-limited" in view.protected_recent.messages[1].message.content[0]["content"]
+    assert "tool result externalized" in (
+        view.protected_recent.messages[1].message.content[0]["content"]
+    )
+    successful_path = resolve_artifact_reference(
+        visible_results[0]["content"].split("path=", 1)[1].split("]", 1)[0]
+    )
+    failed_path = resolve_artifact_reference(
+        visible_results[1]["content"].split("path=", 1)[1].split("]", 1)[0]
+    )
+    assert successful_path is not None
+    assert failed_path is not None
+    assert successful_path.read_text(encoding="utf-8") == successful
+    assert failed_path.read_text(encoding="utf-8") == failed
+    assert f"bytes={len(successful.encode('utf-8'))}" in visible_results[0]["content"]
+    assert f"characters={len(successful)}" in visible_results[0]["content"]
+    assert "lines=1" in visible_results[0]["content"]
 
 
 def test_recent_boundary_uses_larger_message_or_token_window(tmp_path: Path) -> None:
@@ -390,8 +407,9 @@ def test_pressure_masks_every_stale_block_in_multi_result_message(
 
 
 def test_ingress_projection_is_replaced_when_result_becomes_stale_mask(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
     session, run = _session_run(tmp_path)
     _messages(session).extend(_tool_round(run.run_id, "read", "read_file", "x" * 4_000))
     _messages(session).append(
@@ -456,8 +474,10 @@ def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> No
     assert model.contexts == []
 
 
-def test_loop_limits_model_ingress_but_persists_complete_result(tmp_path: Path) -> None:
-    original = "BEGIN-" + "x" * 2_000 + "-END"
+def test_loop_externalizes_large_result_but_persists_complete_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original = "BEGIN\n" + "value\n" * 400 + "END"
     definition = ToolDefinition("large_read", "read", {"type": "object"})
     registry = ToolRegistry()
     registry.register(
@@ -486,8 +506,10 @@ def test_loop_limits_model_ingress_but_persists_complete_result(tmp_path: Path) 
     session, run = _session_run(tmp_path)
     store = SQLiteStateStore(tmp_path / "handshake.db")
     store.create_session(session)
+    home = tmp_path / "handshake-home"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
     manager = AgentContextManager(
-        _policy(recent_messages=8, ingress_tokens=300), CharacterTokenEstimator()
+        _policy(recent_messages=8, ingress_tokens=600), CharacterTokenEstimator()
     )
 
     start_run(
@@ -502,9 +524,20 @@ def test_loop_limits_model_ingress_but_persists_complete_result(tmp_path: Path) 
     visible = model.contexts[1].messages[-1].content[0]["content"]
     loaded_session = store.load_session(session.session_id)
     persisted = history(store, loaded_session)[-2].content[0]["content"]
-    assert "ingress-limited" in visible
-    assert len(visible) <= 300
+    assert "tool result externalized" in visible
+    assert len(visible) <= 600
+    assert "lines=407" in visible
     assert json.loads(persisted)["stdout"] == original
+    output_reference = visible.split("path=", 1)[1].split("]", 1)[0]
+    assert output_reference.startswith("@handshake/artifacts/")
+    recovered = read_file(
+        session.workspace,
+        {"path": output_reference, "start_character": 1, "end_character": 10_000},
+    )
+    assert recovered.ok
+    assert "[tool result]\nok: true\nexit_code: None\n[stdout]\n" in recovered.stdout
+    assert original in recovered.stdout
+    assert recovered.stdout.endswith("\n[stderr]\n")
 
 
 def test_new_manager_rebuilds_masking_state_from_raw_sqlite_history(

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from handshake.artifacts import resolve_artifact_reference
 from handshake.context import (
     AgentContextManager,
     ContextBudgetPolicy,
@@ -76,8 +77,9 @@ def test_restore_skips_episode_sources_and_streams_incremental_suffix(
 
 
 def test_masking_checkpoint_restores_identical_view_without_changing_raw_history(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
     session = Session(workspace=tmp_path)
     run = Run(goal="inspect", session_id=session.session_id)
     store = fresh_store(tmp_path, session)
@@ -105,7 +107,7 @@ def test_masking_checkpoint_restores_identical_view_without_changing_raw_history
     policy = ContextBudgetPolicy(
         protected_recent_messages=1,
         protected_recent_tokens=0,
-        max_tool_result_tokens=300,
+        max_tool_result_tokens=600,
     )
     manager = AgentContextManager(policy, Characters())
     manager.ingest_messages(session, appended)
@@ -129,6 +131,57 @@ def test_masking_checkpoint_restores_identical_view_without_changing_raw_history
         "content"
     ]
     assert "large durable result" in history(store, session)[1].content[0]["content"]
+
+
+def test_restore_rebuilds_externalized_result_and_reuses_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    session = Session(workspace=tmp_path)
+    run = Run(goal="inspect", session_id=session.session_id)
+    store = fresh_store(tmp_path, session)
+    original = "line\n" * 1_000
+    messages = (
+        ModelMessage(
+            "assistant",
+            ({"type": "tool_use", "id": "large", "name": "test", "input": {}},),
+            run.run_id,
+        ),
+        ModelMessage(
+            "user",
+            (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "large",
+                    "content": original,
+                    "is_error": False,
+                },
+            ),
+            run.run_id,
+        ),
+    )
+    appended = store.create_run(session, run, messages)
+    policy = ContextBudgetPolicy(max_tool_result_tokens=600)
+    manager = AgentContextManager(policy, Characters())
+    manager.ingest_messages(session, appended)
+    before = manager.build(session, run)
+
+    restored = AgentContextManager(policy, Characters())
+    restored.restore(
+        session,
+        None,
+        store.message_count(session.session_id),
+        lambda start, end: store.read_messages(session.session_id, start, end),
+    )
+
+    assert restored.build(session, run) == before
+    marker = before.messages[1].content[0]["content"]
+    reference = marker.split("path=", 1)[1].split("]", 1)[0]
+    assert reference.startswith("@handshake/artifacts/")
+    path = resolve_artifact_reference(reference)
+    assert path is not None
+    assert path.read_text(encoding="utf-8") == original
+    assert history(store, session)[1].content[0]["content"] == original
 
 
 @pytest.mark.parametrize(

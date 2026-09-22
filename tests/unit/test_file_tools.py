@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from handshake.tools.files import edit_file, list_files, read_file, search_files, write_file
 
 
@@ -96,8 +98,81 @@ def test_read_file_bounds_a_single_very_long_line(tmp_path: Path) -> None:
     result = read_file(tmp_path, {"path": "minified.js"})
 
     assert result.ok
-    assert len(result.stdout) < 51_000
-    assert "output truncated at 50000 characters" in result.stdout
+    assert len(result.stdout) < 41_000
+    assert "line selection exceeded 40000 UTF-8 bytes" in result.stdout
+    assert "continue exact content with start_character=40001" in result.stdout
+
+    remainder = read_file(
+        tmp_path,
+        {"path": "minified.js", "start_character": 40_001, "end_character": 50_000},
+    )
+
+    assert remainder.stdout.startswith("x" * 10_000)
+    assert "showing characters 40001-50000 of 60000" in remainder.stdout
+    assert "continue with start_character=50001" in remainder.stdout
+
+
+def test_read_file_character_and_line_ranges_are_mutually_exclusive(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_text("abcdef\n", encoding="utf-8")
+
+    from handshake.tools import create_default_registry
+
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    mixed = registry.execute(
+        "read_file",
+        tmp_path,
+        {"path": "value.txt", "start_line": 1, "start_character": 1},
+    )
+    characters = registry.execute(
+        "read_file",
+        tmp_path,
+        {"path": "value.txt", "start_character": 2, "end_character": 4},
+    )
+
+    assert not mixed.ok
+    assert "mutually exclusive" in mixed.stderr
+    assert characters.ok
+    assert characters.stdout == (
+        "bcd\n[read_file: showing characters 2-4 of 7; continue with start_character=5]"
+    )
+
+
+def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "handshake-home"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+
+    from handshake.artifacts import resolve_artifact_reference, store_text_artifact
+    from handshake.tools import create_default_registry
+
+    artifact = store_text_artifact("test-result", "recover me")
+    output = resolve_artifact_reference(artifact.reference)
+    assert output is not None
+    internal = home / "handshake.db"
+    internal.write_text("do not expose", encoding="utf-8")
+
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    allowed = registry.execute("read_file", workspace, {"path": artifact.reference})
+    absolute_rejected = registry.execute("read_file", workspace, {"path": str(output)})
+    rejected = registry.execute("read_file", workspace, {"path": str(internal)})
+    traversal_rejected = registry.execute(
+        "read_file", workspace, {"path": "@handshake/artifacts/../handshake.db"}
+    )
+    write_rejected = registry.execute(
+        "write_file", workspace, {"path": str(output), "content": "changed"}
+    )
+
+    assert allowed.ok and allowed.stdout == "recover me"
+    assert not absolute_rejected.ok
+    assert not rejected.ok
+    assert "inside the workspace or use an @handshake/artifacts reference" in rejected.stderr
+    assert not traversal_rejected.ok
+    assert "Invalid Handshake artifact reference" in traversal_rejected.stderr
+    assert not write_rejected.ok
+    assert output.read_text(encoding="utf-8") == "recover me"
 
 
 def test_read_file_reports_a_page_past_an_empty_file(tmp_path: Path) -> None:
@@ -107,6 +182,24 @@ def test_read_file_reports_a_page_past_an_empty_file(tmp_path: Path) -> None:
 
     assert result.ok
     assert "start_line 2 is past the end of empty.txt (0 lines)" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "@handshake/artifacts",
+        "@handshake/artifacts/",
+        "@handshake/artifacts/not-an-artifact-id",
+        f"@handshake/artifacts/{'a' * 64}/child",
+    ),
+)
+def test_artifact_resolver_requires_one_opaque_artifact_id(
+    reference: str,
+) -> None:
+    from handshake.artifacts import ArtifactReferenceError, resolve_artifact_reference
+
+    with pytest.raises(ArtifactReferenceError, match="identify one artifact|Invalid"):
+        resolve_artifact_reference(reference)
 
 
 def test_list_files_filters_with_glob_and_bounds_results(tmp_path: Path) -> None:

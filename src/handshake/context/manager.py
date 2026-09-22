@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 
+from handshake.artifacts import ArtifactReferenceError, StoredTextArtifact
 from handshake.context.budget import (
     ContextBudgetPolicy,
     TokenEstimator,
@@ -21,6 +22,9 @@ from handshake.context.condenser import (
     raw_data,
 )
 from handshake.context.errors import ContextPressureError, ContextViewError
+from handshake.context.outputs import (
+    externalize_tool_result,
+)
 from handshake.context.state import (
     ContextCheckpoint,
     ContextDependency,
@@ -76,9 +80,11 @@ Rules:
 - Use update_plan for non-trivial, multi-step work when it improves progress tracking.
 - Simple requests may be completed without creating a plan.
 - Treat the plan as provisional and revise it when tool results materially change the approach.
-- All file paths must be relative to the workspace.
+- Use workspace-relative paths for repository files. A large tool result may provide an opaque
+  @handshake/artifacts reference; only read that reference with read_file.
 - Keep context use focused: discover with list_files/search_files, read only relevant line ranges,
-  and prefer edit_file for targeted changes to existing files.
+  use read_file's character-range mode for very long lines, and prefer edit_file for targeted
+  changes to existing files.
 - Make targeted changes and run appropriate validation afterwards.
 - Shell tools require user approval. If denied, adapt instead of pretending they ran.
 - Ask for a non-sensitive user fact with wait_for_text only when it cannot be inferred from the
@@ -203,7 +209,7 @@ class AgentContextManager:
                     and item.message.content[index].get("type") == "tool_result"
                 )
             state.messages[item.sequence] = self._project_message(
-                state, item.sequence, item.message
+                state, session.session_id, item.sequence, item.message
             )
             state.message_count += 1
         if state.message_count != source_message_count:
@@ -241,7 +247,11 @@ class AgentContextManager:
         state.reduction_dirty = False
 
     def _project_message(
-        self, state: _ContextState, sequence: int, raw: ModelMessage
+        self,
+        state: _ContextState,
+        session_id: str,
+        sequence: int,
+        raw: ModelMessage,
     ) -> ModelMessage:
         message = deepcopy(raw)
         if message.role != "user":
@@ -264,7 +274,9 @@ class AgentContextManager:
             content = block.get("content", "")
             text = content if isinstance(content, str) else compact_json(content)
             replacement = _ingress_content(
+                session_id,
                 sequence,
+                index,
                 call_id,
                 block.get("is_error") is not False,
                 text,
@@ -307,7 +319,9 @@ class AgentContextManager:
                 raise ContextViewError(
                     "Context messages must extend the durable transcript contiguously"
                 )
-            message = self._project_message(state, sequence, item.message)
+            message = self._project_message(
+                state, session.session_id, sequence, item.message
+            )
             state.messages[sequence] = message
             state.message_count = sequence + 1
             changed = True
@@ -602,7 +616,9 @@ class AgentContextManager:
 
 
 def _ingress_content(
+    session_id: str,
     sequence: int,
+    block_index: int,
     call_id: str,
     is_error: bool,
     content: str,
@@ -612,30 +628,46 @@ def _ingress_content(
     original_tokens = _result_tokens(call_id, is_error, content, estimator)
     if original_tokens <= policy.max_tool_result_tokens:
         return None
-    marker = (
-        f"[tool result ingress-limited; "
-        f"status={'failure' if is_error else 'success'}; "
-        f"source_sequence={sequence}; original_estimated_tokens={original_tokens}]"
-    )
-    kept = len(content)
-    replacement = marker
-    while kept:
-        head, tail = (kept + 1) // 2, kept // 2
-        replacement = (
-            f"{marker}\n--- head ---\n{content[:head]}\n"
-            f"--- tail ---\n{content[-tail:] if tail else ''}"
+    try:
+        external = externalize_tool_result(
+            session_id,
+            sequence,
+            block_index,
+            content,
         )
-        if (
-            _result_tokens(call_id, is_error, replacement, estimator)
-            <= policy.max_tool_result_tokens
-        ):
-            break
-        kept //= 2
-    while replacement and _result_tokens(
-        call_id, is_error, replacement, estimator
-    ) > policy.max_tool_result_tokens:
-        replacement = replacement[: len(replacement) // 2]
-    return replacement
+    except (OSError, ArtifactReferenceError) as exc:
+        raise ContextViewError(
+            f"Could not externalize oversized tool result at source sequence {sequence}"
+        ) from exc
+    marker = _external_result_marker(
+        external,
+        sequence=sequence,
+        is_error=is_error,
+        estimated_tokens=original_tokens,
+    )
+    if _result_tokens(call_id, is_error, marker, estimator) > policy.max_tool_result_tokens:
+        raise ContextPressureError(
+            "Tool-result ingress limit is too small to expose its recovery path"
+        )
+    return marker
+
+
+def _external_result_marker(
+    external: StoredTextArtifact,
+    *,
+    sequence: int,
+    is_error: bool,
+    estimated_tokens: int,
+) -> str:
+    return (
+        "[tool result externalized; "
+        f"status={'failure' if is_error else 'success'}; "
+        f"source_sequence={sequence}; estimated_tokens={estimated_tokens}; "
+        f"bytes={external.byte_count}; characters={external.character_count}; "
+        f"lines={external.line_count}; path={external.reference}]\n"
+        "Read the complete output with read_file. Ranges are 1-based and inclusive. "
+        "Use one mode only: start_line/end_line OR start_character/end_character."
+    )
 
 
 def _stale_marker(sequence: int, is_error: object) -> str:

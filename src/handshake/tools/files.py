@@ -9,6 +9,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from handshake.artifacts import ArtifactReferenceError, resolve_artifact_reference
 from handshake.models.base import ToolDefinition
 from handshake.runtime.errors import ToolExecutionError
 from handshake.runtime.state import ToolResult
@@ -16,7 +17,9 @@ from handshake.tools.registry import ToolBinding
 
 _DEFAULT_READ_LINES = 200
 _MAX_READ_LINES = 1000
+_DEFAULT_READ_CHARACTERS = 10_000
 _MAX_READ_CHARACTERS = 50_000
+_MAX_READ_BYTES = 40_000
 _DEFAULT_LIST_RESULTS = 200
 _DEFAULT_SEARCH_RESULTS = 50
 _DEFAULT_GLOB_PATTERN = "**/*"
@@ -80,24 +83,58 @@ def resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
     return resolved
 
 
-def _bounded_result(text: str, notice: str) -> str:
-    if len(text) <= _MAX_READ_CHARACTERS:
-        return f"{text}{notice}"
-    clipped = text[:_MAX_READ_CHARACTERS]
-    return (
-        f"{clipped}\n\n[read_file: output truncated at "
-        f"{_MAX_READ_CHARACTERS} characters; request a narrower line range]"
-    )
+def resolve_readable_path(workspace: Path, raw_path: str) -> Path:
+    """Resolve a workspace path or opaque Handshake artifact reference."""
+    try:
+        output_path = resolve_artifact_reference(raw_path)
+    except ArtifactReferenceError as exc:
+        raise ToolExecutionError(str(exc)) from None
+    if output_path is not None:
+        return output_path
+
+    candidate = Path(raw_path)
+    workspace_root = workspace.resolve()
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ToolExecutionError(
+            "Path must remain inside the workspace or use an "
+            "@handshake/artifacts reference"
+        )
+    resolved = (workspace_root / candidate).resolve(strict=False)
+    if not resolved.is_relative_to(workspace_root):
+        raise ToolExecutionError("Resolved path escapes the workspace")
+    return resolved
+
+
+def _clip_utf8(text: str) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _MAX_READ_BYTES:
+        return text, False
+    return encoded[:_MAX_READ_BYTES].decode("utf-8", errors="ignore"), True
 
 
 def read_file(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
-    """Read a bounded, 1-based line range instead of returning a whole large file."""
+    """Read a bounded UTF-8 file range by either lines or characters."""
     raw_path = _required_string(arguments, "path")
-    path = resolve_workspace_path(workspace, raw_path)
+    path = resolve_readable_path(workspace, raw_path)
     if not path.is_file():
         raise ToolExecutionError(f"File does not exist: {raw_path}")
 
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    text = path.read_text(encoding="utf-8")
+    line_keys = {"start_line", "end_line"}
+    character_keys = {"start_character", "end_character"}
+    if line_keys.intersection(arguments) and character_keys.intersection(arguments):
+        raise ToolExecutionError(
+            "Line ranges and character ranges are mutually exclusive; use only one mode"
+        )
+    if character_keys.intersection(arguments):
+        return _read_character_range(raw_path, text, arguments)
+    return _read_line_range(raw_path, text, arguments)
+
+
+def _read_line_range(
+    raw_path: str, text: str, arguments: Mapping[str, Any]
+) -> ToolResult:
+    lines = text.splitlines(keepends=True)
     total_lines = len(lines)
     start = _optional_int(arguments, "start_line", 1, minimum=1)
     raw_end = arguments.get("end_line")
@@ -111,8 +148,16 @@ def read_file(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
         raise ToolExecutionError(f"read_file accepts at most {_MAX_READ_LINES} lines per call")
 
     selected = "".join(lines[start - 1 : end])
+    visible, clipped = _clip_utf8(selected)
     actual_end = min(end, total_lines)
-    if start > total_lines and (total_lines > 0 or start > 1):
+    if clipped:
+        first_character = sum(len(line) for line in lines[: start - 1]) + 1
+        next_character = first_character + len(visible)
+        notice = (
+            f"\n\n[read_file: line selection exceeded {_MAX_READ_BYTES} UTF-8 bytes; "
+            f"continue exact content with start_character={next_character}]"
+        )
+    elif start > total_lines and (total_lines > 0 or start > 1):
         notice = (
             f"\n[read_file: start_line {start} is past the end of {raw_path} ({total_lines} lines)]"
         )
@@ -123,7 +168,50 @@ def read_file(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
         notice = f"\n[read_file: showing lines {start}-{actual_end} of {total_lines}{next_hint}]"
     else:
         notice = ""
-    return ToolResult(ok=True, stdout=_bounded_result(selected, notice))
+    return ToolResult(ok=True, stdout=f"{visible}{notice}")
+
+
+def _read_character_range(
+    raw_path: str, text: str, arguments: Mapping[str, Any]
+) -> ToolResult:
+    total_characters = len(text)
+    start = _optional_int(arguments, "start_character", 1, minimum=1)
+    raw_end = arguments.get("end_character")
+    if raw_end is None:
+        end = start + _DEFAULT_READ_CHARACTERS - 1
+    else:
+        end = _optional_int(arguments, "end_character", start, minimum=1)
+    if end < start:
+        raise ToolExecutionError(
+            "end_character must be greater than or equal to start_character"
+        )
+    if end - start + 1 > _MAX_READ_CHARACTERS:
+        raise ToolExecutionError(
+            f"read_file accepts at most {_MAX_READ_CHARACTERS} characters per call"
+        )
+
+    selected = text[start - 1 : end]
+    visible, clipped = _clip_utf8(selected)
+    actual_end = min(start + len(visible) - 1, total_characters)
+    if start > total_characters and (total_characters > 0 or start > 1):
+        notice = (
+            f"\n[read_file: start_character {start} is past the end of {raw_path} "
+            f"({total_characters} characters)]"
+        )
+    elif start > 1 or actual_end < total_characters:
+        next_hint = (
+            f"; continue with start_character={actual_end + 1}"
+            if actual_end < total_characters
+            else ""
+        )
+        byte_note = f"; clipped at {_MAX_READ_BYTES} UTF-8 bytes" if clipped else ""
+        notice = (
+            f"\n[read_file: showing characters {start}-{actual_end} of "
+            f"{total_characters}{byte_note}{next_hint}]"
+        )
+    else:
+        notice = ""
+    return ToolResult(ok=True, stdout=f"{visible}{notice}")
 
 
 def _iter_workspace_files(root: Path, workspace: Path) -> Iterator[Path]:
@@ -319,8 +407,11 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
             definition=ToolDefinition(
                 name="read_file",
                 description=(
-                    f"Read a UTF-8 workspace file by 1-based line range. Without end_line, "
-                    f"returns at most {_DEFAULT_READ_LINES} lines and provides a continuation hint."
+                    "Read a UTF-8 workspace file or an @handshake/artifacts reference "
+                    "from a large-result notice. Choose one mutually exclusive 1-based range: "
+                    "start_line/end_line or start_character/end_character. With no range, "
+                    "returns at most "
+                    f"{_DEFAULT_READ_LINES} lines and provides a continuation hint."
                 ),
                 input_schema={
                     "type": "object",
@@ -328,8 +419,26 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                         "path": {"type": "string"},
                         "start_line": {"type": "integer", "minimum": 1},
                         "end_line": {"type": "integer", "minimum": 1},
+                        "start_character": {"type": "integer", "minimum": 1},
+                        "end_character": {"type": "integer", "minimum": 1},
                     },
                     "required": ["path"],
+                    "not": {
+                        "allOf": [
+                            {
+                                "anyOf": [
+                                    {"required": ["start_line"]},
+                                    {"required": ["end_line"]},
+                                ]
+                            },
+                            {
+                                "anyOf": [
+                                    {"required": ["start_character"]},
+                                    {"required": ["end_character"]},
+                                ]
+                            },
+                        ]
+                    },
                     "additionalProperties": False,
                 },
             ),

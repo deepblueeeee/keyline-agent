@@ -172,9 +172,12 @@ def tool_round(failed: bool, text: str) -> tuple[ModelMessage, ModelMessage]:
     )
 
 
-def test_masked_success_and_full_failure_and_durable_history(tmp_path: Path) -> None:
+def test_masked_success_and_full_failure_and_durable_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
     condenser = Condenser()
-    manager, session, run = setup(tmp_path, condenser, max_tool_result_tokens=300)
+    manager, session, run = setup(tmp_path, condenser, max_tool_result_tokens=600)
     _HISTORY[session.session_id] = [
         *tool_round(False, "SUCCESS" * 1000),
         *tool_round(True, "ERROR DETAILS" * 1000),

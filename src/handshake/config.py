@@ -42,3 +42,8 @@ def handshake_home() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".handshake").resolve()
+
+
+def artifact_directory() -> Path:
+    """Return the private directory backing model-readable artifact references."""
+    return handshake_home() / "artifacts"
