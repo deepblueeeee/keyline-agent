@@ -19,6 +19,7 @@ from handshake.context import (
 )
 from handshake.context.budget import compact_json, estimate_model_context
 from handshake.context.condenser import condenser_context, episode_data, raw_data
+from handshake.context.reduction import select_raw_candidate
 from handshake.models.protocol import ModelMessage, ModelTurn
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.errors import ModelProtocolError, ModelProviderError
@@ -225,14 +226,35 @@ def test_independent_background_raw_and_total_budgets(tmp_path: Path) -> None:
     manager, session, run = setup(tmp_path, condenser, background_episode_tokens=1)
     _prepare(manager, session, run)
     assert condenser.calls[1][1] == ()
-    background, target = manager._raw_candidate(session, None)
+    state = manager._states[session.session_id]
+    background, target = select_raw_candidate(
+        state,
+        session_id=session.session_id,
+        policy=manager.policy,
+        estimator=manager.estimator,
+        raw_message_reader=None,
+    )
     assert len(target) == 4
     first_size = len(compact_json(raw_data(target[:1])))
     manager.policy = replace(manager.policy, raw_target_tokens=first_size)
-    assert len(manager._raw_candidate(session, None)[1]) == 1
+    assert len(
+        select_raw_candidate(
+            state,
+            session_id=session.session_id,
+            policy=manager.policy,
+            estimator=manager.estimator,
+            raw_message_reader=None,
+        )[1]
+    ) == 1
     total = estimate_model_context(condenser_context((), target[:1]), (), Characters())
     manager.policy = replace(manager.policy, condenser_input_tokens=total - 1)
-    assert manager._raw_candidate(session, None)[1] == ()
+    assert select_raw_candidate(
+        state,
+        session_id=session.session_id,
+        policy=manager.policy,
+        estimator=manager.estimator,
+        raw_message_reader=None,
+    )[1] == ()
 
 
 def test_masking_reaches_target_without_condenser(tmp_path: Path) -> None:

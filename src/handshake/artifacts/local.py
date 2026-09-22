@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 from handshake.config import artifact_directory
 
@@ -55,8 +56,7 @@ def store_text_artifact(key: str, content: str) -> StoredTextArtifact:
     )
 
 
-def resolve_artifact_reference(reference: str) -> Path | None:
-    """Resolve one opaque artifact reference; ordinary workspace paths return None."""
+def _artifact_path(reference: str) -> Path | None:
     if reference in {_REFERENCE_PREFIX.removesuffix("/"), _REFERENCE_PREFIX}:
         raise ArtifactReferenceError("Artifact references must identify one artifact")
     if not reference.startswith(_REFERENCE_PREFIX):
@@ -70,3 +70,14 @@ def resolve_artifact_reference(reference: str) -> Path | None:
     if not resolved.is_relative_to(root):
         raise ArtifactReferenceError("Artifact reference escapes its configured root")
     return resolved
+
+
+def open_text_artifact(reference: str) -> TextIO | None:
+    """Open an artifact text stream; ordinary workspace paths return None."""
+    path = _artifact_path(reference)
+    if path is None:
+        return None
+    try:
+        return path.open(encoding="utf-8", newline="")
+    except FileNotFoundError:
+        raise ArtifactReferenceError(f"Artifact does not exist: {reference}") from None

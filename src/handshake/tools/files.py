@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
-from handshake.artifacts import ArtifactReferenceError, resolve_artifact_reference
+from handshake.artifacts import ArtifactReferenceError, open_text_artifact
 from handshake.models.base import ToolDefinition
 from handshake.runtime.errors import ToolExecutionError
 from handshake.runtime.state import ToolResult
@@ -83,59 +85,79 @@ def resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
     return resolved
 
 
-def resolve_readable_path(workspace: Path, raw_path: str) -> Path:
-    """Resolve a workspace path or opaque Handshake artifact reference."""
+@contextmanager
+def _open_readable_text(workspace: Path, raw_path: str) -> Iterator[TextIO]:
+    """Open either a workspace file or an opaque Handshake artifact."""
     try:
-        output_path = resolve_artifact_reference(raw_path)
+        artifact = open_text_artifact(raw_path)
     except ArtifactReferenceError as exc:
         raise ToolExecutionError(str(exc)) from None
-    if output_path is not None:
-        return output_path
+    if artifact is not None:
+        with artifact:
+            yield artifact
+        return
 
-    candidate = Path(raw_path)
-    workspace_root = workspace.resolve()
-    if candidate.is_absolute() or ".." in candidate.parts:
+    try:
+        path = resolve_workspace_path(workspace, raw_path)
+    except ToolExecutionError:
         raise ToolExecutionError(
-            "Path must remain inside the workspace or use an "
-            "@handshake/artifacts reference"
-        )
-    resolved = (workspace_root / candidate).resolve(strict=False)
-    if not resolved.is_relative_to(workspace_root):
-        raise ToolExecutionError("Resolved path escapes the workspace")
-    return resolved
+            "Read path must be relative and remain inside the workspace or use an "
+            "@handshake/artifacts reference; a path that escapes the workspace is rejected"
+        ) from None
+    if not path.is_file():
+        raise ToolExecutionError(f"File does not exist: {raw_path}")
+    with path.open(encoding="utf-8") as stream:
+        yield stream
 
 
-def _clip_utf8(text: str) -> tuple[str, bool]:
+def _append_bounded(parts: list[str], text: str, remaining: int) -> tuple[int, bool]:
     encoded = text.encode("utf-8")
-    if len(encoded) <= _MAX_READ_BYTES:
-        return text, False
-    return encoded[:_MAX_READ_BYTES].decode("utf-8", errors="ignore"), True
+    if len(encoded) <= remaining:
+        parts.append(text)
+        return remaining - len(encoded), False
+    if remaining:
+        parts.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+    return 0, bool(text)
+
+
+def _iter_line_pieces(stream: TextIO) -> Iterator[tuple[str, bool]]:
+    """Yield bounded text pieces while preserving every original line ending."""
+    pending_cr = ""
+    while chunk := stream.read(8192):
+        chunk = pending_cr + chunk
+        pending_cr = ""
+        if chunk.endswith("\r"):
+            chunk = chunk[:-1]
+            pending_cr = "\r"
+
+        offset = 0
+        for match in re.finditer(r"\r\n|\r|\n", chunk):
+            yield chunk[offset : match.end()], True
+            offset = match.end()
+        if offset < len(chunk):
+            yield chunk[offset:], False
+    if pending_cr:
+        yield pending_cr, True
 
 
 def read_file(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
     """Read a bounded UTF-8 file range by either lines or characters."""
     raw_path = _required_string(arguments, "path")
-    path = resolve_readable_path(workspace, raw_path)
-    if not path.is_file():
-        raise ToolExecutionError(f"File does not exist: {raw_path}")
-
-    text = path.read_text(encoding="utf-8")
     line_keys = {"start_line", "end_line"}
     character_keys = {"start_character", "end_character"}
     if line_keys.intersection(arguments) and character_keys.intersection(arguments):
         raise ToolExecutionError(
             "Line ranges and character ranges are mutually exclusive; use only one mode"
         )
-    if character_keys.intersection(arguments):
-        return _read_character_range(raw_path, text, arguments)
-    return _read_line_range(raw_path, text, arguments)
+    with _open_readable_text(workspace, raw_path) as stream:
+        if character_keys.intersection(arguments):
+            return _read_character_range(raw_path, stream, arguments)
+        return _read_line_range(raw_path, stream, arguments)
 
 
 def _read_line_range(
-    raw_path: str, text: str, arguments: Mapping[str, Any]
+    raw_path: str, stream: TextIO, arguments: Mapping[str, Any]
 ) -> ToolResult:
-    lines = text.splitlines(keepends=True)
-    total_lines = len(lines)
     start = _optional_int(arguments, "start_line", 1, minimum=1)
     raw_end = arguments.get("end_line")
     if raw_end is None:
@@ -147,12 +169,36 @@ def _read_line_range(
     if end - start + 1 > _MAX_READ_LINES:
         raise ToolExecutionError(f"read_file accepts at most {_MAX_READ_LINES} lines per call")
 
-    selected = "".join(lines[start - 1 : end])
-    visible, clipped = _clip_utf8(selected)
+    parts: list[str] = []
+    remaining = _MAX_READ_BYTES
+    clipped = False
+    current_line = 1
+    characters_seen = 0
+    first_character: int | None = None
+    saw_content = False
+    ended_with_newline = False
+    for piece, ends_line in _iter_line_pieces(stream):
+        saw_content = True
+        if start <= current_line <= end:
+            if first_character is None:
+                first_character = characters_seen + 1
+            remaining, piece_clipped = _append_bounded(parts, piece, remaining)
+            clipped = clipped or piece_clipped
+        characters_seen += len(piece)
+        ended_with_newline = ends_line
+        if ends_line:
+            current_line += 1
+    total_lines = (
+        0
+        if not saw_content
+        else current_line - 1
+        if ended_with_newline
+        else current_line
+    )
+    visible = "".join(parts)
     actual_end = min(end, total_lines)
     if clipped:
-        first_character = sum(len(line) for line in lines[: start - 1]) + 1
-        next_character = first_character + len(visible)
+        next_character = (first_character or characters_seen + 1) + len(visible)
         notice = (
             f"\n\n[read_file: line selection exceeded {_MAX_READ_BYTES} UTF-8 bytes; "
             f"continue exact content with start_character={next_character}]"
@@ -172,9 +218,8 @@ def _read_line_range(
 
 
 def _read_character_range(
-    raw_path: str, text: str, arguments: Mapping[str, Any]
+    raw_path: str, stream: TextIO, arguments: Mapping[str, Any]
 ) -> ToolResult:
-    total_characters = len(text)
     start = _optional_int(arguments, "start_character", 1, minimum=1)
     raw_end = arguments.get("end_character")
     if raw_end is None:
@@ -190,8 +235,23 @@ def _read_character_range(
             f"read_file accepts at most {_MAX_READ_CHARACTERS} characters per call"
         )
 
-    selected = text[start - 1 : end]
-    visible, clipped = _clip_utf8(selected)
+    parts: list[str] = []
+    remaining = _MAX_READ_BYTES
+    clipped = False
+    total_characters = 0
+    while chunk := stream.read(8192):
+        chunk_start = total_characters + 1
+        chunk_end = total_characters + len(chunk)
+        overlap_start = max(start, chunk_start)
+        overlap_end = min(end, chunk_end)
+        if overlap_start <= overlap_end:
+            selected = chunk[
+                overlap_start - chunk_start : overlap_end - chunk_start + 1
+            ]
+            remaining, piece_clipped = _append_bounded(parts, selected, remaining)
+            clipped = clipped or piece_clipped
+        total_characters = chunk_end
+    visible = "".join(parts)
     actual_end = min(start + len(visible) - 1, total_characters)
     if start > total_characters and (total_characters > 0 or start > 1):
         notice = (

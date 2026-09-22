@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.artifacts import resolve_artifact_reference
+from handshake.artifacts import open_text_artifact
 from handshake.config import DeepSeekConfig
 from handshake.context import (
     AgentContextManager,
@@ -169,16 +169,17 @@ def test_ingress_externalizes_every_large_result_but_preserves_raw_history(
     assert "tool result externalized" in (
         view.protected_recent.messages[1].message.content[0]["content"]
     )
-    successful_path = resolve_artifact_reference(
+    successful_stream = open_text_artifact(
         visible_results[0]["content"].split("path=", 1)[1].split("]", 1)[0]
     )
-    failed_path = resolve_artifact_reference(
+    failed_stream = open_text_artifact(
         visible_results[1]["content"].split("path=", 1)[1].split("]", 1)[0]
     )
-    assert successful_path is not None
-    assert failed_path is not None
-    assert successful_path.read_text(encoding="utf-8") == successful
-    assert failed_path.read_text(encoding="utf-8") == failed
+    assert successful_stream is not None
+    assert failed_stream is not None
+    with successful_stream, failed_stream:
+        assert successful_stream.read() == successful
+        assert failed_stream.read() == failed
     assert f"bytes={len(successful.encode('utf-8'))}" in visible_results[0]["content"]
     assert f"characters={len(successful)}" in visible_results[0]["content"]
     assert "lines=1" in visible_results[0]["content"]

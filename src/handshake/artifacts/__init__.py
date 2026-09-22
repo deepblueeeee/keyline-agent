@@ -3,13 +3,13 @@
 from handshake.artifacts.local import (
     ArtifactReferenceError,
     StoredTextArtifact,
-    resolve_artifact_reference,
+    open_text_artifact,
     store_text_artifact,
 )
 
 __all__ = [
     "ArtifactReferenceError",
     "StoredTextArtifact",
-    "resolve_artifact_reference",
+    "open_text_artifact",
     "store_text_artifact",
 ]

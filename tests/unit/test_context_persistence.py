@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.artifacts import resolve_artifact_reference
+from handshake.artifacts import open_text_artifact
 from handshake.context import (
     AgentContextManager,
     ContextBudgetPolicy,
@@ -178,9 +178,10 @@ def test_restore_rebuilds_externalized_result_and_reuses_its_path(
     marker = before.messages[1].content[0]["content"]
     reference = marker.split("path=", 1)[1].split("]", 1)[0]
     assert reference.startswith("@handshake/artifacts/")
-    path = resolve_artifact_reference(reference)
-    assert path is not None
-    assert path.read_text(encoding="utf-8") == original
+    stream = open_text_artifact(reference)
+    assert stream is not None
+    with stream:
+        assert stream.read() == original
     assert history(store, session)[1].content[0]["content"] == original
 
 

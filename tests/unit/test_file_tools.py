@@ -145,12 +145,11 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
     home = tmp_path / "handshake-home"
     monkeypatch.setenv("HANDSHAKE_HOME", str(home))
 
-    from handshake.artifacts import resolve_artifact_reference, store_text_artifact
+    from handshake.artifacts import open_text_artifact, store_text_artifact
     from handshake.tools import create_default_registry
 
     artifact = store_text_artifact("test-result", "recover me")
-    output = resolve_artifact_reference(artifact.reference)
-    assert output is not None
+    output = home / "artifacts" / "private.txt"
     internal = home / "handshake.db"
     internal.write_text("do not expose", encoding="utf-8")
 
@@ -172,7 +171,40 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
     assert not traversal_rejected.ok
     assert "Invalid Handshake artifact reference" in traversal_rejected.stderr
     assert not write_rejected.ok
-    assert output.read_text(encoding="utf-8") == "recover me"
+    artifact_stream = open_text_artifact(artifact.reference)
+    assert artifact_stream is not None
+    with artifact_stream:
+        assert artifact_stream.read() == "recover me"
+
+
+def test_artifact_ranges_preserve_crlf_and_cr_line_endings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+
+    from handshake.artifacts import store_text_artifact
+
+    content = "first\r\nsecond\rthird\n"
+    artifact = store_text_artifact("mixed-newlines", content)
+
+    characters = read_file(
+        tmp_path,
+        {
+            "path": artifact.reference,
+            "start_character": 1,
+            "end_character": len(content),
+        },
+    )
+    lines = read_file(
+        tmp_path,
+        {"path": artifact.reference, "start_line": 1, "end_line": 2},
+    )
+
+    assert artifact.character_count == len(content)
+    assert artifact.line_count == 3
+    assert characters.stdout == content
+    assert lines.stdout.startswith("first\r\nsecond\r")
+    assert "showing lines 1-2 of 3; continue with start_line=3" in lines.stdout
 
 
 def test_read_file_reports_a_page_past_an_empty_file(tmp_path: Path) -> None:
@@ -193,13 +225,13 @@ def test_read_file_reports_a_page_past_an_empty_file(tmp_path: Path) -> None:
         f"@handshake/artifacts/{'a' * 64}/child",
     ),
 )
-def test_artifact_resolver_requires_one_opaque_artifact_id(
+def test_artifact_reader_requires_one_opaque_artifact_id(
     reference: str,
 ) -> None:
-    from handshake.artifacts import ArtifactReferenceError, resolve_artifact_reference
+    from handshake.artifacts import ArtifactReferenceError, open_text_artifact
 
     with pytest.raises(ArtifactReferenceError, match="identify one artifact|Invalid"):
-        resolve_artifact_reference(reference)
+        open_text_artifact(reference)
 
 
 def test_list_files_filters_with_glob_and_bounds_results(tmp_path: Path) -> None:
