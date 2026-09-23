@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import threading
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 
 import handshake.cli as cli
+from handshake.config import credentials as provider_credentials
 from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
 from handshake.runtime.state import (
     DependencyStatus,
@@ -157,12 +159,107 @@ def test_real_run_requires_api_key(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(
+        provider_credentials,
+        "_credential_path",
+        lambda: tmp_path / ".handshake" / "credentials" / "deepseek_api_key",
+    )
 
     exit_code = cli.main(["run", str(tmp_path), "inspect the repository"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "DEEPSEEK_API_KEY is required" in captured.err
+    assert "handshake config set-api-key" in captured.err
+
+
+def test_config_set_api_key_uses_hidden_input_without_echo_or_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canary = "local-provider-canary-key"
+    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: canary)
+
+    exit_code = cli.main(["config", "set-api-key"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "saved" in captured.out
+    assert canary not in captured.out + captured.err
+    assert credential_path.read_text(encoding="utf-8") == canary
+    assert not (tmp_path / ".handshake" / "handshake.db").exists()
+
+
+def test_config_set_api_key_rejects_noninteractive_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
+
+    assert cli.main(["config", "set-api-key"]) == 1
+    assert "interactive terminal" in capsys.readouterr().err
+    assert not credential_path.exists()
+
+
+def test_config_set_api_key_rejects_visible_getpass_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+
+    def visible_fallback(_prompt: str) -> str:
+        warnings.warn(
+            "terminal echo would be enabled", cli.getpass.GetPassWarning, stacklevel=2
+        )
+        return "must-not-be-saved"
+
+    monkeypatch.setattr(cli.getpass, "getpass", visible_fallback)
+
+    assert cli.main(["config", "set-api-key"]) == 1
+    captured = capsys.readouterr()
+    assert "Hidden API key input is unavailable" in captured.err
+    assert "must-not-be-saved" not in captured.out + captured.err
+    assert not credential_path.exists()
+
+
+def test_real_run_reads_saved_key_without_persisting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canary = "saved-provider-canary-key"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "state"
+    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
+    provider_credentials.save_deepseek_api_key(canary)
+    supplied_keys: list[str] = []
+
+    def model_factory(**kwargs: Any) -> _RecordingFinishModel:
+        supplied_keys.append(kwargs["api_key"])
+        return _RecordingFinishModel("Completed with saved credential.")
+
+    monkeypatch.setattr(cli, "DeepSeekAnthropicModel", model_factory)
+
+    assert cli.main(["run", str(workspace), "inspect the repository"]) == 0
+    captured = capsys.readouterr()
+    assert supplied_keys == [canary]
+    assert "Completed with saved credential." in captured.out
+    assert canary not in captured.out + captured.err
+    assert canary.encode() not in (home / "handshake.db").read_bytes()
 
 
 def test_run_answers_text_wait_and_finishes_in_same_process(

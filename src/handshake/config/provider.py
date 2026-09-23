@@ -1,11 +1,11 @@
-"""Non-secret provider configuration and environment lookup."""
+"""DeepSeek provider settings and credential lookup."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
+from handshake.config.credentials import read_saved_deepseek_api_key
 from handshake.runtime.errors import HandshakeError
 
 
@@ -29,21 +29,14 @@ class DeepSeekConfig:
 
 
 def read_deepseek_api_key() -> str:
-    """Read the key without placing it in normal session/run state."""
+    """Prefer an environment override, then the private user-local key."""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise HandshakeError("DEEPSEEK_API_KEY is required for real-model runs")
-    return api_key
-
-
-def handshake_home() -> Path:
-    """Return the local durable-state directory without reading any secret."""
-    configured = os.environ.get("HANDSHAKE_HOME")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return (Path.home() / ".handshake").resolve()
-
-
-def artifact_directory() -> Path:
-    """Return the private directory backing model-readable artifact references."""
-    return handshake_home() / "artifacts"
+    if api_key:
+        return api_key
+    saved = read_saved_deepseek_api_key()
+    if saved is not None:
+        return saved
+    raise HandshakeError(
+        "DeepSeek API key is required: set DEEPSEEK_API_KEY or run "
+        "'handshake config set-api-key'"
+    )

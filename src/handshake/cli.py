@@ -10,10 +10,16 @@ import shlex
 import shutil
 import sys
 import tempfile
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 
-from handshake.config import DeepSeekConfig, handshake_home, read_deepseek_api_key
+from handshake.config import (
+    DeepSeekConfig,
+    handshake_home,
+    read_deepseek_api_key,
+    save_deepseek_api_key,
+)
 from handshake.context import AgentContextManager, LLMHistoryCondenser
 from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter
@@ -587,6 +593,25 @@ def _run_demo(_args: argparse.Namespace) -> int:
         return 0
 
 
+def _set_api_key(_args: argparse.Namespace) -> int:
+    if not sys.stdin.isatty():
+        raise HandshakeError("Saving an API key requires an interactive terminal")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            value = getpass.getpass("DeepSeek API key (input hidden): ")
+    except getpass.GetPassWarning:
+        raise HandshakeError("Hidden API key input is unavailable in this terminal") from None
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise UserCancelledError("User cancelled API key input") from exc
+    try:
+        save_deepseek_api_key(value)
+    finally:
+        del value
+    print("DeepSeek API key saved in the user directory.")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="handshake")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -621,6 +646,13 @@ def _parser() -> argparse.ArgumentParser:
 
     demo_parser = subparsers.add_parser("demo", help="run the offline scripted demo")
     demo_parser.set_defaults(handler=_run_demo)
+
+    config_parser = subparsers.add_parser("config", help="manage local configuration")
+    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
+    key_parser = config_subparsers.add_parser(
+        "set-api-key", help="save the DeepSeek API key in the user directory"
+    )
+    key_parser.set_defaults(handler=_set_api_key)
     return parser
 
 
