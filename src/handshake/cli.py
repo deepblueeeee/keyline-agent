@@ -15,12 +15,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from handshake.config import (
-    DeepSeekConfig,
     handshake_home,
+    load_runtime_settings,
     read_deepseek_api_key,
     save_deepseek_api_key,
+    settings_path,
 )
-from handshake.context import AgentContextManager, LLMHistoryCondenser
+from handshake.context import AgentContextManager, ContextBudgetPolicy, LLMHistoryCondenser
 from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
@@ -70,7 +71,7 @@ def _state_store() -> SQLiteStateStore:
 
 
 def _create_real_model(model_name: str) -> ModelAdapter:
-    config = DeepSeekConfig.from_environment(model_override=model_name)
+    config = load_runtime_settings(model_override=model_name).provider
     api_key = read_deepseek_api_key()
     model = DeepSeekAnthropicModel(
         api_key=api_key,
@@ -319,8 +320,9 @@ def _drive_session(
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
     initial_model: ModelAdapter | None = None,
+    context_policy: ContextBudgetPolicy | None = None,
 ) -> int:
-    context_manager = AgentContextManager()
+    context_manager = AgentContextManager(policy=context_policy)
     result_code, run = _process_current_run(
         session,
         run,
@@ -357,14 +359,14 @@ def _run_real(args: argparse.Namespace) -> int:
     workspace = Path(args.repo).expanduser().resolve()
     if not workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {workspace}")
-    config = DeepSeekConfig.from_environment(model_override=args.model)
-    model = _create_real_model(config.model)
+    settings = load_runtime_settings(model_override=args.model)
+    model = _create_real_model(settings.provider.model)
     store = _state_store()
     session = Session(workspace=workspace)
     run = create_initial_run(
         session,
         args.request,
-        model_name=config.model,
+        model_name=settings.provider.model,
         max_steps=args.max_steps,
     )
     store.create_session(session)
@@ -379,6 +381,7 @@ def _run_real(args: argparse.Namespace) -> int:
         secret_writer,
         secret_command_runner,
         model,
+        settings.context,
     )
 
 
@@ -388,6 +391,7 @@ def _resume_session(args: argparse.Namespace) -> int:
     if not session.workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
     run = latest_run(session, store.list_runs(session.session_id))
+    settings = load_runtime_settings(model_override=run.model_name)
     registry = create_default_registry(_interactive_approval)
     secret_writer, secret_command_runner = _create_secret_capabilities()
     if prepare_run_for_resume(
@@ -404,6 +408,7 @@ def _resume_session(args: argparse.Namespace) -> int:
         store,
         secret_writer,
         secret_command_runner,
+        context_policy=settings.context,
     )
 
 
@@ -612,6 +617,16 @@ def _set_api_key(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _show_config(_args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    print(f"Configuration: {settings_path()}")
+    print("[model]")
+    print(f"max_tokens = {settings.provider.max_tokens}")
+    print("\n[context]")
+    print(f"context_window_tokens = {settings.context.context_window_tokens}")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="handshake")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -653,6 +668,10 @@ def _parser() -> argparse.ArgumentParser:
         "set-api-key", help="save the DeepSeek API key in the user directory"
     )
     key_parser.set_defaults(handler=_set_api_key)
+    show_parser = config_subparsers.add_parser(
+        "show", help="show effective non-secret model and context settings"
+    )
+    show_parser.set_defaults(handler=_show_config)
     return parser
 
 

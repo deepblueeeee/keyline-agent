@@ -13,6 +13,7 @@ import pytest
 
 import handshake.cli as cli
 from handshake.config import credentials as provider_credentials
+from handshake.context import AgentContextManager
 from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
 from handshake.runtime.state import (
     DependencyStatus,
@@ -170,6 +171,105 @@ def test_real_run_requires_api_key(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "handshake config set-api-key" in captured.err
+
+
+def test_config_show_displays_effective_nonsecret_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "state"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        "[model]\nmax_tokens = 4096\n[context]\ncontext_window_tokens = 131072\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "never-print-this-key")
+
+    assert cli.main(["config", "show"]) == 0
+
+    captured = capsys.readouterr()
+    assert f"Configuration: {home / 'config.toml'}" in captured.out
+    assert "max_tokens = 4096" in captured.out
+    assert "context_window_tokens = 131072" in captured.out
+    assert "pressure_trigger_ratio" not in captured.out
+    assert "reserved_output_tokens" not in captured.out
+    assert "never-print-this-key" not in captured.out + captured.err
+
+
+def test_run_uses_configured_provider_and_context_budgets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "state"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        "[model]\nmax_tokens = 4096\n"
+        "[context]\ncontext_window_tokens = 32768\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-provider-key")
+    monkeypatch.setattr(sys, "stdin", _TTY(False))
+    supplied: list[dict[str, Any]] = []
+    policies: list[Any] = []
+    context_manager = AgentContextManager
+
+    def model_factory(**kwargs: Any) -> _RecordingFinishModel:
+        supplied.append(kwargs)
+        return _RecordingFinishModel("configured run finished")
+
+    def manager_factory(*args: Any, **kwargs: Any) -> Any:
+        policies.append(kwargs.get("policy"))
+        return context_manager(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "DeepSeekAnthropicModel", model_factory)
+    monkeypatch.setattr(cli, "AgentContextManager", manager_factory)
+
+    assert cli.main(["run", str(tmp_path), "inspect the repository"]) == 0
+
+    assert supplied[0]["max_tokens"] == 4096
+    assert policies[0].context_window_tokens == 32768
+    assert policies[0].reserved_output_tokens == 4096
+    assert policies[0].condenser_input_tokens == 28672
+
+
+def test_resume_reloads_context_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "state"
+    home.mkdir()
+    config_path = home / "config.toml"
+    config_path.write_text(
+        "[context]\ncontext_window_tokens = 131072\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: _WaitThenFinishModel())
+    monkeypatch.setattr(sys, "stdin", _TTY(False))
+    policies: list[Any] = []
+    context_manager = AgentContextManager
+
+    def manager_factory(*args: Any, **kwargs: Any) -> Any:
+        policies.append(kwargs.get("policy"))
+        return context_manager(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "AgentContextManager", manager_factory)
+
+    assert cli.main(["run", str(tmp_path), "style the button"]) == 2
+    session_id = _store(home).list_sessions()[0].session_id
+    config_path.write_text(
+        "[context]\ncontext_window_tokens = 65536\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(sys, "stdin", _TTY(True))
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: "navy" if prompt == "Response: " else "/exit",
+    )
+
+    assert cli.main(["resume", session_id]) == 0
+    assert [policy.context_window_tokens for policy in policies] == [131072, 65536]
 
 
 def test_config_set_api_key_uses_hidden_input_without_echo_or_session(

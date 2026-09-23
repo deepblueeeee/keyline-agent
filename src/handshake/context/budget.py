@@ -30,7 +30,7 @@ class Utf8TokenEstimator:
 class ContextBudgetPolicy:
     """Token pressure thresholds for one provider request."""
 
-    context_window_tokens: int = 1_000_000
+    context_window_tokens: int = 224_000
     reserved_output_tokens: int = 16_384
     pressure_trigger_ratio: float = 0.80
     pressure_target_ratio: float = 0.50
