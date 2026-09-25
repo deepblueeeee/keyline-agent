@@ -20,9 +20,9 @@ from handshake.context import (
 from handshake.context.budget import compact_json, estimate_model_context
 from handshake.context.condenser import condenser_context, episode_data, raw_data
 from handshake.context.reduction import select_raw_candidate
+from handshake.models.errors import ModelProtocolError, ModelProviderError
 from handshake.models.protocol import ModelMessage, ModelTurn
 from handshake.models.scripted import ScriptedModel
-from handshake.runtime.errors import ModelProtocolError, ModelProviderError
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, Session
 from handshake.tools.registry import ToolRegistry

@@ -5,12 +5,11 @@ import pytest
 
 import handshake.runtime.loop as runtime_loop
 from handshake.context import SequencedMessage
+from handshake.models.errors import ModelProtocolError, ModelProviderError
 from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import (
-    ModelProtocolError,
-    ModelProviderError,
     StepLimitExceededError,
     UserCancelledError,
 )

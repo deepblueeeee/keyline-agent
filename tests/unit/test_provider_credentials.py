@@ -6,7 +6,7 @@ import pytest
 
 from handshake.config import credentials as provider_credentials
 from handshake.config import read_deepseek_api_key
-from handshake.runtime.errors import HandshakeError
+from handshake.errors import HandshakeError
 
 
 @pytest.fixture

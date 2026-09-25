@@ -5,8 +5,8 @@ import pytest
 
 from handshake.models.base import ToolDefinition
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
+from handshake.models.errors import ModelProviderError
 from handshake.models.protocol import ModelContext, ModelMessage
-from handshake.runtime.errors import ModelProviderError
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry

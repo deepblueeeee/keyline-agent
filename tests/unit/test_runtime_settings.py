@@ -7,7 +7,7 @@ import pytest
 from handshake.config.approval import ApprovalMode
 from handshake.config.settings import load_runtime_settings, settings_path
 from handshake.context.budget import ContextBudgetPolicy
-from handshake.runtime.errors import HandshakeError
+from handshake.errors import HandshakeError
 
 
 def _write_config(home: Path, content: str) -> None:
