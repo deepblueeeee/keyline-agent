@@ -1,4 +1,4 @@
-"""Provider-neutral model conversation protocol."""
+"""Anthropic Messages conversation types persisted by Handshake."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class ModelMessage:
     run_id: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        """Serialize only provider-visible message fields."""
+        """Serialize only Anthropic-visible message fields."""
         return {"role": self.role, "content": list(self.content)}
 
 

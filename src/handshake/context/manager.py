@@ -1,4 +1,4 @@
-"""Build the provider-neutral context exposed to the model."""
+"""Build the Anthropic Messages context exposed to the model."""
 
 from __future__ import annotations
 

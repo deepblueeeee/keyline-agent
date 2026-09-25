@@ -8,7 +8,7 @@ import tempfile
 from contextlib import suppress
 from pathlib import Path
 
-from handshake.runtime.errors import HandshakeError
+from handshake.errors import HandshakeError
 
 _MAX_KEY_BYTES = 16_384
 

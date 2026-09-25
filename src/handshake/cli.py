@@ -24,13 +24,14 @@ from handshake.config import (
     settings_path,
 )
 from handshake.context import AgentContextManager, ContextBudgetPolicy, LLMHistoryCondenser
+from handshake.errors import HandshakeError
 from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.errors import HandshakeError, UserCancelledError
+from handshake.runtime.errors import UserCancelledError
 from handshake.runtime.loop import continue_run, prepare_run_for_resume, start_run
 from handshake.runtime.runs import (
     create_followup_run,

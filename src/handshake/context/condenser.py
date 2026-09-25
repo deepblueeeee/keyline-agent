@@ -7,8 +7,8 @@ from typing import Protocol
 from handshake.context.budget import compact_json
 from handshake.context.state import HistoryEpisode, SequencedMessage, SourceRange
 from handshake.models.base import ModelAdapter
+from handshake.models.errors import ModelProtocolError
 from handshake.models.protocol import ModelContext, ModelMessage
-from handshake.runtime.errors import ModelProtocolError
 
 
 class HistoryCondenser(Protocol):

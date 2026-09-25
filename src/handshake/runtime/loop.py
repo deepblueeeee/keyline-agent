@@ -11,12 +11,12 @@ from handshake.context import (
     ContextPressureError,
     LLMHistoryCondenser,
 )
+from handshake.errors import HandshakeError
 from handshake.models.base import ModelAdapter, ToolDefinition
+from handshake.models.errors import ModelProtocolError
 from handshake.models.protocol import ModelContext, ModelMessage, ToolCall
 from handshake.runtime.errors import (
     AgentLoopError,
-    HandshakeError,
-    ModelProtocolError,
     StepLimitExceededError,
     UserCancelledError,
 )

@@ -1,4 +1,4 @@
-"""Provider-neutral model and tool interfaces."""
+"""Model and tool interfaces for the Anthropic Messages protocol."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class ToolDefinition:
 
 
 class ModelAdapter(Protocol):
-    """The narrow provider boundary used by the agent loop."""
+    """An Anthropic Messages model used by the agent loop."""
 
     def complete(
         self, context: ModelContext, tools: tuple[ToolDefinition, ...]

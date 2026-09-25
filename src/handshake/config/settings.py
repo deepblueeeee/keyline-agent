@@ -11,7 +11,7 @@ from pathlib import Path
 from handshake.config.approval import ApprovalMode
 from handshake.config.provider import DeepSeekConfig
 from handshake.context.budget import ContextBudgetPolicy
-from handshake.runtime.errors import HandshakeError
+from handshake.errors import HandshakeError
 
 
 @dataclass(frozen=True, slots=True)

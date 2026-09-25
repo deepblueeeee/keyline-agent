@@ -8,8 +8,13 @@ from typing import Any
 import anthropic
 
 from handshake.models.base import ToolDefinition
-from handshake.models.protocol import ContentBlock, ModelContext, ModelTurn, ToolCall
-from handshake.runtime.errors import ModelProtocolError, ModelProviderError
+from handshake.models.errors import ModelProtocolError, ModelProviderError
+from handshake.models.protocol import (
+    ContentBlock,
+    ModelContext,
+    ModelTurn,
+    ToolCall,
+)
 
 
 class DeepSeekAnthropicModel:

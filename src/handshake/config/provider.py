@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 
 from handshake.config.credentials import read_saved_deepseek_api_key
-from handshake.runtime.errors import HandshakeError
+from handshake.errors import HandshakeError
 
 
 @dataclass(slots=True, frozen=True)

@@ -1,20 +1,12 @@
 """Explicit domain errors for the Handshake runtime."""
 
-
-class HandshakeError(Exception):
-    """Base class for errors safe to present to a user."""
+from handshake.errors import HandshakeError as HandshakeError
+from handshake.models.errors import ModelProtocolError as ModelProtocolError
+from handshake.models.errors import ModelProviderError as ModelProviderError
 
 
 class InvalidStateTransitionError(HandshakeError):
     """Raised when a run or tool execution attempts an invalid transition."""
-
-
-class ModelProviderError(HandshakeError):
-    """Raised when a model provider cannot produce a usable turn."""
-
-
-class ModelProtocolError(HandshakeError):
-    """Raised when a model response violates the expected protocol."""
 
 
 class ToolExecutionError(HandshakeError):

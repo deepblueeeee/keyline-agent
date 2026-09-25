@@ -1,4 +1,4 @@
-"""Pure validation and provider-neutral rendering for ContextView."""
+"""Pure validation and Anthropic Messages rendering for ContextView."""
 
 from __future__ import annotations
 

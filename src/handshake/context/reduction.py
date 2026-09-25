@@ -30,8 +30,8 @@ from handshake.context.state import (
     SequencedMessage,
 )
 from handshake.models.base import ToolDefinition
+from handshake.models.errors import ModelProtocolError, ModelProviderError
 from handshake.models.protocol import ModelContext, ModelMessage
-from handshake.runtime.errors import ModelProtocolError, ModelProviderError
 
 RawMessageReader = Callable[[str, int], ModelMessage]
 ContextBuilder = Callable[[], ModelContext]
