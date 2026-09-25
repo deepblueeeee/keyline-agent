@@ -13,6 +13,7 @@ import pytest
 
 import handshake.cli as cli
 from handshake.config import credentials as provider_credentials
+from handshake.config.approval import ApprovalMode
 from handshake.context import AgentContextManager
 from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
 from handshake.runtime.state import (
@@ -21,6 +22,7 @@ from handshake.runtime.state import (
     SecretHandleStatus,
 )
 from handshake.storage.sqlite import SQLiteStateStore
+from handshake.tools import create_default_registry
 from tests.history_support import history
 
 
@@ -30,6 +32,13 @@ class _TTY:
 
     def isatty(self) -> bool:
         return self._interactive
+
+
+@pytest.fixture(autouse=True)
+def _isolated_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    user_home = tmp_path.parent / f"{tmp_path.name}-user-home"
+    user_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: user_home)
 
 
 class _WaitThenFinishModel:
@@ -179,8 +188,9 @@ def test_config_show_displays_effective_nonsecret_settings(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = tmp_path / "state"
-    home.mkdir()
-    (home / "config.toml").write_text(
+    config_home = Path.home() / ".handshake"
+    config_home.mkdir(mode=0o700)
+    (config_home / "config.toml").write_text(
         "[model]\nmax_tokens = 4096\n[context]\ncontext_window_tokens = 131072\n",
         encoding="utf-8",
     )
@@ -190,12 +200,34 @@ def test_config_show_displays_effective_nonsecret_settings(
     assert cli.main(["config", "show"]) == 0
 
     captured = capsys.readouterr()
-    assert f"Configuration: {home / 'config.toml'}" in captured.out
+    assert f"Configuration: {config_home / 'config.toml'}" in captured.out
     assert "max_tokens = 4096" in captured.out
     assert "context_window_tokens = 131072" in captured.out
+    assert 'mode = "always_ask"' in captured.out
     assert "pressure_trigger_ratio" not in captured.out
     assert "reserved_output_tokens" not in captured.out
     assert "never-print-this-key" not in captured.out + captured.err
+
+
+def test_command_approval_modes_apply_with_noninteractive_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "stdin", _TTY(False))
+    cautious = create_default_registry(cli._approval_callback(ApprovalMode.DANGEROUS_ONLY))
+    unrestricted = create_default_registry(cli._approval_callback(ApprovalMode.ALLOW_ALL))
+
+    assert cautious.execute("run_shell", tmp_path, {"argv": ["pwd"]}).ok
+    denied = cautious.execute(
+        "run_shell", tmp_path, {"argv": [sys.executable, "-c", "print('ran')"]}
+    )
+    assert not denied.ok
+    assert "denied" in denied.stderr.lower()
+    approved = unrestricted.execute(
+        "run_shell", tmp_path, {"argv": [sys.executable, "-c", "print('ran')"]}
+    )
+    assert approved.ok
+    assert approved.stdout.strip() == "ran"
 
 
 def test_run_uses_configured_provider_and_context_budgets(
@@ -203,8 +235,9 @@ def test_run_uses_configured_provider_and_context_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "state"
-    home.mkdir()
-    (home / "config.toml").write_text(
+    config_home = Path.home() / ".handshake"
+    config_home.mkdir(mode=0o700)
+    (config_home / "config.toml").write_text(
         "[model]\nmax_tokens = 4096\n"
         "[context]\ncontext_window_tokens = 32768\n",
         encoding="utf-8",
@@ -240,8 +273,9 @@ def test_resume_reloads_context_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "state"
-    home.mkdir()
-    config_path = home / "config.toml"
+    config_home = Path.home() / ".handshake"
+    config_home.mkdir(mode=0o700)
+    config_path = config_home / "config.toml"
     config_path.write_text(
         "[context]\ncontext_window_tokens = 131072\n", encoding="utf-8"
     )
@@ -470,10 +504,15 @@ def test_interactive_session_creates_followup_run_with_full_history(
     assert "Earlier tasks" not in second_model.contexts[0].system_prompt
 
 
+@pytest.mark.parametrize(
+    "approval_mode",
+    (ApprovalMode.ALWAYS_ASK, ApprovalMode.DANGEROUS_ONLY, ApprovalMode.ALLOW_ALL),
+)
 def test_secret_flagship_uses_getpass_secret_command_and_leaks_no_canary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    approval_mode: ApprovalMode,
 ) -> None:
     canary = "flagship-canary-secret-value"
 
@@ -527,14 +566,23 @@ with urllib.request.urlopen(request, timeout=3) as response:
     )
 
     home = tmp_path / "state"
+    if approval_mode is not ApprovalMode.ALWAYS_ASK:
+        config_home = Path.home() / ".handshake"
+        config_home.mkdir(mode=0o700)
+        (config_home / "config.toml").write_text(
+            f"[approval]\nmode = '{approval_mode.value}'\n", encoding="utf-8"
+        )
     model = _SecretFlagshipModel(api_url)
     monkeypatch.setenv("HANDSHAKE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: model)
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: canary)
 
+    approval_prompts: list[str] = []
+
     def answer(prompt: str) -> str:
         if "Execute this command once?" in prompt:
+            approval_prompts.append(prompt)
             return "y"
         return "/exit"
 
@@ -567,6 +615,7 @@ with urllib.request.urlopen(request, timeout=3) as response:
 
     assert exit_code == 0
     assert run.status is RunStatus.COMPLETED
+    assert len(approval_prompts) == (0 if approval_mode is ApprovalMode.ALLOW_ALL else 1)
     assert run.secret_handles[0].status is SecretHandleStatus.CONSUMED
     assert "Authenticated test passed." in captured.out
     assert canary not in captured.out

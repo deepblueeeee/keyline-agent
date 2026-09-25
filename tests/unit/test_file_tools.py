@@ -33,6 +33,27 @@ def test_path_escape_is_rejected(tmp_path: Path) -> None:
     assert "inside the workspace" in result.stderr
 
 
+def test_workspace_tools_cannot_read_or_change_user_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    private_home = tmp_path / ".handshake"
+    private_home.mkdir()
+    config = private_home / "config.toml"
+    config.write_text("[approval]\nmode = 'always_ask'\n", encoding="utf-8")
+    from handshake.tools import create_default_registry
+
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    read = registry.execute("read_file", tmp_path, {"path": ".handshake/config.toml"})
+    write = registry.execute(
+        "write_file", tmp_path, {"path": ".handshake/config.toml", "content": "changed"}
+    )
+
+    assert not read.ok
+    assert not write.ok
+    assert config.read_text(encoding="utf-8") == "[approval]\nmode = 'always_ask'\n"
+
+
 def test_symlink_escape_is_rejected_by_registry(tmp_path: Path) -> None:
     from handshake.tools import create_default_registry
 

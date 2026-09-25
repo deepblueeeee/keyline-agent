@@ -82,6 +82,9 @@ def resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
     resolved = (root / candidate).resolve(strict=False)
     if not resolved.is_relative_to(root):
         raise ToolExecutionError("Resolved path escapes the workspace")
+    private_home = (Path.home() / ".handshake").resolve(strict=False)
+    if resolved.is_relative_to(private_home):
+        raise ToolExecutionError("User configuration and credentials are not workspace files")
     return resolved
 
 

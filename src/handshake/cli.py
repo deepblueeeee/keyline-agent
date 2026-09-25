@@ -15,9 +15,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from handshake.config import (
+    ApprovalMode,
     handshake_home,
     load_runtime_settings,
     read_deepseek_api_key,
+    requires_approval,
     save_deepseek_api_key,
     settings_path,
 )
@@ -47,14 +49,19 @@ from handshake.storage import SQLiteStateStore, StorageError
 from handshake.tools import create_default_registry
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
+from handshake.tools.shell import ApprovalCallback
 
 _WAITING_EXIT_CODE = 2
 
 
-def _interactive_approval(cwd: Path, argv: tuple[str, ...]) -> bool:
+def _interactive_approval(
+    cwd: Path, argv: tuple[str, ...], *, with_secret: bool = False
+) -> bool:
     print("\nApproval required")
     print(f"  cwd:  {cwd}")
     print(f"  argv: {shlex.join(argv)}")
+    if with_secret:
+        print("  A one-time Secret will be supplied to this command.")
     if not sys.stdin.isatty():
         print("Denied: stdin is not interactive")
         return False
@@ -64,6 +71,28 @@ def _interactive_approval(cwd: Path, argv: tuple[str, ...]) -> bool:
         print()
         raise UserCancelledError("User cancelled shell approval") from exc
     return answer.strip().lower() in {"y", "yes"}
+
+
+def _approval_callback(mode: ApprovalMode, *, with_secret: bool = False) -> ApprovalCallback:
+    def approve(cwd: Path, argv: tuple[str, ...]) -> bool:
+        if requires_approval(mode, cwd, argv, with_secret=with_secret):
+            return _interactive_approval(cwd, argv, with_secret=with_secret)
+        return True
+
+    return approve
+
+
+def _announce_approval_mode(mode: ApprovalMode) -> None:
+    if mode is ApprovalMode.DANGEROUS_ONLY:
+        print(
+            "Approval mode: dangerous_only (conservative heuristic; tests, scripts, "
+            "and Secret commands still require confirmation)."
+        )
+    elif mode is ApprovalMode.ALLOW_ALL:
+        print(
+            "Warning: approval.mode=allow_all runs commands, including Secret commands, "
+            "without confirmation."
+        )
 
 
 def _state_store() -> SQLiteStateStore:
@@ -85,11 +114,11 @@ def _create_real_model(model_name: str) -> ModelAdapter:
     return model
 
 
-def _create_secret_capabilities() -> tuple[SecretWriter, SecretCommandRunner]:
+def _create_secret_capabilities(
+    approval: ApprovalCallback,
+) -> tuple[SecretWriter, SecretCommandRunner]:
     store = EphemeralSecretStore()
-    return store.writer(), SecretCommandRunner(
-        store.consumer(), _interactive_approval
-    )
+    return store.writer(), SecretCommandRunner(store.consumer(), approval)
 
 
 def _single_open_dependency(run: Run) -> Dependency:
@@ -360,6 +389,7 @@ def _run_real(args: argparse.Namespace) -> int:
     if not workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {workspace}")
     settings = load_runtime_settings(model_override=args.model)
+    _announce_approval_mode(settings.approval_mode)
     model = _create_real_model(settings.provider.model)
     store = _state_store()
     session = Session(workspace=workspace)
@@ -371,8 +401,11 @@ def _run_real(args: argparse.Namespace) -> int:
     )
     store.create_session(session)
     print(f"Session created: {session.session_id}")
-    registry = create_default_registry(_interactive_approval)
-    secret_writer, secret_command_runner = _create_secret_capabilities()
+    approval = _approval_callback(settings.approval_mode)
+    registry = create_default_registry(approval)
+    secret_writer, secret_command_runner = _create_secret_capabilities(
+        _approval_callback(settings.approval_mode, with_secret=True)
+    )
     return _drive_session(
         session,
         run,
@@ -392,8 +425,12 @@ def _resume_session(args: argparse.Namespace) -> int:
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
     run = latest_run(session, store.list_runs(session.session_id))
     settings = load_runtime_settings(model_override=run.model_name)
-    registry = create_default_registry(_interactive_approval)
-    secret_writer, secret_command_runner = _create_secret_capabilities()
+    _announce_approval_mode(settings.approval_mode)
+    approval = _approval_callback(settings.approval_mode)
+    registry = create_default_registry(approval)
+    secret_writer, secret_command_runner = _create_secret_capabilities(
+        _approval_callback(settings.approval_mode, with_secret=True)
+    )
     if prepare_run_for_resume(
         session,
         run,
@@ -624,6 +661,8 @@ def _show_config(_args: argparse.Namespace) -> int:
     print(f"max_tokens = {settings.provider.max_tokens}")
     print("\n[context]")
     print(f"context_window_tokens = {settings.context.context_window_tokens}")
+    print("\n[approval]")
+    print(f'mode = "{settings.approval_mode.value}"')
     return 0
 
 
@@ -662,14 +701,21 @@ def _parser() -> argparse.ArgumentParser:
     demo_parser = subparsers.add_parser("demo", help="run the offline scripted demo")
     demo_parser.set_defaults(handler=_run_demo)
 
-    config_parser = subparsers.add_parser("config", help="manage local configuration")
+    config_parser = subparsers.add_parser(
+        "config",
+        help="manage local configuration",
+        description=(
+            "Edit ~/.handshake/config.toml to set [approval] mode to "
+            "always_ask, dangerous_only, or allow_all."
+        ),
+    )
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
     key_parser = config_subparsers.add_parser(
         "set-api-key", help="save the DeepSeek API key in the user directory"
     )
     key_parser.set_defaults(handler=_set_api_key)
     show_parser = config_subparsers.add_parser(
-        "show", help="show effective non-secret model and context settings"
+        "show", help="show effective non-secret model, context, and approval settings"
     )
     show_parser.set_defaults(handler=_show_config)
     return parser

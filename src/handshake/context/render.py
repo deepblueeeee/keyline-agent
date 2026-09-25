@@ -72,7 +72,8 @@ Rules:
   use read_file's character-range mode for very long lines, and prefer edit_file for targeted
   changes to existing files.
 - Make targeted changes and run appropriate validation afterwards.
-- Shell tools require user approval. If denied, adapt instead of pretending they ran.
+- Shell tools follow the user's local approval policy. If denied, adapt instead of pretending
+  they ran.
 - Ask for a non-sensitive user fact with wait_for_text only when it cannot be inferred from the
   repository. Call wait_for_text by itself in a turn.
 - Never request passwords, API keys, tokens, or other secrets with wait_for_text.
