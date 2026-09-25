@@ -1,7 +1,7 @@
 import pytest
 
 from handshake.inputs import EphemeralSecretStore
-from handshake.runtime.errors import SecretStoreError
+from handshake.inputs.errors import SecretStoreError
 from handshake.tools import create_default_registry
 
 

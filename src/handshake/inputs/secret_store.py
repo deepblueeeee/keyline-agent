@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from handshake.runtime.errors import SecretStoreError
+from handshake.inputs.errors import SecretStoreError
 
 
 class SecretWriter(Protocol):

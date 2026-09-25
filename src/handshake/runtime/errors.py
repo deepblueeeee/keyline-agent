@@ -29,7 +29,3 @@ class WaitResolutionError(HandshakeError):
 
 class SecretInputError(HandshakeError):
     """Raised when Secret input cannot satisfy its requested dependency."""
-
-
-class SecretStoreError(HandshakeError):
-    """Raised when an ephemeral Secret capability cannot perform its operation."""
