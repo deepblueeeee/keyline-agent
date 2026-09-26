@@ -14,6 +14,7 @@ from handshake.runtime.errors import (
     UserCancelledError,
 )
 from handshake.runtime.loop import continue_run, start_run
+from handshake.runtime.persistence import RunStore
 from handshake.runtime.runs import create_followup_run
 from handshake.runtime.state import (
     DependencyStatus,
@@ -53,7 +54,7 @@ def final_turn(text: str = "done") -> ModelTurn:
 
 def _session_run(
     tmp_path: Path, goal: str, *, max_steps: int = 50
-) -> tuple[Session, Run, SQLiteStateStore]:
+) -> tuple[Session, Run, RunStore]:
     session = Session(workspace=tmp_path)
     run = Run(
         goal=goal,

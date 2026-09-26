@@ -6,6 +6,7 @@ import pytest
 
 from handshake.context import ContextCheckpoint, HistoryEpisode, SourceRange
 from handshake.models.protocol import ModelMessage
+from handshake.runtime.persistence import RunStore
 from handshake.runtime.state import (
     Dependency,
     Run,
@@ -75,13 +76,13 @@ def _waiting_run(session: Session) -> tuple[Run, list[ModelMessage]]:
 
 def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> None:
     database = tmp_path / "state" / "handshake.db"
-    store = SQLiteStateStore(database)
+    store: RunStore = SQLiteStateStore(database)
     session = Session(workspace=tmp_path)
     store.create_session(session)
     run, messages = _waiting_run(session)
     store.create_run(session, run, tuple(messages))
 
-    reopened = SQLiteStateStore(database)
+    reopened: RunStore = SQLiteStateStore(database)
     loaded_session = reopened.load_session(session.session_id)
     loaded_run = reopened.load_run(run.run_id)
 

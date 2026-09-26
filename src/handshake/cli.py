@@ -33,6 +33,7 @@ from handshake.models.scripted import ScriptedModel
 from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import UserCancelledError
 from handshake.runtime.loop import continue_run, prepare_run_for_resume, start_run
+from handshake.runtime.persistence import RunStore
 from handshake.runtime.runs import (
     create_followup_run,
     create_initial_run,
@@ -96,7 +97,7 @@ def _announce_approval_mode(mode: ApprovalMode) -> None:
         )
 
 
-def _state_store() -> SQLiteStateStore:
+def _state_store() -> RunStore:
     return SQLiteStateStore(handshake_home() / "handshake.db")
 
 
@@ -201,7 +202,7 @@ def _drive_run(
     run: Run,
     model: ModelAdapter,
     registry: ToolRegistry,
-    store: SQLiteStateStore,
+    store: RunStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
     context_manager: AgentContextManager | None = None,
@@ -294,7 +295,7 @@ def _process_current_run(
     session: Session,
     run: Run,
     registry: ToolRegistry,
-    store: SQLiteStateStore,
+    store: RunStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
     model: ModelAdapter | None = None,
@@ -346,7 +347,7 @@ def _drive_session(
     session: Session,
     run: Run,
     registry: ToolRegistry,
-    store: SQLiteStateStore,
+    store: RunStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
     initial_model: ModelAdapter | None = None,

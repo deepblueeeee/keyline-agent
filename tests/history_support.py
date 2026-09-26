@@ -4,6 +4,7 @@ from pathlib import Path
 
 from handshake.context import AgentContextManager, SequencedMessage
 from handshake.models.protocol import ModelMessage
+from handshake.runtime.persistence import RunStore
 from handshake.runtime.state import Run, Session
 from handshake.storage.sqlite import SQLiteStateStore
 
@@ -14,12 +15,12 @@ def fresh_store(path: Path, session: Session) -> SQLiteStateStore:
     return store
 
 
-def history(store: SQLiteStateStore, session: Session) -> list[ModelMessage]:
+def history(store: RunStore, session: Session) -> list[ModelMessage]:
     return [item.message for item in store.read_messages(session.session_id)]
 
 
 def register_run(
-    store: SQLiteStateStore,
+    store: RunStore,
     session: Session,
     run: Run,
     messages: tuple[ModelMessage, ...] = (),

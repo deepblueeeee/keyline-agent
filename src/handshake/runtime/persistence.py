@@ -1,4 +1,4 @@
-"""Small persistence boundary used by the runtime."""
+"""Runtime-owned persistence contract over domain state."""
 
 from __future__ import annotations
 
@@ -11,6 +11,24 @@ from handshake.runtime.state import Run, Session
 
 
 class RunStore(Protocol):
+    """Persist and restore domain objects without exposing backend encodings.
+
+    Run checkpoints include their pending messages in one atomic operation.
+    Loaded objects are independent snapshots suitable for runtime recovery.
+    """
+
+    def create_session(self, session: Session) -> None:
+        """Persist a new session."""
+        ...
+
+    def load_session(self, session_id: str) -> Session:
+        """Restore a session's execution state."""
+        ...
+
+    def list_sessions(self) -> tuple[Session, ...]:
+        """Return persisted sessions in most-recently-updated order."""
+        ...
+
     def append_messages(
         self, session_id: str, messages: tuple[ModelMessage, ...]
     ) -> tuple[SequencedMessage, ...]:
@@ -38,7 +56,7 @@ class RunStore(Protocol):
     def save_context_checkpoint(
         self, session_id: str, checkpoint: ContextCheckpoint
     ) -> ContextCheckpoint:
-        """CAS-save a recipe for the exact durable transcript prefix it describes."""
+        """Persist a context recipe, rejecting a stale revision or transcript prefix."""
         ...
 
     def create_run(
@@ -57,4 +75,12 @@ class RunStore(Protocol):
         messages: tuple[ModelMessage, ...] = (),
     ) -> tuple[SequencedMessage, ...]:
         """Persist a checkpoint and return its newly appended messages."""
+        ...
+
+    def load_run(self, run_id: str) -> Run:
+        """Restore a complete run state, including work items and dependencies."""
+        ...
+
+    def list_runs(self, session_id: str | None = None) -> tuple[Run, ...]:
+        """Return runs in session order, or most-recently-updated order globally."""
         ...

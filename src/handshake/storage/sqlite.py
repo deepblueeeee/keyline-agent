@@ -16,6 +16,7 @@ from handshake.context.state import (
     SourceRange,
 )
 from handshake.models.protocol import ModelMessage
+from handshake.runtime.persistence import RunStore
 from handshake.runtime.state import (
     Dependency,
     DependencyKind,
@@ -38,7 +39,7 @@ _CONTEXT_CHECKPOINT_FORMAT = {
 }
 
 
-class SQLiteStateStore:
+class SQLiteStateStore(RunStore):
     """Persist session transcripts and complete stable run snapshots."""
 
     def __init__(self, database_path: Path) -> None:

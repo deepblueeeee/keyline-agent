@@ -20,6 +20,7 @@ from handshake.runtime.errors import (
     StepLimitExceededError,
     UserCancelledError,
 )
+from handshake.runtime.persistence import RunStore
 from handshake.runtime.secret_dependencies import reissue_lost_secret_dependencies
 from handshake.runtime.state import (
     Dependency,
@@ -33,7 +34,6 @@ from handshake.runtime.state import (
     WorkItem,
     WorkItemStatus,
 )
-from handshake.storage.base import RunStore
 from handshake.tools import (
     PLAN_TOOL,
     SECRET_COMMAND_TOOL,
