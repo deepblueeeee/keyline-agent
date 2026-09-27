@@ -31,10 +31,9 @@ from handshake.context.state import (
 )
 from handshake.models.base import ToolDefinition
 from handshake.models.errors import ModelProtocolError, ModelProviderError
-from handshake.models.protocol import ModelContext, ModelMessage
+from handshake.models.protocol import ModelMessage
 
 RawMessageReader = Callable[[str, int], ModelMessage]
-ContextBuilder = Callable[[], ModelContext]
 ContextViewReader = Callable[[], ContextView]
 
 
@@ -67,12 +66,12 @@ def compact_semantic_context(
     estimator: TokenEstimator,
     condenser: HistoryCondenser,
     tools: tuple[ToolDefinition, ...],
-    build_context: ContextBuilder,
+    measure_pressure: Callable[[], int],
     capture_view: ContextViewReader,
     raw_message_reader: RawMessageReader | None,
 ) -> None:
     """Advance raw compaction, then roll up Episodes while pressure remains high."""
-    while _pressure(build_context, tools, estimator) > policy.pressure_target_tokens:
+    while measure_pressure() > policy.pressure_target_tokens:
         background, target = select_raw_candidate(
             state,
             session_id=session_id,
@@ -107,7 +106,7 @@ def compact_semantic_context(
         ):
             break
 
-    while _pressure(build_context, tools, estimator) > policy.pressure_target_tokens:
+    while measure_pressure() > policy.pressure_target_tokens:
         selected: tuple[HistoryEpisode, ...] = ()
         for episode in state.episodes:
             proposed = (*selected, episode)
@@ -172,14 +171,6 @@ def validate_episode(episode: HistoryEpisode, start: int, maximum: int) -> None:
         or not episode.summary.strip()
     ):
         raise ContextViewError("Invalid condenser episode range or content")
-
-
-def _pressure(
-    build_context: ContextBuilder,
-    tools: tuple[ToolDefinition, ...],
-    estimator: TokenEstimator,
-) -> int:
-    return estimate_model_context(build_context(), tools, estimator)
 
 
 def _fits_request(

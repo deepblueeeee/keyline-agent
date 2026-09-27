@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from handshake.context.budget import ContextTokenMeasurement
 from handshake.context.errors import ContextViewError
 from handshake.context.state import HistoryEpisode
 from handshake.models.protocol import ModelMessage
@@ -20,6 +21,7 @@ class ManagedContextState:
     reduced_message_count: int = 0
     checkpoint_revision: int = 0
     reduction_dirty: bool = False
+    token_measurement: ContextTokenMeasurement | None = None
 
 
 def compacted_end(state: ManagedContextState) -> int:

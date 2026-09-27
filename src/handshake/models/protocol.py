@@ -38,10 +38,37 @@ class ToolCall:
 
 
 @dataclass(slots=True, frozen=True)
+class ModelUsage:
+    """Token counts reported for one Anthropic Messages request."""
+
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_write_tokens,
+                self.cache_read_tokens,
+            )
+        ):
+            raise ValueError("Model usage counts must be non-negative integers")
+
+    @property
+    def total_input_tokens(self) -> int:
+        return self.input_tokens + self.cache_write_tokens + self.cache_read_tokens
+
+
+@dataclass(slots=True, frozen=True)
 class ModelTurn:
     content: tuple[ContentBlock, ...]
     tool_calls: tuple[ToolCall, ...] = ()
     stop_reason: str | None = None
+    usage: ModelUsage | None = None
 
     @property
     def text(self) -> str:

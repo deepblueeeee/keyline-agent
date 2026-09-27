@@ -13,6 +13,7 @@ from handshake.models.protocol import (
     ContentBlock,
     ModelContext,
     ModelTurn,
+    ModelUsage,
     ToolCall,
 )
 
@@ -111,4 +112,18 @@ def _normalize_response(response: Any) -> ModelTurn:
 
     raw_stop_reason = payload.get("stop_reason")
     stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
-    return ModelTurn(tuple(content), tuple(tool_calls), stop_reason)
+    usage = None
+    if payload.get("usage") is not None:
+        raw_usage = _as_mapping(payload["usage"], "usage")
+        cache_write = raw_usage.get("cache_creation_input_tokens")
+        cache_read = raw_usage.get("cache_read_input_tokens")
+        try:
+            usage = ModelUsage(
+                input_tokens=raw_usage["input_tokens"],
+                output_tokens=raw_usage["output_tokens"],
+                cache_write_tokens=0 if cache_write is None else cache_write,
+                cache_read_tokens=0 if cache_read is None else cache_read,
+            )
+        except (KeyError, ValueError):
+            raise ModelProtocolError("DeepSeek returned invalid token usage") from None
+    return ModelTurn(tuple(content), tuple(tool_calls), stop_reason, usage)

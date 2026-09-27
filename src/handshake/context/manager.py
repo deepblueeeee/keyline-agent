@@ -11,7 +11,8 @@ from handshake.context.budget import (
     TokenEstimator,
     Utf8TokenEstimator,
     compact_json,
-    estimate_model_context,
+    measure_model_context,
+    measure_model_turn,
 )
 from handshake.context.condenser import HistoryCondenser
 from handshake.context.errors import ContextPressureError, ContextViewError
@@ -41,7 +42,7 @@ from handshake.context.state import (
     SequencedMessage,
 )
 from handshake.models.base import ToolDefinition
-from handshake.models.protocol import ModelContext
+from handshake.models.protocol import ModelContext, ModelTurn
 from handshake.runtime.state import Run, Session
 
 ContextMessageReader = Callable[[int, int | None], Iterable[SequencedMessage]]
@@ -104,7 +105,7 @@ class AgentContextManager:
                     estimator=self.estimator,
                     condenser=self.condenser,
                     tools=tools,
-                    build_context=lambda: self.build(session, run),
+                    measure_pressure=lambda: self.measure_pressure(session, run, tools),
                     capture_view=lambda: self.capture(session, run),
                     raw_message_reader=raw_message_reader,
                 )
@@ -144,6 +145,7 @@ class AgentContextManager:
             max_tool_result_tokens=checkpoint.max_tool_result_tokens,
             reduced_message_count=checkpoint.reduced_message_count,
             checkpoint_revision=checkpoint.revision,
+            token_measurement=checkpoint.token_measurement,
         )
         cursor_seen = (
             checkpoint.stale_mask_through is None
@@ -192,6 +194,7 @@ class AgentContextManager:
             max_tool_result_tokens=state.max_tool_result_tokens,
             reduced_message_count=state.reduced_message_count,
             revision=state.checkpoint_revision,
+            token_measurement=state.token_measurement,
         )
 
     def checkpoint_saved(
@@ -313,11 +316,23 @@ class AgentContextManager:
         tools: tuple[ToolDefinition, ...],
     ) -> int:
         """Measure the current view without changing its compaction state."""
-        return estimate_model_context(
+        return measure_model_context(
             self.build(session, run),
             tools,
             self.estimator,
+            self._synchronized_state(session).token_measurement,
         )
+
+    def record_usage(
+        self, session: Session, context: ModelContext,
+        tools: tuple[ToolDefinition, ...], turn: ModelTurn,
+    ) -> None:
+        """Calibrate the next request from this response's measured token counts."""
+        measurement = measure_model_turn(context, tools, turn, self.estimator)
+        if measurement is not None:
+            state = self._synchronized_state(session)
+            state.token_measurement = measurement
+            state.reduction_dirty = True
 
     def mask_oldest_stale_result(self, session: Session) -> bool:
         """Incrementally mask one oldest result outside protected recent context."""

@@ -4,10 +4,113 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Protocol
 
 from handshake.models.base import ToolDefinition
-from handshake.models.protocol import ModelContext
+from handshake.models.protocol import ModelContext, ModelMessage, ModelTurn
+
+
+@dataclass(frozen=True, slots=True)
+class ContextTokenMeasurement:
+    """Provider-measured message prefix plus estimated request header overhead.
+
+    Fingerprints bind counts to the actual visible history, including projections
+    and summaries. No prompt text is retained in persistence metadata.
+    """
+
+    tokens: int
+    message_count: int
+    messages_fingerprint: str
+    header_estimate: int
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                type(value) is not int or value < 0
+                for value in (
+                    self.tokens,
+                    self.message_count,
+                    self.header_estimate,
+                )
+            )
+            or not isinstance(self.messages_fingerprint, str)
+            or (
+                len(self.messages_fingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in self.messages_fingerprint)
+            )
+        ):
+            raise ValueError("Invalid context token measurement")
+
+
+def _messages_fingerprint(messages: tuple[ModelMessage, ...]) -> str:
+    return sha256(compact_json([message.as_dict() for message in messages]).encode()).hexdigest()
+
+
+def _header_estimate(
+    context: ModelContext,
+    tools: tuple[ToolDefinition, ...],
+    estimator: TokenEstimator,
+) -> int:
+    return estimator.estimate_text(
+        compact_json(
+            {
+                "system": context.system_prompt,
+                "tools": [tool.as_anthropic() for tool in tools],
+            }
+        )
+    )
+
+
+def measure_model_turn(
+    context: ModelContext,
+    tools: tuple[ToolDefinition, ...],
+    turn: ModelTurn,
+    estimator: TokenEstimator,
+) -> ContextTokenMeasurement | None:
+    """Replace the previous baseline: each input count already includes history."""
+    if turn.usage is None:
+        return None
+    messages = (*context.messages, ModelMessage("assistant", turn.content))
+    return ContextTokenMeasurement(
+        tokens=turn.usage.total_input_tokens + turn.usage.output_tokens,
+        message_count=len(messages),
+        messages_fingerprint=_messages_fingerprint(messages),
+        header_estimate=_header_estimate(context, tools, estimator),
+    )
+
+
+def measure_model_context(
+    context: ModelContext,
+    tools: tuple[ToolDefinition, ...],
+    estimator: TokenEstimator,
+    measurement: ContextTokenMeasurement | None,
+) -> int:
+    """Use measured history, estimating only new messages and header changes.
+
+    Masking, projection changes or semantic compression invalidate the prefix;
+    the resulting context is estimated until the next response recalibrates it.
+    """
+    if (
+        measurement is None
+        or len(context.messages) < measurement.message_count
+        or (
+            _messages_fingerprint(context.messages[: measurement.message_count])
+            != measurement.messages_fingerprint
+        )
+    ):
+        return estimate_model_context(context, tools, estimator)
+    added = context.messages[measurement.message_count :]
+    added_tokens = sum(
+        estimator.estimate_text(compact_json(message.as_dict())) for message in added
+    )
+    return max(
+        0,
+        measurement.tokens
+        + added_tokens
+        + _header_estimate(context, tools, estimator)
+        - measurement.header_estimate,
+    )
 
 
 class TokenEstimator(Protocol):

@@ -289,6 +289,10 @@ def _checkpoint(
         appended = store.checkpoint_run(session, run, messages)
     pending_messages.clear()
     context_manager.ingest_messages(session, appended)
+    checkpoint = context_manager.pending_checkpoint(session)
+    if checkpoint is not None:
+        saved = store.save_context_checkpoint(session.session_id, checkpoint)
+        context_manager.checkpoint_saved(session, saved)
 
 
 def _create_text_dependency(
@@ -379,6 +383,7 @@ def _run_turns(
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
             _validate_turn_tool_calls(turn.content, turn.tool_calls)
+            context_manager.record_usage(session, context, definitions, turn)
             pending_messages.append(
                 ModelMessage(role="assistant", content=turn.content, run_id=run.run_id)
             )

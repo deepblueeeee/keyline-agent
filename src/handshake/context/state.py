@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
+from handshake.context.budget import ContextTokenMeasurement
 from handshake.models.protocol import ModelMessage
 
 
@@ -104,3 +105,4 @@ class ContextCheckpoint:
     max_tool_result_tokens: int = 16_000
     reduced_message_count: int = 0
     revision: int = 0
+    token_measurement: ContextTokenMeasurement | None = None

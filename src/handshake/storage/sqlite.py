@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from handshake.context.budget import ContextTokenMeasurement
 from handshake.context.state import (
     ContextCheckpoint,
     HistoryEpisode,
@@ -672,6 +673,10 @@ def _dump_context_checkpoint(checkpoint: ContextCheckpoint) -> str:
                 "stale_mask_through": checkpoint.stale_mask_through,
                 "max_tool_result_tokens": checkpoint.max_tool_result_tokens,
                 "reduced_message_count": checkpoint.reduced_message_count,
+                "token_measurement": (
+                    asdict(checkpoint.token_measurement)
+                    if checkpoint.token_measurement is not None else None
+                ),
             },
         }
     )
@@ -708,6 +713,10 @@ def _load_context_checkpoint(value: str, revision: int) -> ContextCheckpoint:
             max_tool_result_tokens=state["max_tool_result_tokens"],
             reduced_message_count=state["reduced_message_count"],
             revision=revision,
+            token_measurement=(
+                ContextTokenMeasurement(**state["token_measurement"])
+                if state.get("token_measurement") is not None else None
+            ),
         )
     except (KeyError, TypeError, ValueError):
         raise StorageError("Stored context checkpoint fields are invalid") from None

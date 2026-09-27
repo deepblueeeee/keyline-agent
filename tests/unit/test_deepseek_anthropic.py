@@ -2,11 +2,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from anthropic.types import Message
 
 from handshake.models.base import ToolDefinition
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
-from handshake.models.errors import ModelProviderError
-from handshake.models.protocol import ModelContext, ModelMessage
+from handshake.models.errors import ModelProtocolError, ModelProviderError
+from handshake.models.protocol import ModelContext, ModelMessage, ModelUsage
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
@@ -174,3 +175,35 @@ def test_provider_error_does_not_leak_api_key() -> None:
     assert secret not in str(raised.value)
     assert secret not in repr(model)
     assert secret not in vars(model)
+
+
+@pytest.mark.parametrize("sdk_response", [False, True])
+def test_usage_is_normalized_from_mapping_and_sdk_message(sdk_response: bool) -> None:
+    payload: dict[str, Any] = {
+        "id": "msg-1", "type": "message", "role": "assistant", "model": "test",
+        "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn",
+        "usage": {"input_tokens": 100, "output_tokens": 20,
+                  "cache_creation_input_tokens": 30, "cache_read_input_tokens": 40},
+    }
+    response = Message.model_validate(payload) if sdk_response else payload
+    model = DeepSeekAnthropicModel(api_key="canary", client=FakeClient([response]))
+    turn = model.complete(ModelContext("system", "goal", "/tmp", (), ()), ())
+    assert turn.usage == ModelUsage(
+        input_tokens=100, output_tokens=20, cache_write_tokens=30, cache_read_tokens=40,
+    )
+    assert turn.usage.total_input_tokens == 170
+
+
+@pytest.mark.parametrize("usage", [
+    {}, {"input_tokens": 1}, {"input_tokens": -1, "output_tokens": 2},
+    {"input_tokens": True, "output_tokens": 2},
+    {"input_tokens": 1.5, "output_tokens": 2},
+    {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": False},
+    {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": "100"},
+])
+def test_invalid_usage_is_rejected(usage: dict[str, Any]) -> None:
+    model = DeepSeekAnthropicModel(api_key="canary", client=FakeClient([{
+        "content": [{"type": "text", "text": "done"}], "usage": usage,
+    }]))
+    with pytest.raises(ModelProtocolError, match="token usage"):
+        model.complete(ModelContext("system", "goal", "/tmp", (), ()), ())
