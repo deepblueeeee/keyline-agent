@@ -99,7 +99,7 @@ class _RecordingStore(SQLiteStateStore):
                 run.status,
                 run.work_items[0].status,
                 dependency_status,
-                self.message_count(session.session_id) + len(messages),
+                self.message_count(run.context_scope_id) + len(messages),
             )
         )
         self.events.append(f"checkpoint:{run.status.value}")
@@ -111,7 +111,7 @@ class _RecordingStore(SQLiteStateStore):
 class _FailingIngress:
     def ingest_messages(
         self,
-        _session: Session,
+        _run: Run,
         _messages: tuple[SequencedMessage, ...],
     ) -> None:
         raise RuntimeError("view ingress failed")
@@ -119,6 +119,7 @@ class _FailingIngress:
 
 def test_checkpoint_clears_committed_pending_before_view_ingress(tmp_path: Path) -> None:
     session, run, store = _session_run(tmp_path, "persist once")
+    store.create_run(session, run)
     pending = [
         ModelMessage(
             role="user",
@@ -134,11 +135,10 @@ def test_checkpoint_clears_committed_pending_before_view_ingress(tmp_path: Path)
             store,
             _FailingIngress(),  # type: ignore[arg-type]
             pending,
-            create=True,
         )
 
     assert pending == []
-    assert store.message_count(session.session_id) == 1
+    assert store.message_count(run.context_scope_id) == 1
 
 
 def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: Path) -> None:

@@ -489,7 +489,7 @@ def test_interactive_session_creates_followup_run_with_full_history(
     runs = _store(home).list_runs(session.session_id)
     assert exit_code == 0
     assert [run.goal for run in runs] == ["first request", "second request"]
-    assert runs[1].previous_run_id == runs[0].run_id
+    assert runs[1].context_scope_id == runs[0].context_scope_id
     assert runs[1].max_steps == 9
     assert runs[1].model_turns == 1
     messages = second_model.contexts[0].messages

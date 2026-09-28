@@ -14,7 +14,7 @@ from handshake.models.protocol import ModelMessage
 def project_message(
     raw: ModelMessage,
     *,
-    session_id: str,
+    run_id: str,
     sequence: int,
     stale_mask_through: tuple[int, int] | None,
     max_tool_result_tokens: int,
@@ -35,7 +35,7 @@ def project_message(
         content = block.get("content", "")
         text = content if isinstance(content, str) else compact_json(content)
         replacement = _ingress_content(
-            session_id=session_id,
+            run_id=run_id,
             sequence=sequence,
             block_index=index,
             call_id=call_id,
@@ -59,7 +59,7 @@ def stale_marker(sequence: int, is_error: object) -> str:
 
 def _ingress_content(
     *,
-    session_id: str,
+    run_id: str,
     sequence: int,
     block_index: int,
     call_id: str,
@@ -72,7 +72,7 @@ def _ingress_content(
     if original_tokens <= max_tool_result_tokens:
         return None
     try:
-        external = externalize_tool_result(session_id, sequence, block_index, content)
+        external = externalize_tool_result(run_id, sequence, block_index, content)
     except (OSError, ArtifactReferenceError) as exc:
         raise ContextViewError(
             f"Could not externalize oversized tool result at source sequence {sequence}"

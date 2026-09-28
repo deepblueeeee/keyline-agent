@@ -51,29 +51,29 @@ def test_restore_skips_episode_sources_and_streams_incremental_suffix(
         ),
         reduced_message_count=6,
     )
-    saved = store.save_context_checkpoint(session.session_id, checkpoint)
+    saved = store.save_context_checkpoint(run.context_scope_id, checkpoint)
     store.append_messages(
-        session.session_id,
+        run.context_scope_id,
         (ModelMessage("user", ({"type": "text", "text": "new suffix"},), run.run_id),),
     )
     reads: list[tuple[int, int | None]] = []
 
     def read(start: int, end: int | None):
         reads.append((start, end))
-        yield from store.read_messages(session.session_id, start, end)
+        yield from store.read_messages(run.context_scope_id, start, end)
 
     manager = AgentContextManager(
         ContextBudgetPolicy(protected_recent_messages=1, protected_recent_tokens=0),
         Characters(),
     )
-    manager.restore(session, saved, store.message_count(session.session_id), read)
+    manager.restore(run.context_scope, saved, store.message_count(run.context_scope_id), read)
 
     view = manager.capture(session, run)
     assert reads == [(4, 7)]
     assert view.history[0] == checkpoint.episodes[0]
     assert isinstance(view.history[1], RawHistorySegment)
-    assert tuple(manager._states[session.session_id].messages) == (4, 5, 6)
-    assert manager.pending_checkpoint(session) is None
+    assert tuple(manager._states[run.context_scope_id].messages) == (4, 5, 6)
+    assert manager.pending_checkpoint(run.context_scope) is None
 
 
 def test_masking_checkpoint_restores_identical_view_without_changing_raw_history(
@@ -110,23 +110,23 @@ def test_masking_checkpoint_restores_identical_view_without_changing_raw_history
         max_tool_result_tokens=600,
     )
     manager = AgentContextManager(policy, Characters())
-    manager.ingest_messages(session, appended)
-    assert manager.mask_oldest_stale_result(session)
-    pending = manager.pending_checkpoint(session)
+    manager.ingest_messages(run.context_scope, appended)
+    assert manager.mask_oldest_stale_result(run.context_scope)
+    pending = manager.pending_checkpoint(run.context_scope)
     assert pending is not None
-    saved = store.save_context_checkpoint(session.session_id, pending)
-    manager.checkpoint_saved(session, saved)
+    saved = store.save_context_checkpoint(run.context_scope_id, pending)
+    manager.checkpoint_saved(run.context_scope, saved)
 
     restored = AgentContextManager(policy, Characters())
     restored.restore(
-        session,
-        store.load_context_checkpoint(session.session_id),
-        store.message_count(session.session_id),
-        lambda start, end: store.read_messages(session.session_id, start, end),
+        run.context_scope,
+        store.load_context_checkpoint(run.context_scope_id),
+        store.message_count(run.context_scope_id),
+        lambda start, end: store.read_messages(run.context_scope_id, start, end),
     )
 
     assert restored.build(session, run) == manager.build(session, run)
-    assert restored.pending_checkpoint(session) is None
+    assert restored.pending_checkpoint(run.context_scope) is None
     assert "stale tool result masked" in restored.build(session, run).messages[1].content[0][
         "content"
     ]
@@ -163,15 +163,15 @@ def test_restore_rebuilds_externalized_result_and_reuses_its_path(
     appended = store.create_run(session, run, messages)
     policy = ContextBudgetPolicy(max_tool_result_tokens=600)
     manager = AgentContextManager(policy, Characters())
-    manager.ingest_messages(session, appended)
+    manager.ingest_messages(run.context_scope, appended)
     before = manager.build(session, run)
 
     restored = AgentContextManager(policy, Characters())
     restored.restore(
-        session,
+        run.context_scope,
         None,
-        store.message_count(session.session_id),
-        lambda start, end: store.read_messages(session.session_id, start, end),
+        store.message_count(run.context_scope_id),
+        lambda start, end: store.read_messages(run.context_scope_id, start, end),
     )
 
     assert restored.build(session, run) == before
@@ -207,8 +207,8 @@ def test_restore_rejects_incompatible_or_invalid_metadata(
 
     with pytest.raises(ContextViewError):
         manager.restore(
-            session,
+            run.context_scope,
             replace(checkpoint, revision=1),
-            store.message_count(session.session_id),
-            lambda start, end: store.read_messages(session.session_id, start, end),
+            store.message_count(run.context_scope_id),
+            lambda start, end: store.read_messages(run.context_scope_id, start, end),
         )

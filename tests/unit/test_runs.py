@@ -40,10 +40,12 @@ def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, .
 def test_followup_run_inherits_config_without_owning_messages(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     first, messages = _completed_initial_run(session)
+    session.context_scope = session.context_scope.advance(first)
 
     second = create_followup_run(session, [first], "second goal")
 
     assert second.sequence == 2
+    assert second.context_scope_id == first.context_scope_id
     assert second.previous_run_id == first.run_id
     assert second.model_name == "deepseek-v4-pro"
     assert second.max_steps == 17
@@ -86,9 +88,11 @@ def test_failed_or_cancelled_run_allows_followup(
     run.error = "stopped"
     run.work_items[0].transition(WorkItemStatus.FAILED)
     run.transition(status)
+    session.context_scope = session.context_scope.advance(run)
 
     followup = create_followup_run(session, [run], "try another approach")
 
+    assert followup.context_scope_id == run.context_scope_id
     assert followup.previous_run_id == run.run_id
     assert followup.sequence == 2
 

@@ -43,13 +43,13 @@ from handshake.context.state import (
 )
 from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ModelContext, ModelTurn
-from handshake.runtime.state import Run, Session
+from handshake.runtime.state import ContextScope, Run, Session
 
 ContextMessageReader = Callable[[int, int | None], Iterable[SequencedMessage]]
 
 
 class AgentContextManager:
-    """Expose the current model-visible view of a Session and Run."""
+    """Expose one ContextScope's model-visible view in its Session workspace."""
 
     def __init__(
         self,
@@ -70,13 +70,13 @@ class AgentContextManager:
         """Render the already-maintained state without triggering compaction."""
         return self.render(self.capture(session, run))
 
-    def message_count(self, session: Session) -> int:
+    def message_count(self, scope: ContextScope) -> int:
         """Return the durable history prefix already represented by this view."""
-        return self._synchronized_state(session).message_count
+        return self._synchronized_state(scope).message_count
 
-    def is_initialized(self, session: Session) -> bool:
-        """Return whether this process has reconstructed the Session view."""
-        return session.session_id in self._states
+    def is_initialized(self, scope: ContextScope) -> bool:
+        """Return whether this process has reconstructed the context stream view."""
+        return scope.scope_id in self._states
 
     def prepare(
         self,
@@ -88,19 +88,19 @@ class AgentContextManager:
     ) -> ModelContext:
         """Apply context pressure policy and return the next model-visible context."""
         pressure = self.measure_pressure(session, run, tools)
-        state = self._synchronized_state(session)
+        state = self._synchronized_state(run.context_scope)
         if (
             pressure >= self.policy.pressure_trigger_tokens
             and state.reduced_message_count < state.message_count
         ):
             while pressure > self.policy.pressure_target_tokens:
-                if not self.mask_oldest_stale_result(session):
+                if not self.mask_oldest_stale_result(run.context_scope):
                     break
                 pressure = self.measure_pressure(session, run, tools)
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
                 compact_semantic_context(
                     state,
-                    session_id=session.session_id,
+                    run_id=run.context_scope_id,
                     policy=self.policy,
                     estimator=self.estimator,
                     condenser=self.condenser,
@@ -117,13 +117,13 @@ class AgentContextManager:
 
     def restore(
         self,
-        session: Session,
+        scope: ContextScope,
         checkpoint: ContextCheckpoint | None,
         source_message_count: int,
         read_messages: ContextMessageReader,
     ) -> None:
         """Rebuild a bounded view from metadata plus only its uncovered raw tail."""
-        if session.session_id in self._states:
+        if scope.scope_id in self._states:
             raise ContextViewError("Context state is already initialized")
         if source_message_count < 0:
             raise ContextViewError("Durable message count cannot be negative")
@@ -166,7 +166,7 @@ class AgentContextManager:
                 )
             state.messages[item.sequence] = project_message(
                 item.message,
-                session_id=session.session_id,
+                run_id=scope.scope_id,
                 sequence=item.sequence,
                 stale_mask_through=state.stale_mask_through,
                 max_tool_result_tokens=state.max_tool_result_tokens,
@@ -179,11 +179,11 @@ class AgentContextManager:
             raise ContextViewError("Stale mask cursor does not reference a tool result")
         if source_message_count > checkpoint.source_message_count:
             self._update_recent(state)
-        self._states[session.session_id] = state
+        self._states[scope.scope_id] = state
 
-    def pending_checkpoint(self, session: Session) -> ContextCheckpoint | None:
+    def pending_checkpoint(self, scope: ContextScope) -> ContextCheckpoint | None:
         """Return unsaved reduction metadata, if this view changed semantically."""
-        state = self._synchronized_state(session)
+        state = self._synchronized_state(scope)
         if not state.reduction_dirty:
             return None
         return ContextCheckpoint(
@@ -198,11 +198,11 @@ class AgentContextManager:
         )
 
     def checkpoint_saved(
-        self, session: Session, checkpoint: ContextCheckpoint
+        self, scope: ContextScope, checkpoint: ContextCheckpoint
     ) -> None:
         """Acknowledge a storage-owned successful checkpoint transaction."""
-        state = self._synchronized_state(session)
-        pending = self.pending_checkpoint(session)
+        state = self._synchronized_state(scope)
+        pending = self.pending_checkpoint(scope)
         if pending is None or replace(checkpoint, revision=pending.revision) != pending:
             raise ContextViewError("Saved context checkpoint does not match current view")
         state.checkpoint_revision = checkpoint.revision
@@ -224,12 +224,12 @@ class AgentContextManager:
 
     def ingest_messages(
         self,
-        session: Session,
+        scope: ContextScope,
         messages: Iterable[SequencedMessage],
     ) -> None:
         """Add newly committed durable messages to the model-visible view."""
         current = self._states.get(
-            session.session_id,
+            scope.scope_id,
             ManagedContextState(max_tool_result_tokens=self.policy.max_tool_result_tokens),
         )
         state = deepcopy(current)
@@ -242,7 +242,7 @@ class AgentContextManager:
                 )
             message = project_message(
                 item.message,
-                session_id=session.session_id,
+                run_id=scope.scope_id,
                 sequence=sequence,
                 stale_mask_through=state.stale_mask_through,
                 max_tool_result_tokens=state.max_tool_result_tokens,
@@ -252,10 +252,10 @@ class AgentContextManager:
             state.message_count = sequence + 1
             changed = True
         if not changed:
-            self._states[session.session_id] = state
+            self._states[scope.scope_id] = state
             return
         self._update_recent(state)
-        self._states[session.session_id] = state
+        self._states[scope.scope_id] = state
 
     def capture(
         self,
@@ -265,7 +265,7 @@ class AgentContextManager:
         constraints: tuple[str, ...] = (),
     ) -> ContextView:
         """Snapshot the incrementally maintained bounded model view."""
-        state = self._synchronized_state(session)
+        state = self._synchronized_state(run.context_scope)
         exact = ExactContext(
             goal=run.goal,
             workspace=str(session.workspace),
@@ -320,26 +320,26 @@ class AgentContextManager:
             self.build(session, run),
             tools,
             self.estimator,
-            self._synchronized_state(session).token_measurement,
+            self._synchronized_state(run.context_scope).token_measurement,
         )
 
     def record_usage(
-        self, session: Session, context: ModelContext,
+        self, scope: ContextScope, context: ModelContext,
         tools: tuple[ToolDefinition, ...], turn: ModelTurn,
     ) -> None:
         """Calibrate the next request from this response's measured token counts."""
         measurement = measure_model_turn(context, tools, turn, self.estimator)
         if measurement is not None:
-            state = self._synchronized_state(session)
+            state = self._synchronized_state(scope)
             state.token_measurement = measurement
             state.reduction_dirty = True
 
-    def mask_oldest_stale_result(self, session: Session) -> bool:
+    def mask_oldest_stale_result(self, scope: ContextScope) -> bool:
         """Incrementally mask one oldest result outside protected recent context."""
-        return mask_oldest_stale_result(self._synchronized_state(session))
+        return mask_oldest_stale_result(self._synchronized_state(scope))
 
-    def _synchronized_state(self, session: Session) -> ManagedContextState:
-        state = self._states.get(session.session_id)
+    def _synchronized_state(self, scope: ContextScope) -> ManagedContextState:
+        state = self._states.get(scope.scope_id)
         if state is None:
             return ManagedContextState(
                 max_tool_result_tokens=self.policy.max_tool_result_tokens

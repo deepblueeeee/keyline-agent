@@ -17,8 +17,10 @@ from handshake.context.state import (
     SourceRange,
 )
 from handshake.models.protocol import ModelMessage
+from handshake.runtime.errors import InvalidStateTransitionError
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.state import (
+    ContextScope,
     Dependency,
     DependencyKind,
     DependencyStatus,
@@ -41,7 +43,7 @@ _CONTEXT_CHECKPOINT_FORMAT = {
 
 
 class SQLiteStateStore(RunStore):
-    """Persist session transcripts and complete stable run snapshots."""
+    """Persist scope-owned transcripts and complete stable run snapshots."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path.expanduser().resolve()
@@ -78,6 +80,10 @@ class SQLiteStateStore(RunStore):
                         session.updated_at,
                     ),
                 )
+                connection.execute(
+                    "INSERT INTO context_scopes (scope_id, session_id) VALUES (?, ?)",
+                    (session.context_scope.scope_id, session.session_id),
+                )
             session.workspace = workspace
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
@@ -88,6 +94,23 @@ class SQLiteStateStore(RunStore):
                 return self._load_session(connection, session_id)
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
+
+    def load_context_scope(self, scope_id: str) -> ContextScope:
+        try:
+            with self._connect() as connection:
+                return self._load_context_scope(connection, scope_id)
+        except (OSError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    @staticmethod
+    def _load_context_scope(connection: sqlite3.Connection, scope_id: str) -> ContextScope:
+        row = connection.execute(
+            "SELECT session_id, tail_run_id FROM context_scopes WHERE scope_id = ?",
+            (scope_id,),
+        ).fetchone()
+        if row is None:
+            raise StorageError(f"Context scope not found: {scope_id}")
+        return ContextScope(scope_id, str(row["session_id"]), row["tail_run_id"])
 
     def list_sessions(self) -> tuple[Session, ...]:
         try:
@@ -115,7 +138,7 @@ class SQLiteStateStore(RunStore):
         run: Run,
         messages: tuple[ModelMessage, ...] = (),
     ) -> tuple[SequencedMessage, ...]:
-        """Atomically append a run and the session transcript containing its prompt."""
+        """Atomically create a run and append its prompt to its context scope."""
         try:
             updated_at = utc_now()
             with self._connect() as connection:
@@ -123,26 +146,56 @@ class SQLiteStateStore(RunStore):
                 self._validate_session_workspace(connection, session)
                 tail = connection.execute(
                     """
-                    SELECT run_id, sequence FROM runs
+                    SELECT sequence FROM runs
                     WHERE session_id = ? ORDER BY sequence DESC LIMIT 1
                     """,
                     (session.session_id,),
                 ).fetchone()
-                tail_id = None if tail is None else str(tail["run_id"])
                 next_sequence = 1 if tail is None else int(tail["sequence"]) + 1
-                if tail_id != run.previous_run_id or run.sequence != next_sequence:
+                if run.sequence != next_sequence:
                     raise StorageError(
                         f"Run {run.run_id} is not the next run for session "
                         f"{session.session_id}"
                     )
+                if run.parent_run_id is not None:
+                    parent = connection.execute(
+                        "SELECT session_id, context_scope_id FROM runs WHERE run_id = ?",
+                        (run.parent_run_id,),
+                    ).fetchone()
+                    if parent is None or str(parent["session_id"]) != run.session_id:
+                        raise StorageError("Parent run must belong to the same session")
+                    if str(parent["context_scope_id"]) == run.context_scope_id:
+                        raise StorageError("Child run must have its own context scope")
+                    if connection.execute(
+                        "SELECT 1 FROM context_scopes WHERE scope_id = ?",
+                        (run.context_scope_id,),
+                    ).fetchone() is not None:
+                        raise StorageError("Child context scope already exists")
+                    connection.execute(
+                        "INSERT INTO context_scopes (scope_id, session_id) VALUES (?, ?)",
+                        (run.context_scope_id, run.session_id),
+                    )
+                elif run.context_scope_id != session.context_scope.scope_id:
+                    raise StorageError("Root run must use the session's main context scope")
+                scope = self._load_context_scope(connection, run.context_scope_id)
+                try:
+                    advanced_scope = scope.advance(run)
+                except InvalidStateTransitionError as exc:
+                    raise StorageError(str(exc)) from exc
+                if any(message.run_id != run.run_id for message in messages):
+                    raise StorageError("Run messages must originate from the checkpointed run")
                 self._insert_run(connection, run, updated_at)
-                self._update_session(connection, session, updated_at=updated_at)
-                appended = self._append_messages(
-                    connection, session.session_id, messages
+                connection.execute(
+                    "UPDATE context_scopes SET tail_run_id = ? WHERE scope_id = ?",
+                    (advanced_scope.tail_run_id, advanced_scope.scope_id),
                 )
+                self._update_session(connection, session, updated_at=updated_at)
+                appended = self._append_messages(connection, run.context_scope_id, messages)
                 self._replace_run_children(connection, run)
             session.updated_at = updated_at
             run.updated_at = updated_at
+            if run.parent_run_id is None:
+                session.context_scope = advanced_scope
             return appended
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
@@ -159,11 +212,14 @@ class SQLiteStateStore(RunStore):
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 self._validate_run_membership(connection, session, run)
+                scope = self._load_context_scope(connection, run.context_scope_id)
+                if not scope.is_tail(run):
+                    raise StorageError("Only the context scope tail run can append messages")
+                if any(message.run_id != run.run_id for message in messages):
+                    raise StorageError("Run messages must originate from the checkpointed run")
                 self._update_session(connection, session, updated_at=updated_at)
                 self._update_run(connection, run, updated_at=updated_at)
-                appended = self._append_messages(
-                    connection, session.session_id, messages
-                )
+                appended = self._append_messages(connection, run.context_scope_id, messages)
                 self._replace_run_children(connection, run)
             session.updated_at = updated_at
             run.updated_at = updated_at
@@ -210,12 +266,14 @@ class SQLiteStateStore(RunStore):
         if row is None:
             raise SessionNotFoundError(f"Session not found: {session_id}")
         try:
-            return Session(
+            session = Session(
                 session_id=str(row["session_id"]),
                 workspace=Path(row["workspace"]),
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
             )
+            session.context_scope = self._load_context_scope(connection, session_id)
+            return session
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise StorageError(
                 f"Session {session_id} contains invalid persisted state "
@@ -280,6 +338,9 @@ class SQLiteStateStore(RunStore):
                 session_id=str(row["session_id"]),
                 sequence=int(row["sequence"]),
                 previous_run_id=row["previous_run_id"],
+                parent_run_id=row["parent_run_id"],
+                agent_spec_id=row["agent_spec_id"],
+                context_scope_id=str(row["context_scope_id"]),
                 goal=str(row["goal"]),
                 status=RunStatus(row["status"]),
                 plan=plan,
@@ -317,7 +378,8 @@ class SQLiteStateStore(RunStore):
         self._validate_session_workspace(connection, session)
         row = connection.execute(
             """
-            SELECT session_id, sequence, previous_run_id, goal
+            SELECT session_id, sequence, previous_run_id, parent_run_id,
+                   agent_spec_id, context_scope_id, goal
             FROM runs WHERE run_id = ?
             """,
             (run.run_id,),
@@ -328,9 +390,15 @@ class SQLiteStateStore(RunStore):
             str(row["session_id"]),
             int(row["sequence"]),
             row["previous_run_id"],
+            row["parent_run_id"],
+            row["agent_spec_id"],
+            str(row["context_scope_id"]),
             str(row["goal"]),
         )
-        expected = (run.session_id, run.sequence, run.previous_run_id, run.goal)
+        expected = (
+            run.session_id, run.sequence, run.previous_run_id, run.parent_run_id,
+            run.agent_spec_id, run.context_scope_id, run.goal,
+        )
         if membership != expected or run.session_id != session.session_id:
             raise StorageError(f"Run {run.run_id} has invalid session membership")
 
@@ -340,16 +408,20 @@ class SQLiteStateStore(RunStore):
         connection.execute(
             """
             INSERT INTO runs (
-                run_id, session_id, sequence, previous_run_id, goal, status,
+                run_id, session_id, sequence, previous_run_id, parent_run_id,
+                agent_spec_id, context_scope_id, goal, status,
                 plan_json, final_summary, error, model_name, model_turns,
                 max_steps, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
                 run.session_id,
                 run.sequence,
                 run.previous_run_id,
+                run.parent_run_id,
+                run.agent_spec_id,
+                run.context_scope_id,
                 run.goal,
                 run.status.value,
                 _dump_json(run.plan),
@@ -408,10 +480,10 @@ class SQLiteStateStore(RunStore):
             raise RunNotFoundError(f"Run not found: {run.run_id}")
 
     @staticmethod
-    def _message_count(connection: sqlite3.Connection, session_id: str) -> int:
+    def _message_count(connection: sqlite3.Connection, scope_id: str) -> int:
         row = connection.execute(
-            "SELECT COUNT(*), MAX(sequence) FROM messages WHERE session_id = ?",
-            (session_id,),
+            "SELECT COUNT(*), MAX(sequence) FROM messages WHERE scope_id = ?",
+            (scope_id,),
         ).fetchone()
         count = int(row[0])
         if count and int(row[1]) != count - 1:
@@ -421,22 +493,31 @@ class SQLiteStateStore(RunStore):
     def _append_messages(
         self,
         connection: sqlite3.Connection,
-        session_id: str,
+        scope_id: str,
         messages: tuple[ModelMessage, ...],
     ) -> tuple[SequencedMessage, ...]:
-        start = self._message_count(connection, session_id)
+        scope = self._load_context_scope(connection, scope_id)
+        for origin_run_id in {message.run_id for message in messages}:
+            row = connection.execute(
+                "SELECT context_scope_id FROM runs WHERE run_id = ?", (origin_run_id,)
+            ).fetchone()
+            if row is None or str(row["context_scope_id"]) != scope_id:
+                raise StorageError("Message must belong to a run in its context scope")
+            if scope.tail_run_id != origin_run_id:
+                raise StorageError("Only the context scope tail run can append messages")
+        start = self._message_count(connection, scope_id)
         appended = tuple(
             SequencedMessage(start + index, message)
             for index, message in enumerate(messages)
         )
         connection.executemany(
             """
-            INSERT INTO messages (session_id, sequence, run_id, role, content_json)
+            INSERT INTO messages (scope_id, sequence, origin_run_id, role, content_json)
             VALUES (?, ?, ?, ?, ?)
             """,
             (
                 (
-                    session_id,
+                    scope_id,
                     start + index,
                     message.run_id,
                     message.role,
@@ -448,21 +529,21 @@ class SQLiteStateStore(RunStore):
         return appended
 
     def append_messages(
-        self, session_id: str, messages: tuple[ModelMessage, ...]
+        self, scope_id: str, messages: tuple[ModelMessage, ...]
     ) -> tuple[SequencedMessage, ...]:
         """Append a batch without replacing any existing transcript rows."""
         try:
             with self._connect() as connection:
                 if connection.execute(
-                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                    "SELECT 1 FROM context_scopes WHERE scope_id = ?", (scope_id,)
                 ).fetchone() is None:
-                    raise SessionNotFoundError(f"Session not found: {session_id}")
-                return self._append_messages(connection, session_id, messages)
+                    raise StorageError(f"Context scope not found: {scope_id}")
+                return self._append_messages(connection, scope_id, messages)
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
     def read_messages(
-        self, session_id: str, start: int = 0, end: int | None = None
+        self, scope_id: str, start: int = 0, end: int | None = None
     ) -> Iterator[SequencedMessage]:
         """Stream decoded messages in the half-open range [start, end)."""
         if start < 0 or (end is not None and end < start):
@@ -470,18 +551,18 @@ class SQLiteStateStore(RunStore):
         try:
             with self._connect() as connection:
                 if connection.execute(
-                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                    "SELECT 1 FROM context_scopes WHERE scope_id = ?", (scope_id,)
                 ).fetchone() is None:
-                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                    raise StorageError(f"Context scope not found: {scope_id}")
                 rows = connection.execute(
                     """
-                    SELECT sequence, run_id, role, content_json
+                    SELECT sequence, origin_run_id, role, content_json
                     FROM messages
-                    WHERE session_id = ? AND sequence >= ?
+                    WHERE scope_id = ? AND sequence >= ?
                       AND (? IS NULL OR sequence < ?)
                     ORDER BY sequence
                     """,
-                    (session_id, start, end, end),
+                    (scope_id, start, end, end),
                 )
                 for row in rows:
                     yield SequencedMessage(
@@ -491,47 +572,43 @@ class SQLiteStateStore(RunStore):
                             content=tuple(
                                 _load_json(row["content_json"], "message content")
                             ),
-                            run_id=str(row["run_id"]),
+                            run_id=str(row["origin_run_id"]),
                         ),
                     )
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def message_count(self, session_id: str, run_id: str | None = None) -> int:
+    def message_count(self, scope_id: str) -> int:
         try:
             with self._connect() as connection:
                 if connection.execute(
-                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                    "SELECT 1 FROM context_scopes WHERE scope_id = ?", (scope_id,)
                 ).fetchone() is None:
-                    raise SessionNotFoundError(f"Session not found: {session_id}")
-                if run_id is None:
-                    return self._message_count(connection, session_id)
-                return int(
-                    connection.execute(
-                        """
-                        SELECT COUNT(*) FROM messages
-                        WHERE session_id = ? AND run_id = ?
-                        """,
-                        (session_id, run_id),
-                    ).fetchone()[0]
-                )
+                    raise StorageError(f"Context scope not found: {scope_id}")
+                return self._message_count(connection, scope_id)
         except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
-    def has_run_messages(self, session_id: str, run_id: str) -> bool:
-        return self.message_count(session_id, run_id) > 0
+    def has_run_messages(self, run_id: str) -> bool:
+        try:
+            with self._connect() as connection:
+                return connection.execute(
+                    "SELECT 1 FROM messages WHERE origin_run_id = ? LIMIT 1", (run_id,)
+                ).fetchone() is not None
+        except (OSError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
 
-    def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+    def load_context_checkpoint(self, scope_id: str) -> ContextCheckpoint | None:
         """Load view metadata without loading any raw transcript rows."""
         try:
             with self._connect() as connection:
                 if connection.execute(
-                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                    "SELECT 1 FROM context_scopes WHERE scope_id = ?", (scope_id,)
                 ).fetchone() is None:
-                    raise SessionNotFoundError(f"Session not found: {session_id}")
+                    raise StorageError(f"Context scope not found: {scope_id}")
                 row = connection.execute(
-                    "SELECT revision, snapshot_json FROM context_checkpoints WHERE session_id = ?",
-                    (session_id,),
+                    "SELECT revision, snapshot_json FROM context_checkpoints WHERE scope_id = ?",
+                    (scope_id,),
                 ).fetchone()
                 if row is None:
                     return None
@@ -542,24 +619,24 @@ class SQLiteStateStore(RunStore):
             raise _storage_error(exc) from None
 
     def save_context_checkpoint(
-        self, session_id: str, checkpoint: ContextCheckpoint
+        self, scope_id: str, checkpoint: ContextCheckpoint
     ) -> ContextCheckpoint:
         """Save one projection recipe with tail and revision checks."""
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if connection.execute(
-                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+                    "SELECT 1 FROM context_scopes WHERE scope_id = ?", (scope_id,)
                 ).fetchone() is None:
-                    raise SessionNotFoundError(f"Session not found: {session_id}")
-                count = self._message_count(connection, session_id)
+                    raise StorageError(f"Context scope not found: {scope_id}")
+                count = self._message_count(connection, scope_id)
                 if count != checkpoint.source_message_count:
                     raise StorageError(
                         "Context checkpoint does not describe the current transcript tail"
                     )
                 row = connection.execute(
-                    "SELECT revision FROM context_checkpoints WHERE session_id = ?",
-                    (session_id,),
+                    "SELECT revision FROM context_checkpoints WHERE scope_id = ?",
+                    (scope_id,),
                 ).fetchone()
                 revision = 0 if row is None else int(row["revision"])
                 if checkpoint.revision != revision:
@@ -567,13 +644,13 @@ class SQLiteStateStore(RunStore):
                 saved = replace(checkpoint, revision=revision + 1)
                 connection.execute(
                     """
-                    INSERT INTO context_checkpoints (session_id, revision, snapshot_json)
+                    INSERT INTO context_checkpoints (scope_id, revision, snapshot_json)
                     VALUES (?, ?, ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
+                    ON CONFLICT(scope_id) DO UPDATE SET
                         revision = excluded.revision,
                         snapshot_json = excluded.snapshot_json
                     """,
-                    (session_id, saved.revision, _dump_context_checkpoint(saved)),
+                    (scope_id, saved.revision, _dump_context_checkpoint(saved)),
                 )
                 return saved
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:

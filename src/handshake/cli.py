@@ -480,7 +480,7 @@ def _inspect_session(args: argparse.Namespace) -> int:
     print(f"Session:   {session.session_id}")
     print(f"Workspace: {session.workspace}")
     print(f"Created:   {session.created_at}")
-    print(f"Messages:  {store.message_count(session.session_id)}")
+    print(f"Latest run messages: {store.message_count(runs[-1].context_scope_id) if runs else 0}")
     print("Runs:")
     for run in runs:
         goal = run.goal.replace("\n", " ")
@@ -500,7 +500,7 @@ def _inspect_run(args: argparse.Namespace) -> int:
     store = _state_store()
     run = store.load_run(args.run_id)
     session = store.load_session(run.session_id)
-    message_count = store.message_count(session.session_id, run.run_id)
+    message_count = store.message_count(run.context_scope_id)
     print(f"Run:         {run.run_id}")
     print(f"Session:     {run.session_id}")
     print(f"Sequence:    {run.sequence}")

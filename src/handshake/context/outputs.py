@@ -37,13 +37,13 @@ def readable_tool_result(content: str) -> str:
 
 
 def externalize_tool_result(
-    session_id: str,
+    run_id: str,
     sequence: int,
     block_index: int,
     content: str,
 ) -> StoredTextArtifact:
     """Store one tool result as a generic text artifact."""
     return store_text_artifact(
-        f"tool-result\0{session_id}\0{sequence}\0{block_index}",
+        f"tool-result\0{run_id}\0{sequence}\0{block_index}",
         readable_tool_result(content),
     )

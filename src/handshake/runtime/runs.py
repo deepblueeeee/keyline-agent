@@ -23,9 +23,8 @@ def create_initial_run(
 ) -> Run:
     """Create the first run in a session without persisting it."""
     _validate_goal(goal)
-    return Run(
-        goal=goal.strip(),
-        session_id=session.session_id,
+    return session.context_scope.new_run(
+        goal.strip(),
         sequence=1,
         model_name=model_name,
         max_steps=max_steps,
@@ -37,21 +36,27 @@ def create_followup_run(
     runs: Sequence[Run],
     goal: str,
 ) -> Run:
-    """Create a run after the current session tail has terminated."""
+    """Create a root run after every existing run has terminated."""
     _validate_goal(goal)
     latest = _latest_run(session, runs)
-    if latest.status not in TERMINAL_RUN_STATUSES:
+    active = next((run for run in runs if run.status not in TERMINAL_RUN_STATUSES), None)
+    if active is not None:
         raise AgentLoopError(
             f"Session {session.session_id} already has an active run "
-            f"{latest.run_id} ({latest.status.value})"
+            f"{active.run_id} ({active.status.value})"
         )
-    return Run(
-        goal=goal.strip(),
-        session_id=session.session_id,
+    previous_root = max(
+        (run for run in runs if run.parent_run_id is None),
+        key=lambda run: run.sequence,
+    )
+    if session.context_scope.tail_run_id != previous_root.run_id:
+        raise AgentLoopError("Session context scope tail does not match the latest root run")
+    return session.context_scope.new_run(
+        goal.strip(),
         sequence=latest.sequence + 1,
-        previous_run_id=latest.run_id,
-        model_name=latest.model_name,
-        max_steps=latest.max_steps,
+        agent_spec_id=previous_root.agent_spec_id,
+        model_name=previous_root.model_name,
+        max_steps=previous_root.max_steps,
     )
 
 

@@ -218,28 +218,27 @@ def _execute_tool_calls(
 
 
 def _sync_context(
-    session: Session,
+    run: Run,
     store: RunStore,
     context_manager: AgentContextManager,
 ) -> None:
-    if not context_manager.is_initialized(session):
-        end = store.message_count(session.session_id)
+    scope = store.load_context_scope(run.context_scope_id)
+    if not context_manager.is_initialized(scope):
+        end = store.message_count(run.context_scope_id)
         context_manager.restore(
-            session,
-            store.load_context_checkpoint(session.session_id),
+            scope,
+            store.load_context_checkpoint(run.context_scope_id),
             end,
             lambda start, stop: store.read_messages(
-                session.session_id, start, stop
+                run.context_scope_id, start, stop
             ),
         )
         return
-    start = context_manager.message_count(session)
-    end = store.message_count(session.session_id)
+    start = context_manager.message_count(scope)
+    end = store.message_count(run.context_scope_id)
     if start > end:
         raise AgentLoopError("Context view is ahead of the durable transcript")
-    context_manager.ingest_messages(
-        session, store.read_messages(session.session_id, start, end)
-    )
+    context_manager.ingest_messages(scope, store.read_messages(run.context_scope_id, start, end))
 
 
 def _prepare_model_context(
@@ -255,19 +254,20 @@ def _prepare_model_context(
             session,
             run,
             tools,
-            raw_message_reader=lambda session_id, sequence: _read_raw_message(
-                store, session_id, sequence
+            raw_message_reader=lambda scope_id, sequence: _read_raw_message(
+                store, scope_id, sequence
             ),
         )
     finally:
-        checkpoint = context_manager.pending_checkpoint(session)
+        scope = store.load_context_scope(run.context_scope_id)
+        checkpoint = context_manager.pending_checkpoint(scope)
         if checkpoint is not None:
-            saved = store.save_context_checkpoint(session.session_id, checkpoint)
-            context_manager.checkpoint_saved(session, saved)
+            saved = store.save_context_checkpoint(run.context_scope_id, checkpoint)
+            context_manager.checkpoint_saved(scope, saved)
 
 
-def _read_raw_message(store: RunStore, session_id: str, sequence: int) -> ModelMessage:
-    messages = tuple(store.read_messages(session_id, sequence, sequence + 1))
+def _read_raw_message(store: RunStore, scope_id: str, sequence: int) -> ModelMessage:
+    messages = tuple(store.read_messages(scope_id, sequence, sequence + 1))
     if len(messages) != 1 or messages[0].sequence != sequence:
         raise AgentLoopError(f"Missing durable message sequence {sequence}")
     return messages[0].message
@@ -285,14 +285,18 @@ def _checkpoint(
     messages = tuple(pending_messages)
     if create:
         appended = store.create_run(session, run, messages)
+        pending_messages.clear()
+        _sync_context(run, store, context_manager)
+        return
     else:
         appended = store.checkpoint_run(session, run, messages)
     pending_messages.clear()
-    context_manager.ingest_messages(session, appended)
-    checkpoint = context_manager.pending_checkpoint(session)
+    scope = store.load_context_scope(run.context_scope_id)
+    context_manager.ingest_messages(scope, appended)
+    checkpoint = context_manager.pending_checkpoint(scope)
     if checkpoint is not None:
-        saved = store.save_context_checkpoint(session.session_id, checkpoint)
-        context_manager.checkpoint_saved(session, saved)
+        saved = store.save_context_checkpoint(run.context_scope_id, checkpoint)
+        context_manager.checkpoint_saved(scope, saved)
 
 
 def _create_text_dependency(
@@ -383,7 +387,9 @@ def _run_turns(
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
             _validate_turn_tool_calls(turn.content, turn.tool_calls)
-            context_manager.record_usage(session, context, definitions, turn)
+            context_manager.record_usage(
+                store.load_context_scope(run.context_scope_id), context, definitions, turn
+            )
             pending_messages.append(
                 ModelMessage(role="assistant", content=turn.content, run_id=run.run_id)
             )
@@ -526,14 +532,13 @@ def start_run(
         raise AgentLoopError("Only a newly created run can be started")
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if store.has_run_messages(session.session_id, run.run_id):
-        raise AgentLoopError(f"Run {run.run_id} already has session messages")
+    if store.has_run_messages(run.run_id):
+        raise AgentLoopError(f"Run {run.run_id} already has model messages")
 
     output = emit or (lambda _message: None)
     current_context_manager = context_manager or AgentContextManager(
         condenser=LLMHistoryCondenser(model)
     )
-    _sync_context(session, store, current_context_manager)
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
     _resume_one_work_item(run)
@@ -598,13 +603,13 @@ def continue_run(
         raise AgentLoopError("Only a running run can continue")
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if not store.has_run_messages(session.session_id, run.run_id):
+    if not store.has_run_messages(run.run_id):
         raise AgentLoopError("A resumed run must have model protocol history")
     output = emit or (lambda _message: None)
     current_context_manager = context_manager or AgentContextManager(
         condenser=LLMHistoryCondenser(model)
     )
-    _sync_context(session, store, current_context_manager)
+    _sync_context(run, store, current_context_manager)
     pending = list(pending_messages)
     _checkpoint(session, run, store, current_context_manager, pending)
     output("Input received; resuming run")

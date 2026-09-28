@@ -10,7 +10,7 @@ ContentBlock = dict[str, Any]
 
 @dataclass(slots=True, frozen=True)
 class ModelMessage:
-    """One persisted session message and its originating run."""
+    """One protocol message with the ID of its originating run."""
 
     role: Literal["user", "assistant"]
     content: tuple[ContentBlock, ...]

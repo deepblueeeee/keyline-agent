@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -16,11 +16,21 @@ CREATE TABLE sessions (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE context_scopes (
+    scope_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    tail_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    UNIQUE (scope_id, session_id)
+);
+
 CREATE TABLE runs (
     run_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL,
     previous_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    parent_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    agent_spec_id TEXT,
+    context_scope_id TEXT NOT NULL,
     goal TEXT NOT NULL,
     status TEXT NOT NULL,
     plan_json TEXT NOT NULL,
@@ -32,23 +42,22 @@ CREATE TABLE runs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (session_id, sequence),
-    UNIQUE (previous_run_id),
-    UNIQUE (run_id, session_id)
+    UNIQUE (run_id, session_id),
+    FOREIGN KEY (context_scope_id, session_id)
+        REFERENCES context_scopes(scope_id, session_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE messages (
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL REFERENCES context_scopes(scope_id) ON DELETE CASCADE,
     sequence INTEGER NOT NULL,
-    run_id TEXT NOT NULL,
+    origin_run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
     role TEXT NOT NULL,
     content_json TEXT NOT NULL,
-    PRIMARY KEY (session_id, sequence),
-    FOREIGN KEY (run_id, session_id) REFERENCES runs(run_id, session_id)
-        ON DELETE CASCADE
+    PRIMARY KEY (scope_id, sequence)
 );
 
 CREATE TABLE context_checkpoints (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    scope_id TEXT PRIMARY KEY REFERENCES context_scopes(scope_id) ON DELETE CASCADE,
     revision INTEGER NOT NULL,
     snapshot_json TEXT NOT NULL
 );
@@ -89,7 +98,6 @@ CREATE TABLE secret_handles (
 );
 
 CREATE INDEX runs_session_sequence ON runs(session_id, sequence);
-CREATE INDEX messages_run ON messages(run_id, sequence);
 CREATE INDEX dependencies_run_status ON dependencies(run_id, status);
 CREATE INDEX secret_handles_run_status ON secret_handles(run_id, status);
 """

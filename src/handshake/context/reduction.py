@@ -61,7 +61,7 @@ def mask_oldest_stale_result(state: ManagedContextState) -> bool:
 def compact_semantic_context(
     state: ManagedContextState,
     *,
-    session_id: str,
+    run_id: str,
     policy: ContextBudgetPolicy,
     estimator: TokenEstimator,
     condenser: HistoryCondenser,
@@ -74,7 +74,7 @@ def compact_semantic_context(
     while measure_pressure() > policy.pressure_target_tokens:
         background, target = select_raw_candidate(
             state,
-            session_id=session_id,
+            run_id=run_id,
             policy=policy,
             estimator=estimator,
             raw_message_reader=raw_message_reader,
@@ -188,7 +188,7 @@ def _fits_request(
 def select_raw_candidate(
     state: ManagedContextState,
     *,
-    session_id: str,
+    run_id: str,
     policy: ContextBudgetPolicy,
     estimator: TokenEstimator,
     raw_message_reader: RawMessageReader | None,
@@ -210,7 +210,7 @@ def select_raw_candidate(
             for index, block in enumerate(message.content):
                 if block.get("type") == "tool_result" and block.get("is_error") is True:
                     raw = (
-                        raw_message_reader(session_id, sequence)
+                        raw_message_reader(run_id, sequence)
                         if raw_message_reader is not None
                         else state.messages[sequence]
                     )

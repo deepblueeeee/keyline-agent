@@ -44,7 +44,7 @@ class ExactContext:
 
 @dataclass(frozen=True, slots=True)
 class SourceRange:
-    """Inclusive, zero-based range in the durable Session message sequence."""
+    """Inclusive, zero-based range in a durable Run message sequence."""
 
     start_sequence: int
     end_sequence: int

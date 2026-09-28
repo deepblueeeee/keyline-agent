@@ -1,4 +1,4 @@
-"""Helpers for tests whose raw transcript is owned by SQLite."""
+"""Helpers for tests whose context streams are owned by SQLite."""
 
 from pathlib import Path
 
@@ -16,7 +16,10 @@ def fresh_store(path: Path, session: Session) -> SQLiteStateStore:
 
 
 def history(store: RunStore, session: Session) -> list[ModelMessage]:
-    return [item.message for item in store.read_messages(session.session_id)]
+    return [
+        item.message
+        for item in store.read_messages(session.context_scope.scope_id)
+    ]
 
 
 def register_run(
@@ -30,13 +33,13 @@ def register_run(
 
 def ingest(
     manager: AgentContextManager,
-    session: Session,
+    run: Run,
     messages: list[ModelMessage] | tuple[ModelMessage, ...],
     *,
     start: int = 0,
 ) -> None:
     manager.ingest_messages(
-        session,
+        run.context_scope,
         tuple(
             SequencedMessage(start + index, message)
             for index, message in enumerate(messages)

@@ -7,7 +7,7 @@ from typing import Protocol
 
 from handshake.context.state import ContextCheckpoint, SequencedMessage
 from handshake.models.protocol import ModelMessage
-from handshake.runtime.state import Run, Session
+from handshake.runtime.state import ContextScope, Run, Session
 
 
 class RunStore(Protocol):
@@ -29,32 +29,36 @@ class RunStore(Protocol):
         """Return persisted sessions in most-recently-updated order."""
         ...
 
+    def load_context_scope(self, scope_id: str) -> ContextScope:
+        """Restore a stream and its current tail run."""
+        ...
+
     def append_messages(
-        self, session_id: str, messages: tuple[ModelMessage, ...]
+        self, scope_id: str, messages: tuple[ModelMessage, ...]
     ) -> tuple[SequencedMessage, ...]:
-        """Append messages and return their assigned durable sequences."""
+        """Append messages to one ContextScope and return durable sequences."""
         ...
 
     def read_messages(
-        self, session_id: str, start: int = 0, end: int | None = None
+        self, scope_id: str, start: int = 0, end: int | None = None
     ) -> Iterator[SequencedMessage]:
-        """Stream messages in the half-open sequence range [start, end)."""
+        """Stream one scope's messages in the half-open range [start, end)."""
         ...
 
-    def message_count(self, session_id: str, run_id: str | None = None) -> int:
-        """Return the number of messages in a session transcript."""
+    def message_count(self, scope_id: str) -> int:
+        """Return the number of messages in one context stream."""
         ...
 
-    def has_run_messages(self, session_id: str, run_id: str) -> bool:
+    def has_run_messages(self, run_id: str) -> bool:
         """Return whether a run has any durable protocol messages."""
         ...
 
-    def load_context_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+    def load_context_checkpoint(self, scope_id: str) -> ContextCheckpoint | None:
         """Load the latest model-view recipe without reading raw messages."""
         ...
 
     def save_context_checkpoint(
-        self, session_id: str, checkpoint: ContextCheckpoint
+        self, scope_id: str, checkpoint: ContextCheckpoint
     ) -> ContextCheckpoint:
         """Persist a context recipe, rejecting a stale revision or transcript prefix."""
         ...
@@ -65,7 +69,7 @@ class RunStore(Protocol):
         run: Run,
         messages: tuple[ModelMessage, ...] = (),
     ) -> tuple[SequencedMessage, ...]:
-        """Persist a run and return its newly appended transcript messages."""
+        """Persist a run and append messages to its context scope."""
         ...
 
     def checkpoint_run(

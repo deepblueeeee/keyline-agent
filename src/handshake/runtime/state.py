@@ -202,6 +202,56 @@ class Session:
     session_id: str = field(default_factory=lambda: str(uuid4()))
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
+    context_scope: ContextScope = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.context_scope = ContextScope(self.session_id, self.session_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ContextScope:
+    """One message stream and the last run that extended it."""
+
+    scope_id: str
+    session_id: str
+    tail_run_id: str | None = None
+
+    def owns(self, run: Run) -> bool:
+        """Whether a run belongs to this session's message stream."""
+        return run.session_id == self.session_id and run.context_scope_id == self.scope_id
+
+    def is_tail(self, run: Run) -> bool:
+        """Whether the run can continue writing to this stream."""
+        return self.owns(run) and self.tail_run_id == run.run_id
+
+    def new_run(
+        self,
+        goal: str,
+        *,
+        sequence: int,
+        model_name: str,
+        max_steps: int,
+        agent_spec_id: str | None = None,
+    ) -> Run:
+        """Build the next run in this stream without copying its history."""
+        return Run(
+            goal=goal,
+            session_id=self.session_id,
+            sequence=sequence,
+            previous_run_id=self.tail_run_id,
+            agent_spec_id=agent_spec_id,
+            context_scope_id=self.scope_id,
+            model_name=model_name,
+            max_steps=max_steps,
+        )
+
+    def advance(self, run: Run) -> ContextScope:
+        """Validate the stream predecessor and return its new durable head."""
+        if not self.owns(run):
+            raise InvalidStateTransitionError("Run does not belong to this context scope")
+        if run.previous_run_id != self.tail_run_id:
+            raise InvalidStateTransitionError("Run does not follow the context scope tail")
+        return ContextScope(self.scope_id, self.session_id, run.run_id)
 
 
 @dataclass(slots=True)
@@ -211,6 +261,9 @@ class Run:
     run_id: str = field(default_factory=lambda: str(uuid4()))
     sequence: int = 1
     previous_run_id: str | None = None
+    parent_run_id: str | None = None
+    agent_spec_id: str | None = None
+    context_scope_id: str = ""
     status: RunStatus = RunStatus.CREATED
     plan: list[str] = field(default_factory=list)
     tool_runs: list[ToolRun] = field(default_factory=list)
@@ -226,8 +279,17 @@ class Run:
     updated_at: str = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        if not self.context_scope_id:
+            self.context_scope_id = (
+                str(uuid4()) if self.parent_run_id is not None else self.session_id
+            )
         if not self.work_items:
             self.work_items.append(WorkItem(description=self.goal))
+
+    @property
+    def context_scope(self) -> ContextScope:
+        """Reference the stream identity; load persisted scope for its current tail."""
+        return ContextScope(scope_id=self.context_scope_id, session_id=self.session_id)
 
     def transition(self, target: RunStatus) -> None:
         if target not in _RUN_TRANSITIONS[self.status]:
