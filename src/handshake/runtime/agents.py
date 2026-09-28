@@ -13,15 +13,15 @@ class AgentSpec:
 
     spec_id: str
     model_name: str
-    system_prompt: str
+    instructions: str
     profile: str = ""
     allowed_tools: frozenset[str] = frozenset()
     default_budget: ContextBudgetPolicy = field(default_factory=ContextBudgetPolicy)
     default_max_steps: int = 50
 
     def __post_init__(self) -> None:
-        if not self.spec_id or not self.model_name or not self.system_prompt:
-            raise ValueError("Agent spec needs an identity, model, and system prompt")
+        if not self.spec_id or not self.model_name or not self.instructions:
+            raise ValueError("Agent spec needs an identity, model, and instructions")
         if isinstance(self.allowed_tools, str):
             raise ValueError("Allowed tools must be a collection of names")
         tools = frozenset(self.allowed_tools)

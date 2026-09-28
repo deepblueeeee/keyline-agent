@@ -16,6 +16,7 @@ def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, .
         "first goal",
         model_name="deepseek-v4-pro",
         max_steps=17,
+        agent_spec_id="test",
     )
     run.transition(RunStatus.RUNNING)
     run.work_items[0].transition(WorkItemStatus.RUNNING)
@@ -47,6 +48,7 @@ def test_followup_run_inherits_config_without_owning_messages(tmp_path: Path) ->
     assert second.sequence == 2
     assert second.context_scope_id == first.context_scope_id
     assert second.previous_run_id == first.run_id
+    assert second.agent_spec_id == first.agent_spec_id
     assert second.model_name == "deepseek-v4-pro"
     assert second.max_steps == 17
     assert second.model_turns == 0
@@ -64,6 +66,7 @@ def test_active_run_blocks_followup(tmp_path: Path) -> None:
         "active goal",
         model_name="deepseek-v4-flash",
         max_steps=50,
+        agent_spec_id="test",
     )
     active.transition(RunStatus.RUNNING)
     active.work_items[0].transition(WorkItemStatus.RUNNING)
@@ -82,6 +85,7 @@ def test_failed_or_cancelled_run_allows_followup(
         "first attempt",
         model_name="deepseek-v4-flash",
         max_steps=50,
+        agent_spec_id="test",
     )
     run.transition(RunStatus.RUNNING)
     run.work_items[0].transition(WorkItemStatus.RUNNING)

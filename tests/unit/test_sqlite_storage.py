@@ -25,6 +25,7 @@ def _waiting_run(session: Session) -> tuple[Run, list[ModelMessage]]:
         model_name="deepseek-v4-flash",
         max_steps=7,
         model_turns=2,
+        agent_spec_id="test",
     )
     run.transition(RunStatus.RUNNING)
     work = run.work_items[0]
@@ -213,10 +214,13 @@ def test_context_checkpoint_is_small_separate_metadata_with_revision_cas(
         store.load_context_checkpoint(run.context_scope_id)
 
 
-def test_incompatible_development_schema_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("old_version", [7, 11])
+def test_incompatible_development_schema_is_rejected(
+    tmp_path: Path, old_version: int
+) -> None:
     database = tmp_path / "handshake.db"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 7")
+        connection.execute(f"PRAGMA user_version = {old_version}")
 
     with pytest.raises(StorageError, match="incompatible with current development schema"):
         SQLiteStateStore(database)

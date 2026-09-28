@@ -266,6 +266,7 @@ def test_run_uses_configured_provider_and_context_budgets(
     assert policies[0].context_window_tokens == 32768
     assert policies[0].reserved_output_tokens == 4096
     assert policies[0].condenser_input_tokens == 28672
+    assert _store(home).list_runs()[0].agent_spec_id == "main"
 
 
 def test_resume_reloads_context_configuration(

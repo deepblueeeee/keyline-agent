@@ -113,7 +113,7 @@ def test_missing_usage_uses_local_estimator() -> None:
 
 def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
-    run = Run(goal="ask", session_id=session.session_id)
+    run = Run(goal="ask", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
     wait_turn = ModelTurn(
         (
@@ -178,7 +178,7 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
 
 def test_low_actual_usage_avoids_unnecessary_compaction(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
-    run = Run(goal="continue", session_id=session.session_id)
+    run = Run(goal="continue", session_id=session.session_id, agent_spec_id="test")
     policy = ContextBudgetPolicy(context_window_tokens=1000, reserved_output_tokens=0)
     manager = AgentContextManager(policy)
     ingest(manager, session, (text_message("x" * 10000),))
@@ -215,7 +215,7 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
             return None
 
     session = Session(workspace=tmp_path)
-    run = Run(goal="continue", session_id=session.session_id)
+    run = Run(goal="continue", session_id=session.session_id, agent_spec_id="test")
     policy = ContextBudgetPolicy(
         context_window_tokens=10000,
         reserved_output_tokens=0,
@@ -241,7 +241,7 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
 
 def test_actual_usage_enforces_hard_limit_for_protected_context(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
-    run = Run(goal="continue", session_id=session.session_id)
+    run = Run(goal="continue", session_id=session.session_id, agent_spec_id="test")
     manager = AgentContextManager(
         ContextBudgetPolicy(
             context_window_tokens=10000,

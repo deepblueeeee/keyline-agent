@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -29,7 +29,7 @@ CREATE TABLE runs (
     sequence INTEGER NOT NULL,
     previous_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
     parent_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
-    agent_spec_id TEXT,
+    agent_spec_id TEXT NOT NULL CHECK (length(trim(agent_spec_id)) > 0),
     context_scope_id TEXT NOT NULL,
     goal TEXT NOT NULL,
     status TEXT NOT NULL,

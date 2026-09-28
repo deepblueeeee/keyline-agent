@@ -400,6 +400,7 @@ def _run_real(args: argparse.Namespace) -> int:
         args.request,
         model_name=settings.provider.model,
         max_steps=args.max_steps,
+        agent_spec_id="main",
     )
     store.create_session(session)
     print(f"Session created: {session.session_id}")
@@ -627,6 +628,7 @@ def _run_demo(_args: argparse.Namespace) -> int:
         run = Run(
             goal="Implement the missing calculator.add function",
             session_id=session.session_id,
+            agent_spec_id="demo",
             model_name="scripted",
         )
         registry = create_default_registry(lambda _cwd, _argv: True)

@@ -80,7 +80,7 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
         return True
 
     session = Session(workspace=workspace)
-    run = Run(goal="Implement add", session_id=session.session_id)
+    run = Run(goal="Implement add", session_id=session.session_id, agent_spec_id="test")
     start_run(
         session,
         run,

@@ -20,6 +20,7 @@ def create_initial_run(
     *,
     model_name: str,
     max_steps: int,
+    agent_spec_id: str,
 ) -> Run:
     """Create the first run in a session without persisting it."""
     _validate_goal(goal)
@@ -28,6 +29,7 @@ def create_initial_run(
         sequence=1,
         model_name=model_name,
         max_steps=max_steps,
+        agent_spec_id=agent_spec_id,
     )
 
 

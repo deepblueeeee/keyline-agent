@@ -64,7 +64,7 @@ def setup(
     tmp_path: Path, condenser: Condenser, **policy: int | float,
 ) -> tuple[AgentContextManager, Session, Run]:
     session = Session(workspace=tmp_path)
-    run = Run(goal="Continue", session_id=session.session_id)
+    run = Run(goal="Continue", session_id=session.session_id, agent_spec_id="test")
     messages = list(
         ModelMessage("user", ({"type": "text", "text": f"stage {i}: " + "x" * 2000},),
                      run.run_id)
@@ -324,6 +324,7 @@ def test_loop_persists_compaction_and_restart_restores_without_llm(tmp_path: Pat
         session_id=session.session_id,
         sequence=2,
         previous_run_id=old_run.run_id,
+        agent_spec_id="test",
     )
     model = ScriptedModel([ModelTurn(({"type": "text", "text": "Done"},),
                                     stop_reason="end_turn")])
@@ -409,10 +410,13 @@ def test_shared_model_summary_never_enters_transcript_or_turn_count(tmp_path: Pa
         ModelTurn(({"type": "text", "text": "Done"},), stop_reason="end_turn"),
     ])
     manager.condenser = LLMHistoryCondenser(model)
-    run = Run(goal="Next request", session_id=session.session_id)
+    run = Run(goal="Next request", session_id=session.session_id, agent_spec_id="test")
     original = deepcopy(_messages(session))
     store = fresh_store(tmp_path, session)
-    old_run = Run(goal="Earlier", session_id=session.session_id, run_id=original[0].run_id)
+    old_run = Run(
+        goal="Earlier", session_id=session.session_id,
+        run_id=original[0].run_id, agent_spec_id="test",
+    )
     old_run.transition(RunStatus.RUNNING)
     old_run.transition(RunStatus.COMPLETED)
     store.create_run(session, old_run, tuple(original))

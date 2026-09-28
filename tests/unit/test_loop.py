@@ -61,6 +61,7 @@ def _session_run(
         session_id=session.session_id,
         model_name="scripted",
         max_steps=max_steps,
+        agent_spec_id="test",
     )
     return session, run, fresh_store(tmp_path, session)
 

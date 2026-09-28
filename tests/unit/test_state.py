@@ -14,12 +14,18 @@ from handshake.runtime.state import (
 
 
 def test_run_accepts_only_declared_transitions() -> None:
-    run = Run(goal="test", session_id="test-session")
+    run = Run(goal="test", session_id="test-session", agent_spec_id="test")
     run.transition(RunStatus.RUNNING)
     run.transition(RunStatus.COMPLETED)
 
     with pytest.raises(InvalidStateTransitionError):
         run.transition(RunStatus.RUNNING)
+
+
+@pytest.mark.parametrize("spec_id", ["", "   "])
+def test_run_requires_agent_spec_id(spec_id: str) -> None:
+    with pytest.raises(ValueError, match="must have an agent spec ID"):
+        Run(goal="test", session_id="test-session", agent_spec_id=spec_id)
 
 
 def test_tool_run_accepts_only_declared_transitions() -> None:
@@ -37,7 +43,7 @@ def test_tool_run_accepts_only_declared_transitions() -> None:
 
 
 def test_dependency_blocks_ready_work_without_a_duplicate_waiting_status() -> None:
-    run = Run(goal="test", session_id="test-session")
+    run = Run(goal="test", session_id="test-session", agent_spec_id="test")
     work = run.work_items[0]
     dependency = Dependency(
         work_id=work.work_id,
@@ -60,7 +66,7 @@ def test_dependency_blocks_ready_work_without_a_duplicate_waiting_status() -> No
 
 
 def test_run_owns_work_item_relationships() -> None:
-    run = Run(goal="test", session_id="test-session")
+    run = Run(goal="test", session_id="test-session", agent_spec_id="test")
     work = run.work_items[0]
     dependency = Dependency(
         work_id=work.work_id,

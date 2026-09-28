@@ -140,13 +140,14 @@ def test_followup_reuses_main_context_scope_without_copying(tmp_path: Path) -> N
 def test_wrong_predecessor_does_not_advance_scope_or_write_messages(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     store = fresh_store(tmp_path, session)
-    first = Run(goal="first", session_id=session.session_id)
+    first = Run(goal="first", session_id=session.session_id, agent_spec_id="test")
     store.create_run(session, first, (_message(first, "first"),))
     wrong = Run(
         goal="wrong",
         session_id=session.session_id,
         sequence=2,
         previous_run_id="some-other-run",
+        agent_spec_id="test",
     )
 
     with pytest.raises(StorageError, match="context scope tail"):
@@ -162,12 +163,13 @@ def test_child_must_refer_to_parent_in_same_session(tmp_path: Path) -> None:
     second_session = Session(workspace=tmp_path)
     store = fresh_store(tmp_path, first_session)
     store.create_session(second_session)
-    parent = Run(goal="parent", session_id=first_session.session_id)
+    parent = Run(goal="parent", session_id=first_session.session_id, agent_spec_id="test")
     store.create_run(first_session, parent)
     child = Run(
         goal="child",
         session_id=second_session.session_id,
         parent_run_id=parent.run_id,
+        agent_spec_id="test",
     )
     with pytest.raises(StorageError, match="Parent run must belong"):
         store.create_run(second_session, child)
@@ -207,7 +209,7 @@ def test_user_followup_after_child_copies_root_not_child(tmp_path: Path) -> None
 def test_user_followup_waits_for_active_parent_even_if_child_terminated(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     store = fresh_store(tmp_path, session)
-    root = Run(goal="root", session_id=session.session_id)
+    root = Run(goal="root", session_id=session.session_id, agent_spec_id="test")
     root.transition(RunStatus.RUNNING)
     store.create_run(session, root)
     child = Run(
@@ -215,6 +217,7 @@ def test_user_followup_waits_for_active_parent_even_if_child_terminated(tmp_path
         session_id=session.session_id,
         sequence=2,
         parent_run_id=root.run_id,
+        agent_spec_id="test",
     )
     child.transition(RunStatus.RUNNING)
     child.transition(RunStatus.COMPLETED)

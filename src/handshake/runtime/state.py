@@ -231,7 +231,7 @@ class ContextScope:
         sequence: int,
         model_name: str,
         max_steps: int,
-        agent_spec_id: str | None = None,
+        agent_spec_id: str,
     ) -> Run:
         """Build the next run in this stream without copying its history."""
         return Run(
@@ -258,11 +258,11 @@ class ContextScope:
 class Run:
     goal: str
     session_id: str
+    agent_spec_id: str
     run_id: str = field(default_factory=lambda: str(uuid4()))
     sequence: int = 1
     previous_run_id: str | None = None
     parent_run_id: str | None = None
-    agent_spec_id: str | None = None
     context_scope_id: str = ""
     status: RunStatus = RunStatus.CREATED
     plan: list[str] = field(default_factory=list)
@@ -279,6 +279,8 @@ class Run:
     updated_at: str = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.agent_spec_id, str) or not self.agent_spec_id.strip():
+            raise ValueError("Run must have an agent spec ID")
         if not self.context_scope_id:
             self.context_scope_id = (
                 str(uuid4()) if self.parent_run_id is not None else self.session_id

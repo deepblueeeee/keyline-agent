@@ -33,6 +33,7 @@ def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
     run = Run(
         goal="Implement calculator.add and run the existing tests.",
         session_id=session.session_id,
+        agent_spec_id="test",
     )
 
     start_run(

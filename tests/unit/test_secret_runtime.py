@@ -55,7 +55,11 @@ def test_secret_dependency_and_command_complete_without_model_leak(
         secret_store.consumer(), lambda _cwd, _argv: True
     )
     session = Session(workspace=tmp_path)
-    run = Run(goal="run authenticated integration test", session_id=session.session_id)
+    run = Run(
+        goal="run authenticated integration test",
+        session_id=session.session_id,
+        agent_spec_id="test",
+    )
     state_store.create_session(session)
     wait_call = ToolCall(
         "ask-secret",
@@ -144,7 +148,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
 def test_secret_wait_mixed_with_other_tool_has_no_side_effect(tmp_path: Path) -> None:
     state_store = SQLiteStateStore(tmp_path / "state.db")
     session = Session(workspace=tmp_path)
-    run = Run(goal="safe request", session_id=session.session_id)
+    run = Run(goal="safe request", session_id=session.session_id, agent_spec_id="test")
     state_store.create_session(session)
     model = ScriptedModel(
         [
@@ -198,7 +202,7 @@ def test_secret_command_without_capability_fails_without_shell_fallback(
         ]
     )
     session = Session(workspace=tmp_path)
-    run = Run(goal="no fallback", session_id=session.session_id)
+    run = Run(goal="no fallback", session_id=session.session_id, agent_spec_id="test")
     state_store = fresh_store(tmp_path, session)
 
     start_run(

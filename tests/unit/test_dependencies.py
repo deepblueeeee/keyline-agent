@@ -17,7 +17,7 @@ from handshake.runtime.state import (
 
 def _waiting_run(tmp_path: Path) -> tuple[Session, Run, list[ModelMessage]]:
     session = Session(workspace=tmp_path, session_id="test-session")
-    run = Run(goal="选择发布颜色", session_id=session.session_id)
+    run = Run(goal="选择发布颜色", session_id=session.session_id, agent_spec_id="test")
     run.transition(RunStatus.RUNNING)
     work = run.work_items[0]
     work.transition(WorkItemStatus.RUNNING)

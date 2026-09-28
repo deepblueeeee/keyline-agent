@@ -48,7 +48,7 @@ def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> N
     state_store = SQLiteStateStore(tmp_path / "state.db")
     first_secret_store = EphemeralSecretStore()
     session = Session(workspace=tmp_path)
-    run = Run(goal="integration", session_id=session.session_id)
+    run = Run(goal="integration", session_id=session.session_id, agent_spec_id="test")
     state_store.create_session(session)
     start_run(
         session,

@@ -16,7 +16,7 @@ from handshake.tools.secret_command import SecretCommandRunner
 def _available_secret(
     raw_value: str,
 ) -> tuple[Run, SecretHandle, object, SecretCommandRunner]:
-    run = Run(goal="integration test", session_id="session")
+    run = Run(goal="integration test", session_id="session", agent_spec_id="test")
     work = run.work_items[0]
     dependency = Dependency(
         work_id=work.work_id,

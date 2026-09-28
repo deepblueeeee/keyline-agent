@@ -60,7 +60,7 @@ def _policy(
 def _session_run(tmp_path: Path) -> tuple[Session, Run]:
     session = Session(workspace=tmp_path)
     _HISTORY[session.session_id] = []
-    run = Run(goal="Keep working", session_id=session.session_id)
+    run = Run(goal="Keep working", session_id=session.session_id, agent_spec_id="test")
     return session, run
 
 

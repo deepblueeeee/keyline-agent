@@ -40,7 +40,7 @@ def test_restore_skips_episode_sources_and_streams_incremental_suffix(
     tmp_path: Path,
 ) -> None:
     session = Session(workspace=tmp_path)
-    run = Run(goal="continue", session_id=session.session_id)
+    run = Run(goal="continue", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
     store.create_run(session, run, _messages(run, 6))
     checkpoint = ContextCheckpoint(
@@ -82,7 +82,7 @@ def test_masking_checkpoint_restores_identical_view_without_changing_raw_history
 ) -> None:
     monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
     session = Session(workspace=tmp_path)
-    run = Run(goal="inspect", session_id=session.session_id)
+    run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
     messages = (
         ModelMessage(
@@ -139,7 +139,7 @@ def test_restore_rebuilds_externalized_result_and_reuses_its_path(
 ) -> None:
     monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
     session = Session(workspace=tmp_path)
-    run = Run(goal="inspect", session_id=session.session_id)
+    run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
     original = "line\n" * 1_000
     messages = (
@@ -201,7 +201,7 @@ def test_restore_rejects_incompatible_or_invalid_metadata(
     tmp_path: Path, checkpoint: ContextCheckpoint
 ) -> None:
     session = Session(workspace=tmp_path)
-    run = Run(goal="inspect", session_id=session.session_id)
+    run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
     store.create_run(session, run, _messages(run, 3))
     manager = AgentContextManager(estimator=Characters())

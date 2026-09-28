@@ -20,7 +20,7 @@ from tests.history_support import ingest
 
 def _session_run(tmp_path: Path) -> tuple[Session, Run]:
     session = Session(workspace=tmp_path)
-    run = Run(goal="Make a focused change", session_id=session.session_id)
+    run = Run(goal="Make a focused change", session_id=session.session_id, agent_spec_id="test")
     return session, run
 
 

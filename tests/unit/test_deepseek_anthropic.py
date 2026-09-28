@@ -102,7 +102,7 @@ def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
         ]
     )
     session = Session(workspace=tmp_path)
-    run = Run(goal="inspect", session_id=session.session_id)
+    run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
 
     start_run(
         session,
