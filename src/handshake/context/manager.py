@@ -72,7 +72,7 @@ class AgentContextManager:
 
     def message_count(self, scope: ContextScope) -> int:
         """Return the durable history prefix already represented by this view."""
-        return self._synchronized_state(scope).message_count
+        return self._synchronized_state(scope.scope_id).message_count
 
     def is_initialized(self, scope: ContextScope) -> bool:
         """Return whether this process has reconstructed the context stream view."""
@@ -88,13 +88,13 @@ class AgentContextManager:
     ) -> ModelContext:
         """Apply context pressure policy and return the next model-visible context."""
         pressure = self.measure_pressure(session, run, tools)
-        state = self._synchronized_state(run.context_scope)
+        state = self._synchronized_state(run.context_scope_id)
         if (
             pressure >= self.policy.pressure_trigger_tokens
             and state.reduced_message_count < state.message_count
         ):
             while pressure > self.policy.pressure_target_tokens:
-                if not self.mask_oldest_stale_result(run.context_scope):
+                if not mask_oldest_stale_result(state):
                     break
                 pressure = self.measure_pressure(session, run, tools)
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
@@ -183,7 +183,7 @@ class AgentContextManager:
 
     def pending_checkpoint(self, scope: ContextScope) -> ContextCheckpoint | None:
         """Return unsaved reduction metadata, if this view changed semantically."""
-        state = self._synchronized_state(scope)
+        state = self._synchronized_state(scope.scope_id)
         if not state.reduction_dirty:
             return None
         return ContextCheckpoint(
@@ -201,7 +201,7 @@ class AgentContextManager:
         self, scope: ContextScope, checkpoint: ContextCheckpoint
     ) -> None:
         """Acknowledge a storage-owned successful checkpoint transaction."""
-        state = self._synchronized_state(scope)
+        state = self._synchronized_state(scope.scope_id)
         pending = self.pending_checkpoint(scope)
         if pending is None or replace(checkpoint, revision=pending.revision) != pending:
             raise ContextViewError("Saved context checkpoint does not match current view")
@@ -265,7 +265,7 @@ class AgentContextManager:
         constraints: tuple[str, ...] = (),
     ) -> ContextView:
         """Snapshot the incrementally maintained bounded model view."""
-        state = self._synchronized_state(run.context_scope)
+        state = self._synchronized_state(run.context_scope_id)
         exact = ExactContext(
             goal=run.goal,
             workspace=str(session.workspace),
@@ -320,7 +320,7 @@ class AgentContextManager:
             self.build(session, run),
             tools,
             self.estimator,
-            self._synchronized_state(run.context_scope).token_measurement,
+            self._synchronized_state(run.context_scope_id).token_measurement,
         )
 
     def record_usage(
@@ -330,16 +330,16 @@ class AgentContextManager:
         """Calibrate the next request from this response's measured token counts."""
         measurement = measure_model_turn(context, tools, turn, self.estimator)
         if measurement is not None:
-            state = self._synchronized_state(scope)
+            state = self._synchronized_state(scope.scope_id)
             state.token_measurement = measurement
             state.reduction_dirty = True
 
     def mask_oldest_stale_result(self, scope: ContextScope) -> bool:
         """Incrementally mask one oldest result outside protected recent context."""
-        return mask_oldest_stale_result(self._synchronized_state(scope))
+        return mask_oldest_stale_result(self._synchronized_state(scope.scope_id))
 
-    def _synchronized_state(self, scope: ContextScope) -> ManagedContextState:
-        state = self._states.get(scope.scope_id)
+    def _synchronized_state(self, scope_id: str) -> ManagedContextState:
+        state = self._states.get(scope_id)
         if state is None:
             return ManagedContextState(
                 max_tool_result_tokens=self.policy.max_tool_result_tokens

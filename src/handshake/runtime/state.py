@@ -286,11 +286,6 @@ class Run:
         if not self.work_items:
             self.work_items.append(WorkItem(description=self.goal))
 
-    @property
-    def context_scope(self) -> ContextScope:
-        """Reference the stream identity; load persisted scope for its current tail."""
-        return ContextScope(scope_id=self.context_scope_id, session_id=self.session_id)
-
     def transition(self, target: RunStatus) -> None:
         if target not in _RUN_TRANSITIONS[self.status]:
             raise InvalidStateTransitionError(

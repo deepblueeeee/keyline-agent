@@ -19,7 +19,7 @@ def _message(run: Run, text: str) -> ModelMessage:
 
 def _restore(manager: AgentContextManager, store: RunStore, run: Run) -> None:
     manager.restore(
-        run.context_scope,
+        store.load_context_scope(run.context_scope_id),
         store.load_context_checkpoint(run.context_scope_id),
         store.message_count(run.context_scope_id),
         lambda start, end: store.read_messages(run.context_scope_id, start, end),
@@ -45,7 +45,8 @@ def test_child_run_has_empty_private_history_and_checkpoint(tmp_path: Path) -> N
     store.create_run(session, child, (_message(child, "child goal"),))
 
     assert child.previous_run_id is None
-    assert store.load_context_scope(child.context_scope_id).tail_run_id == child.run_id
+    assert store.load_context_scope(child.context_scope_id).is_tail(child)
+    assert store.load_context_scope(parent.context_scope_id).is_tail(parent)
     assert store.load_session(session.session_id).context_scope.tail_run_id == parent.run_id
     assert store.load_run(child.run_id).parent_run_id == parent.run_id
     assert store.load_run(child.run_id).agent_spec_id == "reader"
@@ -70,8 +71,8 @@ def test_child_run_has_empty_private_history_and_checkpoint(tmp_path: Path) -> N
     manager = AgentContextManager()
     _restore(manager, store, parent)
     _restore(manager, store, child)
-    assert manager.is_initialized(parent.context_scope)
-    assert manager.is_initialized(child.context_scope)
+    assert manager.is_initialized(store.load_context_scope(parent.context_scope_id))
+    assert manager.is_initialized(store.load_context_scope(child.context_scope_id))
     assert [item.content[0]["text"] for item in manager.build(session, parent).messages] == [
         "parent private history",
         "parent continued",
@@ -113,7 +114,7 @@ def test_followup_reuses_main_context_scope_without_copying(tmp_path: Path) -> N
         first.run_id,
         second.run_id,
     ]
-    store.append_messages(second.context_scope_id, (_message(second, "second continued"),))
+    store.checkpoint_run(session, second, (_message(second, "second continued"),))
     assert store.message_count(first.context_scope_id) == 3
     assert store.message_count(second.context_scope_id) == 3
     assert store.load_context_checkpoint(first.context_scope_id) == checkpoint
@@ -127,8 +128,8 @@ def test_followup_reuses_main_context_scope_without_copying(tmp_path: Path) -> N
 
     manager = AgentContextManager()
     _restore(manager, store, first)
-    assert manager.is_initialized(second.context_scope)
-    assert manager.message_count(second.context_scope) == 3
+    assert manager.is_initialized(store.load_context_scope(second.context_scope_id))
+    assert manager.message_count(store.load_context_scope(second.context_scope_id)) == 3
     assert [item.content[0]["text"] for item in manager.build(session, second).messages] == [
         "first history",
         "second goal",

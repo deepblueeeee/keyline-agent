@@ -249,6 +249,9 @@ def _prepare_model_context(
     context_manager: AgentContextManager,
 ) -> ModelContext:
     """Prepare a view and durably save only newly reduced projection state."""
+    scope = store.load_context_scope(run.context_scope_id)
+    if not scope.is_tail(run):
+        raise AgentLoopError("Only the context scope tail run can make model requests")
     try:
         return context_manager.prepare(
             session,
@@ -259,7 +262,6 @@ def _prepare_model_context(
             ),
         )
     finally:
-        scope = store.load_context_scope(run.context_scope_id)
         checkpoint = context_manager.pending_checkpoint(scope)
         if checkpoint is not None:
             saved = store.save_context_checkpoint(run.context_scope_id, checkpoint)

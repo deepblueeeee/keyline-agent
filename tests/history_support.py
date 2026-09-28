@@ -33,13 +33,13 @@ def register_run(
 
 def ingest(
     manager: AgentContextManager,
-    run: Run,
+    session: Session,
     messages: list[ModelMessage] | tuple[ModelMessage, ...],
     *,
     start: int = 0,
 ) -> None:
     manager.ingest_messages(
-        run.context_scope,
+        session.context_scope,
         tuple(
             SequencedMessage(start + index, message)
             for index, message in enumerate(messages)

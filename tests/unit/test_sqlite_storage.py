@@ -134,13 +134,13 @@ def test_messages_are_append_only_and_support_range_queries(tmp_path: Path) -> N
     store.create_run(session, run)
 
     first = tuple(messages[:2])
-    first_appended = store.append_messages(run.context_scope_id, first)
+    first_appended = store.checkpoint_run(session, run, first)
     with sqlite3.connect(database) as connection:
         original_rows = connection.execute(
             "SELECT sequence, content_json FROM messages ORDER BY sequence"
         ).fetchall()
 
-    second_appended = store.append_messages(run.context_scope_id, (messages[2],))
+    second_appended = store.checkpoint_run(session, run, (messages[2],))
 
     assert [item.sequence for item in first_appended] == [0, 1]
     assert [item.message for item in first_appended] == list(first)
@@ -194,8 +194,9 @@ def test_context_checkpoint_is_small_separate_metadata_with_revision_cas(
     with pytest.raises(StorageError, match="revision is stale"):
         store.save_context_checkpoint(run.context_scope_id, checkpoint)
 
-    store.append_messages(
-        run.context_scope_id,
+    store.checkpoint_run(
+        session,
+        run,
         (ModelMessage("user", ({"type": "text", "text": "suffix"},), run.run_id),),
     )
     with pytest.raises(StorageError, match="current transcript tail"):

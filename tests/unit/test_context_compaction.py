@@ -77,7 +77,7 @@ def setup(
         protected_recent_messages=1, protected_recent_tokens=0,
     ), **policy)
     manager = AgentContextManager(budget, Characters(), condenser)
-    ingest(manager, run, messages)
+    ingest(manager, session, messages)
     return manager, session, run
 
 
@@ -114,7 +114,7 @@ def test_frontier_background_suffix_and_incremental_growth(tmp_path: Path) -> No
     assert _messages(session) == original
     assert view.protected_recent.messages[0].message == original[6]
     _messages(session).append(ModelMessage("user", ({"type": "text", "text": "new"},)))
-    ingest(manager, run, _messages(session)[-1:], start=7)
+    ingest(manager, session, _messages(session)[-1:], start=7)
     _prepare(manager, session, run)
     target = condenser.calls[3][2]
     assert isinstance(target, tuple)
@@ -188,7 +188,7 @@ def test_masked_success_and_full_failure_and_durable_history(
         replace(message, run_id=run.run_id) for message in _messages(session)
     ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    ingest(manager, run, _messages(session))
+    ingest(manager, session, _messages(session))
     original = deepcopy(_messages(session))
     store = fresh_store(tmp_path, session)
     store.create_run(session, run, tuple(original))
@@ -209,7 +209,7 @@ def test_candidate_budget_and_tool_round_boundaries(tmp_path: Path) -> None:
         ModelMessage("user", ({"type": "text", "text": "recent"},)),
     ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    ingest(manager, run, _messages(session))
+    ingest(manager, session, _messages(session))
     _prepare(manager, session, run)
     assert all(isinstance(s, RawHistorySegment) for s in manager.capture(session, run).history)
     assert len(condenser.calls) == 1
@@ -266,7 +266,7 @@ def test_masking_reaches_target_without_condenser(tmp_path: Path) -> None:
         ModelMessage("user", ({"type": "text", "text": "recent"},)),
     ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    ingest(manager, run, _messages(session))
+    ingest(manager, session, _messages(session))
     _prepare(manager, session, run)
     assert not condenser.calls
     assert manager.measure_pressure(session, run, ()) <= 7500
@@ -342,7 +342,7 @@ def test_loop_persists_compaction_and_restart_restores_without_llm(tmp_path: Pat
     restored_condenser = Condenser()
     restored = AgentContextManager(manager.policy, Characters(), restored_condenser)
     restored.restore(
-        run.context_scope,
+        session.context_scope,
         checkpoint,
         store.message_count(run.context_scope_id),
         lambda start, end: store.read_messages(run.context_scope_id, start, end),
@@ -389,7 +389,7 @@ def test_multiple_results_repeated_ids_restore_by_sequence_and_block(tmp_path: P
         ModelMessage("user", ({"type": "text", "text": "recent"},)),
     ]
     manager = AgentContextManager(manager.policy, Characters(), condenser)
-    ingest(manager, run, _messages(session))
+    ingest(manager, session, _messages(session))
     _prepare(manager, session, run)
     target = condenser.calls[0][2]
     assert isinstance(target, tuple)

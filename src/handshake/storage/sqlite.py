@@ -528,20 +528,6 @@ class SQLiteStateStore(RunStore):
         )
         return appended
 
-    def append_messages(
-        self, scope_id: str, messages: tuple[ModelMessage, ...]
-    ) -> tuple[SequencedMessage, ...]:
-        """Append a batch without replacing any existing transcript rows."""
-        try:
-            with self._connect() as connection:
-                if connection.execute(
-                    "SELECT 1 FROM context_scopes WHERE scope_id = ?", (scope_id,)
-                ).fetchone() is None:
-                    raise StorageError(f"Context scope not found: {scope_id}")
-                return self._append_messages(connection, scope_id, messages)
-        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
-            raise _storage_error(exc) from None
-
     def read_messages(
         self, scope_id: str, start: int = 0, end: int | None = None
     ) -> Iterator[SequencedMessage]:

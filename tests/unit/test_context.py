@@ -41,7 +41,7 @@ def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> 
     original_messages = list(messages)
     original_plan = list(run.plan)
     manager = AgentContextManager()
-    ingest(manager, run, messages)
+    ingest(manager, session, messages)
 
     context = manager.build(session, run)
 
@@ -83,7 +83,7 @@ def test_build_is_read_only_and_requires_explicit_ingress(tmp_path: Path) -> Non
     ]
     assert manager.build(session, run) == first
 
-    ingest(manager, run, messages)
+    ingest(manager, session, messages)
     original_messages = deepcopy(messages)
     second = manager.build(session, run)
     third = manager.build(session, run)
@@ -110,7 +110,7 @@ def test_capture_preserves_exact_state_and_sequences_complete_history(
             ModelMessage("assistant", ({"type": "text", "text": "response"},), "prior"),
         ]
     manager = AgentContextManager()
-    ingest(manager, run, messages)
+    ingest(manager, session, messages)
     view = manager.capture(
         session,
         run,
@@ -145,7 +145,7 @@ def test_capture_and_render_do_not_alias_session_history(tmp_path: Path) -> None
         )
     ]
     manager = AgentContextManager()
-    ingest(manager, run, messages)
+    ingest(manager, session, messages)
     view = manager.capture(session, run)
     context = manager.render(view)
 

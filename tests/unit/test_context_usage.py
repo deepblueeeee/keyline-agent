@@ -138,7 +138,7 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
 
     restored = AgentContextManager()
     restored.restore(
-        run.context_scope,
+        session.context_scope,
         checkpoint,
         store.message_count(run.context_scope_id),
         lambda start, end: store.read_messages(run.context_scope_id, start, end),
@@ -181,11 +181,11 @@ def test_low_actual_usage_avoids_unnecessary_compaction(tmp_path: Path) -> None:
     run = Run(goal="continue", session_id=session.session_id)
     policy = ContextBudgetPolicy(context_window_tokens=1000, reserved_output_tokens=0)
     manager = AgentContextManager(policy)
-    ingest(manager, run, (text_message("x" * 10000),))
+    ingest(manager, session, (text_message("x" * 10000),))
     context = manager.build(session, run)
     turn = ModelTurn(({"type": "text", "text": "reply"},), usage=ModelUsage(100, 10))
-    manager.record_usage(run.context_scope, context, (), turn)
-    ingest(manager, run, (text_message("reply", "assistant"),), start=1)
+    manager.record_usage(session.context_scope, context, (), turn)
+    ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     assert estimate_model_context(manager.build(session, run), (), manager.estimator) > 1000
     assert manager.measure_pressure(session, run, ()) == 110
     assert manager.prepare(session, run, ()).messages == manager.build(session, run).messages
@@ -224,11 +224,11 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
     )
     condenser = Condenser()
     manager = AgentContextManager(policy, condenser=condenser)
-    ingest(manager, run, (text_message("x" * 2000),))
+    ingest(manager, session, (text_message("x" * 2000),))
     context = manager.build(session, run)
     turn = ModelTurn(({"type": "text", "text": "reply"},), usage=ModelUsage(8900, 100))
-    manager.record_usage(run.context_scope, context, (), turn)
-    ingest(manager, run, (text_message("reply", "assistant"),), start=1)
+    manager.record_usage(session.context_scope, context, (), turn)
+    ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     assert estimate_model_context(manager.build(session, run), (), manager.estimator) < 5000
     assert manager.measure_pressure(session, run, ()) == 9000
     prepared = manager.prepare(session, run, ())
@@ -248,10 +248,10 @@ def test_actual_usage_enforces_hard_limit_for_protected_context(tmp_path: Path) 
             reserved_output_tokens=0,
         )
     )
-    ingest(manager, run, (text_message("history"),))
+    ingest(manager, session, (text_message("history"),))
     context = manager.build(session, run)
     turn = ModelTurn(({"type": "text", "text": "reply"},), usage=ModelUsage(9990, 10))
-    manager.record_usage(run.context_scope, context, (), turn)
-    ingest(manager, run, (text_message("reply", "assistant"),), start=1)
+    manager.record_usage(session.context_scope, context, (), turn)
+    ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     with pytest.raises(ContextPressureError):
         manager.prepare(session, run, ())

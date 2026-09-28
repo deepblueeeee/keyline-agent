@@ -73,8 +73,8 @@ def _capture_after_ingress(
     session: Session,
     run: Run,
 ) -> ContextView:
-    start = manager.message_count(run.context_scope)
-    ingest(manager, run, _messages(session)[start:], start=start)
+    start = manager.message_count(session.context_scope)
+    ingest(manager, session, _messages(session)[start:], start=start)
     return manager.capture(session, run)
 
 
@@ -84,13 +84,13 @@ def _apply_pressure(
     run: Run,
     tools: tuple[ToolDefinition, ...] = (),
 ) -> ContextView:
-    start = manager.message_count(run.context_scope)
-    ingest(manager, run, _messages(session)[start:], start=start)
+    start = manager.message_count(session.context_scope)
+    ingest(manager, session, _messages(session)[start:], start=start)
     pressure = manager.measure_pressure(session, run, tools)
     if pressure >= manager.policy.pressure_trigger_tokens:
         while (
             pressure > manager.policy.pressure_target_tokens
-            and manager.mask_oldest_stale_result(run.context_scope)
+            and manager.mask_oldest_stale_result(session.context_scope)
         ):
             pressure = manager.measure_pressure(session, run, tools)
     manager.ensure_below_hard_limit(pressure)
@@ -291,14 +291,14 @@ def test_pressure_measurement_does_not_execute_masking(tmp_path: Path) -> None:
         ),
         CharacterTokenEstimator(),
     )
-    ingest(manager, run, _messages(session))
+    ingest(manager, session, _messages(session))
 
     pressure = manager.measure_pressure(session, run, ())
     before = manager.build(session, run)
 
     assert pressure >= manager.policy.pressure_trigger_tokens
     assert before.messages[1].content[0]["content"] == "x" * 2_000
-    assert manager.mask_oldest_stale_result(run.context_scope)
+    assert manager.mask_oldest_stale_result(session.context_scope)
     assert "stale tool result masked" in manager.build(session, run).messages[1].content[0][
         "content"
     ]
@@ -557,27 +557,27 @@ def test_new_manager_rebuilds_masking_state_from_raw_sqlite_history(
         CharacterTokenEstimator(),
     )
     _messages(session).extend(_tool_round(run.run_id, "shell", "run_shell", "raw-output"))
-    ingest(manager, run, _messages(session))
+    ingest(manager, session, _messages(session))
     _messages(session).append(
         ModelMessage("user", ({"type": "text", "text": "z" * 6_000},), run.run_id),
     )
-    ingest(manager, run, _messages(session)[2:], start=2)
+    ingest(manager, session, _messages(session)[2:], start=2)
     store.create_run(session, run, tuple(_messages(session)))
 
     pressure = manager.measure_pressure(session, run, ())
     assert pressure >= manager.policy.pressure_trigger_tokens
-    assert manager.mask_oldest_stale_result(run.context_scope)
+    assert manager.mask_oldest_stale_result(session.context_scope)
     store.checkpoint_run(session, run)
 
     loaded_session = store.load_session(session.session_id)
     loaded_run = store.load_run(run.run_id)
     restored = AgentContextManager(manager.policy, manager.estimator)
     restored.ingest_messages(
-        loaded_run.context_scope, store.read_messages(loaded_run.context_scope_id)
+        loaded_session.context_scope, store.read_messages(loaded_run.context_scope_id)
     )
     restored_pressure = restored.measure_pressure(loaded_session, loaded_run, ())
     assert restored_pressure >= restored.policy.pressure_trigger_tokens
-    assert restored.mask_oldest_stale_result(loaded_run.context_scope)
+    assert restored.mask_oldest_stale_result(loaded_session.context_scope)
     context = restored.build(loaded_session, loaded_run)
     assert "stale tool result masked" in context.messages[1].content[0]["content"]
     assert history(store, loaded_session)[1].content[0]["content"] == "raw-output"

@@ -33,12 +33,6 @@ class RunStore(Protocol):
         """Restore a stream and its current tail run."""
         ...
 
-    def append_messages(
-        self, scope_id: str, messages: tuple[ModelMessage, ...]
-    ) -> tuple[SequencedMessage, ...]:
-        """Append messages to one ContextScope and return durable sequences."""
-        ...
-
     def read_messages(
         self, scope_id: str, start: int = 0, end: int | None = None
     ) -> Iterator[SequencedMessage]:
