@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import handshake.cli as cli
+import handshake.runtime.loop as runtime_loop
 from handshake.config import credentials as provider_credentials
 from handshake.config.approval import ApprovalMode
 from handshake.context import AgentContextManager
@@ -258,7 +259,7 @@ def test_run_uses_configured_provider_and_context_budgets(
         return context_manager(*args, **kwargs)
 
     monkeypatch.setattr(cli, "DeepSeekAnthropicModel", model_factory)
-    monkeypatch.setattr(cli, "AgentContextManager", manager_factory)
+    monkeypatch.setattr(runtime_loop, "AgentContextManager", manager_factory)
 
     assert cli.main(["run", str(tmp_path), "inspect the repository"]) == 0
 
@@ -266,7 +267,6 @@ def test_run_uses_configured_provider_and_context_budgets(
     assert policies[0].context_window_tokens == 32768
     assert policies[0].reserved_output_tokens == 4096
     assert policies[0].condenser_input_tokens == 28672
-    assert _store(home).list_runs()[0].agent_spec_id == "main"
 
 
 def test_resume_reloads_context_configuration(
@@ -281,7 +281,14 @@ def test_resume_reloads_context_configuration(
         "[context]\ncontext_window_tokens = 131072\n", encoding="utf-8"
     )
     monkeypatch.setenv("HANDSHAKE_HOME", str(home))
-    monkeypatch.setattr(cli, "_create_real_model", lambda _name: _WaitThenFinishModel())
+    monkeypatch.setenv("DEEPSEEK_MODEL", "old-model")
+    model_names: list[str] = []
+
+    def create_model(name: str) -> _WaitThenFinishModel:
+        model_names.append(name)
+        return _WaitThenFinishModel()
+
+    monkeypatch.setattr(cli, "_create_real_model", create_model)
     monkeypatch.setattr(sys, "stdin", _TTY(False))
     policies: list[Any] = []
     context_manager = AgentContextManager
@@ -290,13 +297,16 @@ def test_resume_reloads_context_configuration(
         policies.append(kwargs.get("policy"))
         return context_manager(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "AgentContextManager", manager_factory)
+    monkeypatch.setattr(runtime_loop, "AgentContextManager", manager_factory)
 
     assert cli.main(["run", str(tmp_path), "style the button"]) == 2
-    session_id = _store(home).list_sessions()[0].session_id
+    stored_run = _store(home).list_runs()[0]
+    assert stored_run.agent_spec_id == "main"
+    session_id = stored_run.session_id
     config_path.write_text(
         "[context]\ncontext_window_tokens = 65536\n", encoding="utf-8"
     )
+    monkeypatch.setenv("DEEPSEEK_MODEL", "new-model")
     monkeypatch.setattr(sys, "stdin", _TTY(True))
     monkeypatch.setattr(
         "builtins.input",
@@ -305,6 +315,8 @@ def test_resume_reloads_context_configuration(
 
     assert cli.main(["resume", session_id]) == 0
     assert [policy.context_window_tokens for policy in policies] == [131072, 65536]
+    assert model_names == ["old-model", "new-model"]
+    assert _store(home).load_run(stored_run.run_id).model_name == "new-model"
 
 
 def test_config_set_api_key_uses_hidden_input_without_echo_or_session(

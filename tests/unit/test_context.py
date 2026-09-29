@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from handshake.context import (
 )
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import Dependency, DependencyKind, Run, Session
+from handshake.tools import TEXT_WAIT_TOOL
 from tests.history_support import ingest
 
 
@@ -40,7 +42,7 @@ def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> 
         ]
     original_messages = list(messages)
     original_plan = list(run.plan)
-    manager = AgentContextManager()
+    manager = AgentContextManager(scope_id=run.context_scope_id)
     ingest(manager, session, messages)
 
     context = manager.build(session, run)
@@ -49,13 +51,14 @@ def test_build_preserves_state_and_includes_complete_context(tmp_path: Path) -> 
     assert context.workspace == str(tmp_path)
     assert context.plan == ()
     assert context.messages == tuple(original_messages)
-    assert "Optional current plan:\n(none)" in context.system_prompt
-    assert "Investigate enough repository context" in context.system_prompt
-    assert "Simple requests may be completed without creating a plan." in context.system_prompt
-    assert "Treat the plan as provisional" in context.system_prompt
-    assert "list_files/search_files" in context.system_prompt
-    assert "prefer edit_file" in context.system_prompt
-    assert "Keep a short current plan" not in context.system_prompt
+    assert context.system_prompt.startswith("Harness protocol\n")
+    assert "\n\nAgent instructions\n(none)\n\nRuntime state\n" in context.system_prompt
+    state = json.loads(context.system_prompt.split("\n\nRuntime state\n", 1)[1])
+    assert state["goal"] == run.goal
+    assert state["workspace"] == str(tmp_path)
+    assert state["plan"] == []
+    assert "wait_for_text" not in context.system_prompt
+    assert "read_file" not in context.system_prompt
     assert messages == original_messages
     assert run.plan == original_plan
 
@@ -67,9 +70,48 @@ def test_build_renders_current_plan(tmp_path: Path) -> None:
     context = AgentContextManager().build(session, run)
 
     assert context.plan == ("Inspect the implementation", "Run focused tests")
-    assert (
-        "Optional current plan:\n- Inspect the implementation\n- Run focused tests"
-    ) in context.system_prompt
+    state = json.loads(context.system_prompt.split("\n\nRuntime state\n", 1)[1])
+    assert state["plan"] == ["Inspect the implementation", "Run focused tests"]
+
+
+def test_tool_protocol_notes_follow_visible_tools_and_agent_instructions(tmp_path: Path) -> None:
+    session, run = _session_run(tmp_path)
+    manager = AgentContextManager()
+    context = manager.prepare(
+        session,
+        run,
+        (TEXT_WAIT_TOOL,),
+        instructions="Review the patch for regressions.",
+    )
+
+    assert "Agent instructions\nReview the patch for regressions." in context.system_prompt
+    assert "wait_for_text" in context.system_prompt
+    assert "wait_for_secret" not in context.system_prompt
+    assert "read_file" not in context.system_prompt
+    assert "update_plan" not in context.system_prompt
+
+    other_session, other_run = _session_run(tmp_path / "other")
+    with pytest.raises(ContextViewError, match="belongs to scope"):
+        manager.prepare(
+            other_session,
+            other_run,
+            (),
+            instructions="Explore the repository structure.",
+        )
+    other_manager = AgentContextManager(scope_id=other_run.context_scope_id)
+    other = other_manager.prepare(
+        other_session,
+        other_run,
+        (),
+        instructions="Explore the repository structure.",
+    )
+    assert "Explore the repository structure." in other.system_prompt
+    assert "Review the patch" not in other.system_prompt
+    assert "wait_for_text" not in other.system_prompt
+    assert manager.build(
+        session, run, (TEXT_WAIT_TOOL,),
+        instructions="Review the patch for regressions.",
+    ) == context
 
 
 def test_build_is_read_only_and_requires_explicit_ingress(tmp_path: Path) -> None:

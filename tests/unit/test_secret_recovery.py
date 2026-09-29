@@ -17,6 +17,7 @@ from handshake.runtime.state import (
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.secret_command import SecretCommandRunner
+from tests.history_support import TEST_AGENT_SPEC
 
 
 def _secret_wait_turn() -> ModelTurn:
@@ -56,6 +57,7 @@ def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> N
         ScriptedModel([_secret_wait_turn()]),
         create_default_registry(lambda _cwd, _argv: True),
         store=state_store,
+        agent_spec=TEST_AGENT_SPEC,
     )
     requested_snapshot = state_store.load_run(run.run_id)
     assert requested_snapshot.status is RunStatus.WAITING

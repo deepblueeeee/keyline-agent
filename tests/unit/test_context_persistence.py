@@ -73,7 +73,7 @@ def test_restore_skips_episode_sources_and_streams_incremental_suffix(
     assert reads == [(4, 7)]
     assert view.history[0] == checkpoint.episodes[0]
     assert isinstance(view.history[1], RawHistorySegment)
-    assert tuple(manager._states[run.context_scope_id].messages) == (4, 5, 6)
+    assert tuple(manager._synchronized_state(run.context_scope_id).messages) == (4, 5, 6)
     assert manager.pending_checkpoint(session.context_scope) is None
 
 

@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from handshake.config import (
@@ -23,16 +23,28 @@ from handshake.config import (
     save_deepseek_api_key,
     settings_path,
 )
-from handshake.context import AgentContextManager, ContextBudgetPolicy, LLMHistoryCondenser
+from handshake.config.settings import RuntimeSettings
+from handshake.context import ActiveContextManagers, AgentContextManager
 from handshake.errors import HandshakeError
 from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
+from handshake.runtime.agents import (
+    AgentSpec,
+    demo_agent_spec,
+    main_agent_spec,
+    model_name_for_run,
+)
 from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.errors import UserCancelledError
-from handshake.runtime.loop import continue_run, prepare_run_for_resume, start_run
+from handshake.runtime.errors import AgentLoopError, UserCancelledError
+from handshake.runtime.loop import (
+    context_manager_for_run,
+    continue_run,
+    prepare_run_for_resume,
+    start_run,
+)
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.runs import (
     create_followup_run,
@@ -48,12 +60,34 @@ from handshake.runtime.state import (
     Session,
 )
 from handshake.storage import SQLiteStateStore, StorageError
-from handshake.tools import create_default_registry
+from handshake.tools import create_default_registry, runtime_tool_definitions
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
 from handshake.tools.shell import ApprovalCallback
 
 _WAITING_EXIT_CODE = 2
+
+def _agent_specs(settings: RuntimeSettings, registry: ToolRegistry) -> dict[str, AgentSpec]:
+    main = main_agent_spec(
+        settings.provider.model,
+        (
+            definition.name
+            for definition in (*runtime_tool_definitions(), *registry.definitions())
+        ),
+        settings.context,
+    )
+    return {
+        main.spec_id: main,
+    }
+
+
+def _spec_for_run(run: Run, specs: Mapping[str, AgentSpec]) -> AgentSpec:
+    try:
+        spec = specs[run.agent_spec_id]
+    except KeyError:
+        raise AgentLoopError(f"Agent spec {run.agent_spec_id} is unavailable") from None
+    model_name_for_run(run, spec)
+    return spec
 
 
 def _interactive_approval(
@@ -205,6 +239,7 @@ def _drive_run(
     store: RunStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
+    agent_spec: AgentSpec,
     context_manager: AgentContextManager | None = None,
 ) -> tuple[int, Run]:
     while run.status is RunStatus.WAITING:
@@ -247,6 +282,7 @@ def _drive_run(
             store=store,
             secret_command_runner=secret_command_runner,
             context_manager=context_manager,
+            agent_spec=agent_spec,
             pending_messages=(continuation,),
         )
     if run.status is not RunStatus.COMPLETED:
@@ -298,17 +334,20 @@ def _process_current_run(
     store: RunStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
+    agent_specs: Mapping[str, AgentSpec],
+    context_managers: ActiveContextManagers,
     model: ModelAdapter | None = None,
-    context_manager: AgentContextManager | None = None,
 ) -> tuple[int, Run]:
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         return _print_terminal_run(run), run
     if run.status not in {RunStatus.CREATED, RunStatus.WAITING}:
         return _print_terminal_run(run), run
 
-    current_model = model or _create_real_model(run.model_name)
-    current_context = context_manager or AgentContextManager()
-    current_context.condenser = LLMHistoryCondenser(current_model)
+    agent_spec = _spec_for_run(run, agent_specs)
+    current_model = model or _create_real_model(model_name_for_run(run, agent_spec))
+    current_context = context_manager_for_run(
+        context_managers, run, agent_spec, current_model
+    )
     try:
         if run.status is RunStatus.CREATED:
             run = start_run(
@@ -320,6 +359,7 @@ def _process_current_run(
                 store=store,
                 secret_command_runner=secret_command_runner,
                 context_manager=current_context,
+                agent_spec=agent_spec,
             )
         return _drive_run(
             session,
@@ -329,6 +369,7 @@ def _process_current_run(
             store,
             secret_writer,
             secret_command_runner,
+            agent_spec,
             current_context,
         )
     except UserCancelledError:
@@ -350,10 +391,10 @@ def _drive_session(
     store: RunStore,
     secret_writer: SecretWriter,
     secret_command_runner: SecretCommandRunner,
+    agent_specs: Mapping[str, AgentSpec],
     initial_model: ModelAdapter | None = None,
-    context_policy: ContextBudgetPolicy | None = None,
 ) -> int:
-    context_manager = AgentContextManager(policy=context_policy)
+    context_managers = ActiveContextManagers()
     result_code, run = _process_current_run(
         session,
         run,
@@ -361,8 +402,9 @@ def _drive_session(
         store,
         secret_writer,
         secret_command_runner,
+        agent_specs,
+        context_managers,
         initial_model,
-        context_manager,
     )
     if result_code == _WAITING_EXIT_CODE or not sys.stdin.isatty():
         return result_code
@@ -380,7 +422,8 @@ def _drive_session(
             store,
             secret_writer,
             secret_command_runner,
-            context_manager=context_manager,
+            agent_specs,
+            context_managers,
         )
         if result_code == _WAITING_EXIT_CODE:
             return result_code
@@ -392,20 +435,23 @@ def _run_real(args: argparse.Namespace) -> int:
         raise HandshakeError(f"Repository directory does not exist: {workspace}")
     settings = load_runtime_settings(model_override=args.model)
     _announce_approval_mode(settings.approval_mode)
-    model = _create_real_model(settings.provider.model)
     store = _state_store()
     session = Session(workspace=workspace)
+    approval = _approval_callback(settings.approval_mode)
+    registry = create_default_registry(approval)
+    main_spec = _agent_specs(settings, registry)["main"]
+    model = _create_real_model(main_spec.model_name)
     run = create_initial_run(
         session,
         args.request,
-        model_name=settings.provider.model,
-        max_steps=args.max_steps,
-        agent_spec_id="main",
+        model_name=main_spec.model_name,
+        max_steps=(
+            main_spec.default_max_steps if args.max_steps is None else args.max_steps
+        ),
+        agent_spec_id=main_spec.spec_id,
     )
     store.create_session(session)
     print(f"Session created: {session.session_id}")
-    approval = _approval_callback(settings.approval_mode)
-    registry = create_default_registry(approval)
     secret_writer, secret_command_runner = _create_secret_capabilities(
         _approval_callback(settings.approval_mode, with_secret=True)
     )
@@ -416,8 +462,8 @@ def _run_real(args: argparse.Namespace) -> int:
         store,
         secret_writer,
         secret_command_runner,
+        {main_spec.spec_id: main_spec},
         model,
-        settings.context,
     )
 
 
@@ -427,7 +473,7 @@ def _resume_session(args: argparse.Namespace) -> int:
     if not session.workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
     run = latest_run(session, store.list_runs(session.session_id))
-    settings = load_runtime_settings(model_override=run.model_name)
+    settings = load_runtime_settings()
     _announce_approval_mode(settings.approval_mode)
     approval = _approval_callback(settings.approval_mode)
     registry = create_default_registry(approval)
@@ -448,7 +494,7 @@ def _resume_session(args: argparse.Namespace) -> int:
         store,
         secret_writer,
         secret_command_runner,
-        context_policy=settings.context,
+        _agent_specs(settings, registry),
     )
 
 
@@ -625,16 +671,23 @@ def _run_demo(_args: argparse.Namespace) -> int:
         shutil.copytree(fixture, workspace)
         print(f"Running isolated scripted demo in {workspace}")
         session = Session(workspace=workspace)
+        registry = create_default_registry(lambda _cwd, _argv: True)
+        demo_spec = demo_agent_spec(
+            definition.name
+            for definition in (*runtime_tool_definitions(), *registry.definitions())
+        )
         run = Run(
             goal="Implement the missing calculator.add function",
             session_id=session.session_id,
-            agent_spec_id="demo",
-            model_name="scripted",
+            agent_spec_id=demo_spec.spec_id,
+            model_name=demo_spec.model_name,
         )
-        registry = create_default_registry(lambda _cwd, _argv: True)
         store = SQLiteStateStore(Path(temporary) / "demo.db")
         store.create_session(session)
-        start_run(session, run, _demo_model(), registry, emit=print, store=store)
+        start_run(
+            session, run, _demo_model(), registry,
+            emit=print, store=store, agent_spec=demo_spec,
+        )
         _print_final_summary(run)
         return 0
 
@@ -682,7 +735,7 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         help="DeepSeek model name",
     )
-    run_parser.add_argument("--max-steps", type=int, default=50)
+    run_parser.add_argument("--max-steps", type=int)
     run_parser.set_defaults(handler=_run_real)
 
     resume_parser = subparsers.add_parser("resume", help="resume a durable session")

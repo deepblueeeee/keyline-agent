@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from handshake.context import (
+    ActiveContextManagers,
     AgentContextManager,
     ContextPressureError,
     LLMHistoryCondenser,
@@ -15,6 +16,7 @@ from handshake.errors import HandshakeError
 from handshake.models.base import ModelAdapter, ToolDefinition
 from handshake.models.errors import ModelProtocolError
 from handshake.models.protocol import ModelContext, ModelMessage, ToolCall
+from handshake.runtime.agents import AgentSpec, model_name_for_run
 from handshake.runtime.errors import (
     AgentLoopError,
     StepLimitExceededError,
@@ -48,6 +50,24 @@ from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
 
 EmitCallback = Callable[[str], None]
+
+
+def context_manager_for_run(
+    active: ActiveContextManagers,
+    run: Run,
+    agent_spec: AgentSpec,
+    model: ModelAdapter,
+) -> AgentContextManager:
+    """Configure the manager owned by this run's context stream."""
+    manager = active.get(run.context_scope_id)
+    if manager is None:
+        manager = AgentContextManager(
+            policy=agent_spec.default_budget,
+            scope_id=run.context_scope_id,
+        )
+        active.register(run.context_scope_id, manager)
+    manager.condenser = LLMHistoryCondenser(model)
+    return manager
 
 
 def _result_content(result: ToolResult) -> str:
@@ -245,6 +265,7 @@ def _prepare_model_context(
     session: Session,
     run: Run,
     tools: tuple[ToolDefinition, ...],
+    instructions: str,
     store: RunStore,
     context_manager: AgentContextManager,
 ) -> ModelContext:
@@ -257,6 +278,7 @@ def _prepare_model_context(
             session,
             run,
             tools,
+            instructions=instructions,
             raw_message_reader=lambda scope_id, sequence: _read_raw_message(
                 store, scope_id, sequence
             ),
@@ -369,8 +391,13 @@ def _run_turns(
     emit: EmitCallback,
     store: RunStore,
     context_manager: AgentContextManager,
+    agent_spec: AgentSpec,
 ) -> Run:
-    definitions = (*runtime_tool_definitions(), *registry.definitions())
+    definitions = tuple(
+        definition
+        for definition in (*runtime_tool_definitions(), *registry.definitions())
+        if definition.name in agent_spec.allowed_tools
+    )
     while True:
         pending_messages: list[ModelMessage] = []
         messages_after_checkpoint: list[str] = []
@@ -382,13 +409,18 @@ def _run_turns(
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
             context = _prepare_model_context(
-                session, run, definitions, store, context_manager
+                session, run, definitions, agent_spec.instructions, store, context_manager
             )
             turn = model.complete(context, definitions)
             run.model_turns += 1
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
             _validate_turn_tool_calls(turn.content, turn.tool_calls)
+            for call in turn.tool_calls:
+                if call.name not in agent_spec.allowed_tools:
+                    raise ModelProtocolError(
+                        f"Agent {agent_spec.spec_id} cannot use tool {call.name}"
+                    )
             context_manager.record_usage(
                 store.load_context_scope(run.context_scope_id), context, definitions, turn
             )
@@ -526,6 +558,7 @@ def start_run(
     store: RunStore,
     secret_command_runner: SecretCommandRunner | None = None,
     context_manager: AgentContextManager | None = None,
+    agent_spec: AgentSpec,
 ) -> Run:
     """Start one user-request run and execute until terminal state or a wait."""
     if run.max_steps < 1:
@@ -536,11 +569,15 @@ def start_run(
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
     if store.has_run_messages(run.run_id):
         raise AgentLoopError(f"Run {run.run_id} already has model messages")
+    run.model_name = model_name_for_run(run, agent_spec)
 
     output = emit or (lambda _message: None)
     current_context_manager = context_manager or AgentContextManager(
-        condenser=LLMHistoryCondenser(model)
+        policy=agent_spec.default_budget,
+        condenser=LLMHistoryCondenser(model),
+        scope_id=run.context_scope_id,
     )
+    current_context_manager.bind_scope(run.context_scope_id)
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
     _resume_one_work_item(run)
@@ -569,6 +606,7 @@ def start_run(
         output,
         store,
         current_context_manager,
+        agent_spec,
     )
 
 
@@ -599,6 +637,7 @@ def continue_run(
     pending_messages: tuple[ModelMessage, ...],
     secret_command_runner: SecretCommandRunner | None = None,
     context_manager: AgentContextManager | None = None,
+    agent_spec: AgentSpec,
 ) -> Run:
     """Persist a resolved dependency, then continue its durable run."""
     if run.status is not RunStatus.RUNNING:
@@ -607,10 +646,14 @@ def continue_run(
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
     if not store.has_run_messages(run.run_id):
         raise AgentLoopError("A resumed run must have model protocol history")
+    run.model_name = model_name_for_run(run, agent_spec)
     output = emit or (lambda _message: None)
     current_context_manager = context_manager or AgentContextManager(
-        condenser=LLMHistoryCondenser(model)
+        policy=agent_spec.default_budget,
+        condenser=LLMHistoryCondenser(model),
+        scope_id=run.context_scope_id,
     )
+    current_context_manager.bind_scope(run.context_scope_id)
     _sync_context(run, store, current_context_manager)
     pending = list(pending_messages)
     _checkpoint(session, run, store, current_context_manager, pending)
@@ -625,4 +668,5 @@ def continue_run(
         output,
         store,
         current_context_manager,
+        agent_spec,
     )

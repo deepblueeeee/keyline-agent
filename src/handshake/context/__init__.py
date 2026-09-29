@@ -8,7 +8,7 @@ from handshake.context.budget import (
 )
 from handshake.context.condenser import HistoryCondenser, LLMHistoryCondenser
 from handshake.context.errors import ContextPressureError, ContextViewError
-from handshake.context.manager import AgentContextManager
+from handshake.context.manager import ActiveContextManagers, AgentContextManager
 from handshake.context.state import (
     ContextCheckpoint,
     ContextDependency,
@@ -24,6 +24,7 @@ from handshake.context.state import (
 )
 
 __all__ = [
+    "ActiveContextManagers",
     "AgentContextManager",
     "ContextBudgetPolicy",
     "ContextCheckpoint",

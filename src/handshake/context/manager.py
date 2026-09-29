@@ -56,19 +56,38 @@ class AgentContextManager:
         policy: ContextBudgetPolicy | None = None,
         estimator: TokenEstimator | None = None,
         condenser: HistoryCondenser | None = None,
+        *,
+        scope_id: str | None = None,
     ) -> None:
         self.policy = policy or ContextBudgetPolicy()
         self.estimator = estimator or Utf8TokenEstimator()
         self.condenser = condenser
-        self._states: dict[str, ManagedContextState] = {}
+        self._scope_id: str | None = None
+        self._state: ManagedContextState | None = None
+        if scope_id is not None:
+            self.bind_scope(scope_id)
+
+    def bind_scope(self, scope_id: str) -> None:
+        """Bind this manager to exactly one durable context stream."""
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ContextViewError("Context scope ID must not be empty")
+        if self._scope_id is None:
+            self._scope_id = scope_id
+        elif self._scope_id != scope_id:
+            raise ContextViewError(
+                f"Context manager belongs to scope {self._scope_id}, not {scope_id}"
+            )
 
     def build(
         self,
         session: Session,
         run: Run,
+        tools: tuple[ToolDefinition, ...] = (),
+        *,
+        instructions: str = "",
     ) -> ModelContext:
         """Render the already-maintained state without triggering compaction."""
-        return self.render(self.capture(session, run))
+        return self.render(self.capture(session, run), tools, instructions=instructions)
 
     def message_count(self, scope: ContextScope) -> int:
         """Return the durable history prefix already represented by this view."""
@@ -76,7 +95,8 @@ class AgentContextManager:
 
     def is_initialized(self, scope: ContextScope) -> bool:
         """Return whether this process has reconstructed the context stream view."""
-        return scope.scope_id in self._states
+        self.bind_scope(scope.scope_id)
+        return self._state is not None
 
     def prepare(
         self,
@@ -84,10 +104,11 @@ class AgentContextManager:
         run: Run,
         tools: tuple[ToolDefinition, ...],
         *,
+        instructions: str,
         raw_message_reader: RawMessageReader | None = None,
     ) -> ModelContext:
         """Apply context pressure policy and return the next model-visible context."""
-        pressure = self.measure_pressure(session, run, tools)
+        pressure = self.measure_pressure(session, run, tools, instructions=instructions)
         state = self._synchronized_state(run.context_scope_id)
         if (
             pressure >= self.policy.pressure_trigger_tokens
@@ -96,7 +117,9 @@ class AgentContextManager:
             while pressure > self.policy.pressure_target_tokens:
                 if not mask_oldest_stale_result(state):
                     break
-                pressure = self.measure_pressure(session, run, tools)
+                pressure = self.measure_pressure(
+                    session, run, tools, instructions=instructions
+                )
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
                 compact_semantic_context(
                     state,
@@ -105,15 +128,20 @@ class AgentContextManager:
                     estimator=self.estimator,
                     condenser=self.condenser,
                     tools=tools,
-                    measure_pressure=lambda: self.measure_pressure(session, run, tools),
+                    instructions=instructions,
+                    measure_pressure=lambda: self.measure_pressure(
+                        session, run, tools, instructions=instructions
+                    ),
                     capture_view=lambda: self.capture(session, run),
                     raw_message_reader=raw_message_reader,
                 )
-                pressure = self.measure_pressure(session, run, tools)
+                pressure = self.measure_pressure(
+                    session, run, tools, instructions=instructions
+                )
             state.reduced_message_count = state.message_count
             state.reduction_dirty = True
         self.ensure_below_hard_limit(pressure)
-        return self.build(session, run)
+        return self.build(session, run, tools, instructions=instructions)
 
     def restore(
         self,
@@ -123,7 +151,8 @@ class AgentContextManager:
         read_messages: ContextMessageReader,
     ) -> None:
         """Rebuild a bounded view from metadata plus only its uncovered raw tail."""
-        if scope.scope_id in self._states:
+        self.bind_scope(scope.scope_id)
+        if self._state is not None:
             raise ContextViewError("Context state is already initialized")
         if source_message_count < 0:
             raise ContextViewError("Durable message count cannot be negative")
@@ -179,7 +208,7 @@ class AgentContextManager:
             raise ContextViewError("Stale mask cursor does not reference a tool result")
         if source_message_count > checkpoint.source_message_count:
             self._update_recent(state)
-        self._states[scope.scope_id] = state
+        self._state = state
 
     def pending_checkpoint(self, scope: ContextScope) -> ContextCheckpoint | None:
         """Return unsaved reduction metadata, if this view changed semantically."""
@@ -228,10 +257,12 @@ class AgentContextManager:
         messages: Iterable[SequencedMessage],
     ) -> None:
         """Add newly committed durable messages to the model-visible view."""
-        current = self._states.get(
-            scope.scope_id,
-            ManagedContextState(max_tool_result_tokens=self.policy.max_tool_result_tokens),
-        )
+        self.bind_scope(scope.scope_id)
+        current = self._state
+        if current is None:
+            current = ManagedContextState(
+                max_tool_result_tokens=self.policy.max_tool_result_tokens
+            )
         state = deepcopy(current)
         changed = False
         for item in messages:
@@ -252,10 +283,10 @@ class AgentContextManager:
             state.message_count = sequence + 1
             changed = True
         if not changed:
-            self._states[scope.scope_id] = state
+            self._state = state
             return
         self._update_recent(state)
-        self._states[scope.scope_id] = state
+        self._state = state
 
     def capture(
         self,
@@ -314,10 +345,12 @@ class AgentContextManager:
         session: Session,
         run: Run,
         tools: tuple[ToolDefinition, ...],
+        *,
+        instructions: str = "",
     ) -> int:
         """Measure the current view without changing its compaction state."""
         return measure_model_context(
-            self.build(session, run),
+            self.build(session, run, tools, instructions=instructions),
             tools,
             self.estimator,
             self._synchronized_state(run.context_scope_id).token_measurement,
@@ -339,7 +372,8 @@ class AgentContextManager:
         return mask_oldest_stale_result(self._synchronized_state(scope.scope_id))
 
     def _synchronized_state(self, scope_id: str) -> ManagedContextState:
-        state = self._states.get(scope_id)
+        self.bind_scope(scope_id)
+        state = self._state
         if state is None:
             return ManagedContextState(
                 max_tool_result_tokens=self.policy.max_tool_result_tokens
@@ -354,9 +388,31 @@ class AgentContextManager:
                 "Model input remains above the hard context limit after context reduction"
             )
 
-    def render(self, view: ContextView) -> ModelContext:
+    def render(
+        self,
+        view: ContextView,
+        tools: tuple[ToolDefinition, ...] = (),
+        *,
+        instructions: str = "",
+    ) -> ModelContext:
         """Validate and render a ContextView without changing its source data."""
-        return render_context_view(view)
+        return render_context_view(view, instructions=instructions, tools=tools)
+
+
+class ActiveContextManagers:
+    """Keep one manager for each context scope in the current process."""
+
+    def __init__(self) -> None:
+        self._by_scope: dict[str, AgentContextManager] = {}
+
+    def get(self, scope_id: str) -> AgentContextManager | None:
+        return self._by_scope.get(scope_id)
+
+    def register(self, scope_id: str, manager: AgentContextManager) -> None:
+        if scope_id in self._by_scope:
+            raise ContextViewError(f"Context scope {scope_id} already has a manager")
+        manager.bind_scope(scope_id)
+        self._by_scope[scope_id] = manager
 
 
 def _recent_start(

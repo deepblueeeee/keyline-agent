@@ -26,7 +26,7 @@ from handshake.runtime.state import (
 from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
-from tests.history_support import fresh_store, history
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, history
 
 
 def tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -161,6 +161,7 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.COMPLETED
@@ -189,6 +190,7 @@ def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) 
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.COMPLETED
@@ -212,6 +214,7 @@ def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
             ScriptedModel([bad_turn]),
             create_default_registry(lambda _cwd, _argv: True),
             store=store,
+            agent_spec=TEST_AGENT_SPEC,
         )
 
     assert run.status is RunStatus.FAILED
@@ -227,6 +230,7 @@ def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
             ScriptedModel([]),
             create_default_registry(lambda _cwd, _argv: True),
             store=store,
+            agent_spec=TEST_AGENT_SPEC,
         )
 
     assert run.status is RunStatus.FAILED
@@ -253,6 +257,7 @@ def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
             model,
             create_default_registry(lambda _cwd, _argv: True),
             store=store,
+            agent_spec=TEST_AGENT_SPEC,
         )
 
     assert run.status is RunStatus.FAILED
@@ -294,6 +299,7 @@ def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.COMPLETED
@@ -313,6 +319,7 @@ def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     plan_tool = next(tool for tool in model.tool_sets[0] if tool.name == "update_plan")
@@ -330,7 +337,10 @@ def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) ->
     )
 
     with pytest.raises(UserCancelledError):
-        start_run(session, run, model, create_default_registry(cancel), store=store)
+        start_run(
+            session, run, model, create_default_registry(cancel),
+            store=store, agent_spec=TEST_AGENT_SPEC,
+        )
 
     assert run.status is RunStatus.CANCELLED
     result = history(store, session)[-1].content[0]
@@ -357,6 +367,7 @@ def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
             ScriptedModel([tool_turn(*calls)]),
             create_default_registry(cancel),
             store=store,
+            agent_spec=TEST_AGENT_SPEC,
         )
 
     results = history(store, session)[-1].content
@@ -394,11 +405,11 @@ def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -
         ]
     )
     registry = create_default_registry(lambda _cwd, _argv: True)
-    start_run(session, first, first_model, registry, store=store)
+    start_run(session, first, first_model, registry, store=store, agent_spec=TEST_AGENT_SPEC)
     second = create_followup_run(session, [first], "continue")
     second_model = ScriptedModel([final_turn("second complete")])
 
-    start_run(session, second, second_model, registry, store=store)
+    start_run(session, second, second_model, registry, store=store, agent_spec=TEST_AGENT_SPEC)
 
     messages = second_model.contexts[0].messages
     assert [message.run_id for message in messages] == [
@@ -443,6 +454,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         first_model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.WAITING
@@ -473,6 +485,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
         pending_messages=(continuation,),
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     context = second_model.contexts[0]
@@ -512,6 +525,7 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
         create_default_registry(lambda _cwd, _argv: True),
         emit=events.append,
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert events.index("checkpoint:waiting") < events.index(
@@ -528,6 +542,7 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
         emit=events.append,
         store=store,
         pending_messages=(continuation,),
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert store.snapshots == [
@@ -560,6 +575,7 @@ def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -
             create_default_registry(lambda _cwd, _argv: True),
             emit=events.append,
             store=store,
+            agent_spec=TEST_AGENT_SPEC,
         )
 
     assert run.status is RunStatus.WAITING
@@ -582,6 +598,7 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert not (tmp_path / "created.txt").exists()
@@ -602,6 +619,7 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=store,
+        agent_spec=TEST_AGENT_SPEC,
     )
     resumed_session = store.load_session(session.session_id)
     resumed_run = store.load_run(run.run_id)
@@ -620,6 +638,7 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
             create_default_registry(lambda _cwd, _argv: True),
             store=store,
             pending_messages=(continuation,),
+            agent_spec=TEST_AGENT_SPEC,
         )
 
     assert resumed_run.status is RunStatus.FAILED

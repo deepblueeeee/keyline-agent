@@ -66,6 +66,7 @@ def compact_semantic_context(
     estimator: TokenEstimator,
     condenser: HistoryCondenser,
     tools: tuple[ToolDefinition, ...],
+    instructions: str,
     measure_pressure: Callable[[], int],
     capture_view: ContextViewReader,
     raw_message_reader: RawMessageReader | None,
@@ -100,6 +101,7 @@ def compact_semantic_context(
         if not _accept_episodes(
             state,
             tools=tools,
+            instructions=instructions,
             estimator=estimator,
             capture_view=capture_view,
             episodes=state.episodes + episodes,
@@ -133,6 +135,7 @@ def compact_semantic_context(
         if not _accept_episodes(
             state,
             tools=tools,
+            instructions=instructions,
             estimator=estimator,
             capture_view=capture_view,
             episodes=(merged, *state.episodes[len(selected) :]),
@@ -240,6 +243,7 @@ def _accept_episodes(
     state: ManagedContextState,
     *,
     tools: tuple[ToolDefinition, ...],
+    instructions: str,
     estimator: TokenEstimator,
     capture_view: ContextViewReader,
     episodes: tuple[HistoryEpisode, ...],
@@ -256,9 +260,13 @@ def _accept_episodes(
                 )
             ),
         )
-    proposed = render_context_view(replace(view, history=history))
+    proposed = render_context_view(
+        replace(view, history=history), instructions=instructions, tools=tools
+    )
     if estimate_model_context(proposed, tools, estimator) >= estimate_model_context(
-        render_context_view(view), tools, estimator
+        render_context_view(view, instructions=instructions, tools=tools),
+        tools,
+        estimator,
     ):
         return False
     state.episodes = episodes

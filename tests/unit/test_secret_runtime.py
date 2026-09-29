@@ -18,7 +18,7 @@ from handshake.runtime.state import (
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.secret_command import SecretCommandRunner
-from tests.history_support import fresh_store, history
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, history
 
 
 def _tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -79,6 +79,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
         create_default_registry(lambda _cwd, _argv: True),
         store=state_store,
         secret_command_runner=runner,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     dependency = run.dependencies[0]
@@ -131,6 +132,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
         store=state_store,
         secret_command_runner=runner,
         pending_messages=(continuation,),
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.COMPLETED
@@ -178,6 +180,7 @@ def test_secret_wait_mixed_with_other_tool_has_no_side_effect(tmp_path: Path) ->
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=state_store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.COMPLETED
@@ -211,6 +214,7 @@ def test_secret_command_without_capability_fails_without_shell_fallback(
         model,
         create_default_registry(lambda _cwd, _argv: True),
         store=state_store,
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     result = run.tool_runs[-1].result

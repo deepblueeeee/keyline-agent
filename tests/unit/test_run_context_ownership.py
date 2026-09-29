@@ -3,9 +3,18 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context import AgentContextManager, ContextCheckpoint
+from handshake.context import (
+    ActiveContextManagers,
+    AgentContextManager,
+    ContextBudgetPolicy,
+    ContextCheckpoint,
+    ContextViewError,
+)
 from handshake.models.protocol import ModelMessage
+from handshake.models.scripted import ScriptedModel
+from handshake.runtime.agents import AgentSpec
 from handshake.runtime.errors import AgentLoopError
+from handshake.runtime.loop import context_manager_for_run
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.runs import create_followup_run
 from handshake.runtime.state import Run, RunStatus, Session
@@ -24,6 +33,36 @@ def _restore(manager: AgentContextManager, store: RunStore, run: Run) -> None:
         store.message_count(run.context_scope_id),
         lambda start, end: store.read_messages(run.context_scope_id, start, end),
     )
+
+
+def test_runtime_context_managers_reuse_only_the_same_stream(tmp_path: Path) -> None:
+    session = Session(workspace=tmp_path)
+    parent = Run(goal="parent", session_id=session.session_id, agent_spec_id="main")
+    child = Run(
+        goal="child", session_id=session.session_id,
+        parent_run_id=parent.run_id, agent_spec_id="explorer",
+    )
+    followup = Run(
+        goal="followup", session_id=session.session_id,
+        sequence=2, previous_run_id=parent.run_id,
+        context_scope_id=parent.context_scope_id, agent_spec_id="main",
+    )
+    parent_budget = ContextBudgetPolicy(context_window_tokens=1000, reserved_output_tokens=0)
+    child_budget = ContextBudgetPolicy(context_window_tokens=2000, reserved_output_tokens=0)
+    parent_spec = AgentSpec("main", "scripted", "Implement the goal.", default_budget=parent_budget)
+    child_spec = AgentSpec(
+        "explorer", "scripted", "Explore the workspace.", default_budget=child_budget
+    )
+    model = ScriptedModel(())
+    managers = ActiveContextManagers()
+
+    parent_manager = context_manager_for_run(managers, parent, parent_spec, model)
+    child_manager = context_manager_for_run(managers, child, child_spec, model)
+
+    assert parent_manager is context_manager_for_run(managers, followup, parent_spec, model)
+    assert child_manager is not parent_manager
+    assert parent_manager.policy is parent_budget
+    assert child_manager.policy is child_budget
 
 
 def test_child_run_has_empty_private_history_and_checkpoint(tmp_path: Path) -> None:
@@ -68,16 +107,28 @@ def test_child_run_has_empty_private_history_and_checkpoint(tmp_path: Path) -> N
     assert store.load_context_checkpoint(parent.context_scope_id) == parent_checkpoint
     assert store.load_context_checkpoint(child.context_scope_id) == child_checkpoint
 
-    manager = AgentContextManager()
-    _restore(manager, store, parent)
-    _restore(manager, store, child)
-    assert manager.is_initialized(store.load_context_scope(parent.context_scope_id))
-    assert manager.is_initialized(store.load_context_scope(child.context_scope_id))
-    assert [item.content[0]["text"] for item in manager.build(session, parent).messages] == [
+    managers = ActiveContextManagers()
+    parent_manager = AgentContextManager(scope_id=parent.context_scope_id)
+    child_manager = AgentContextManager(scope_id=child.context_scope_id)
+    managers.register(parent.context_scope_id, parent_manager)
+    managers.register(child.context_scope_id, child_manager)
+    assert managers.get(parent.context_scope_id) is parent_manager
+    assert managers.get(child.context_scope_id) is child_manager
+    with pytest.raises(ContextViewError, match="already has a manager"):
+        managers.register(parent.context_scope_id, AgentContextManager())
+    with pytest.raises(ContextViewError, match="belongs to scope"):
+        managers.register("different-scope", parent_manager)
+    _restore(parent_manager, store, parent)
+    _restore(child_manager, store, child)
+    assert parent_manager.is_initialized(store.load_context_scope(parent.context_scope_id))
+    assert child_manager.is_initialized(store.load_context_scope(child.context_scope_id))
+    with pytest.raises(ContextViewError, match="belongs to scope"):
+        parent_manager.build(session, child)
+    assert [item.content[0]["text"] for item in parent_manager.build(session, parent).messages] == [
         "parent private history",
         "parent continued",
     ]
-    assert [item.content[0]["text"] for item in manager.build(session, child).messages] == [
+    assert [item.content[0]["text"] for item in child_manager.build(session, child).messages] == [
         "child goal",
         "child continued",
     ]

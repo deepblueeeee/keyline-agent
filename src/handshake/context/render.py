@@ -16,20 +16,20 @@ from handshake.context.state import (
     SequencedMessage,
     SourceRange,
 )
+from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ModelContext, ModelMessage
 
 
-def render_context_view(view: ContextView) -> ModelContext:
+def render_context_view(
+    view: ContextView,
+    *,
+    instructions: str = "",
+    tools: tuple[ToolDefinition, ...] = (),
+) -> ModelContext:
     """Validate and render a ContextView without changing its source data."""
     _validate_view(view)
     exact = view.exact
-    prompt = _system_prompt(exact)
-    state = {
-        "constraints": exact.constraints,
-        "work_items": [asdict(item) for item in exact.work_items],
-        "dependencies": [asdict(item) for item in exact.dependencies],
-    }
-    prompt += "\nExact current state:\n" + json.dumps(state, ensure_ascii=False)
+    prompt = _system_prompt(exact, instructions, tools)
 
     messages: list[ModelMessage] = []
     for segment in view.history:
@@ -48,46 +48,64 @@ def render_context_view(view: ContextView) -> ModelContext:
     )
 
 
-def _system_prompt(exact: ExactContext) -> str:
-    plan = "\n".join(f"- {step}" for step in exact.plan) or "(none)"
-    return f"""You are Handshake, a local coding agent operating on one workspace.
-
-Current goal:
-{exact.goal}
-
-Workspace:
-{exact.workspace}
-
-Optional current plan:
-{plan}
-
-Rules:
-- Investigate enough repository context before choosing an approach or modifying files.
-- Use update_plan for non-trivial, multi-step work when it improves progress tracking.
-- Simple requests may be completed without creating a plan.
-- Treat the plan as provisional and revise it when tool results materially change the approach.
-- Use workspace-relative paths for repository files. A large tool result may provide an opaque
-  @handshake/artifacts reference; only read that reference with read_file.
-- Keep context use focused: discover with list_files/search_files, read only relevant line ranges,
-  use read_file's character-range mode for very long lines, and prefer edit_file for targeted
-  changes to existing files.
-- Make targeted changes and run appropriate validation afterwards.
-- Shell tools follow the user's local approval policy. If denied, adapt instead of pretending
-  they ran.
-- Ask for a non-sensitive user fact with wait_for_text only when it cannot be inferred from the
-  repository. Call wait_for_text by itself in a turn.
-- Never request passwords, API keys, tokens, or other secrets with wait_for_text.
-- A successful wait_for_text result means an input dependency was registered. The user's later
-  answer arrives as a new user continuation message, not as another result for the same tool call.
-- Request a test credential with wait_for_secret, never through normal messages or file tools.
-  Call wait_for_secret by itself. Its successful result provides an opaque handle, not the Secret.
-- Pass that opaque handle only to run_command_with_secret when the requested credential is
-  available. Handles are one-time: request a new one before rerunning a command that started.
-- Use tool results as evidence and correct failures when possible.
-- Do not claim a test passed unless its tool result says it passed.
-- When the current request is complete, respond without tool calls with a concise summary of
-  changes, validation performed, and any unresolved issue.
-"""
+def _system_prompt(
+    exact: ExactContext,
+    instructions: str,
+    tools: tuple[ToolDefinition, ...],
+) -> str:
+    tool_names = {tool.name for tool in tools}
+    protocol = [
+        "- Use only the tools provided with this request; never invent a tool or its result.",
+        "- Treat tool results as evidence. Do not claim an action succeeded without its result.",
+        "- Never put secret values in ordinary messages, model requests, workspace files, or logs.",
+        "- When finished, reply with text and no tool calls.",
+    ]
+    if "update_plan" in tool_names:
+        protocol.append("- update_plan records a provisional plan; revise it as work changes.")
+    if "read_file" in tool_names:
+        protocol.append(
+            "- A tool result may contain an opaque @handshake/artifacts reference; "
+            "read it only with read_file."
+        )
+    if tool_names & {"run_shell", "run_tests", "run_command_with_secret"}:
+        protocol.append(
+            "- Commands follow the user's local approval policy. If denied, do not claim they ran."
+        )
+    if "wait_for_text" in tool_names:
+        protocol.extend(
+            (
+                "- Call wait_for_text alone to request non-sensitive user input; "
+                "never use it for credentials.",
+                "- Its tool result registers a dependency. The answer arrives later as "
+                "a user continuation message.",
+            )
+        )
+    if "wait_for_secret" in tool_names:
+        protocol.append(
+            "- Call wait_for_secret alone for a credential. Its result contains an "
+            "opaque handle, never the secret value."
+        )
+    if "run_command_with_secret" in tool_names:
+        protocol.append(
+            "- Pass an available one-time secret handle only to run_command_with_secret. "
+            "Request a new handle before rerunning a command that started."
+        )
+    state = {
+        "goal": exact.goal,
+        "workspace": exact.workspace,
+        "plan": exact.plan,
+        "constraints": exact.constraints,
+        "work_items": [asdict(item) for item in exact.work_items],
+        "dependencies": [asdict(item) for item in exact.dependencies],
+    }
+    return (
+        "Harness protocol\n"
+        + "\n".join(protocol)
+        + "\n\nAgent instructions\n"
+        + (instructions.strip() or "(none)")
+        + "\n\nRuntime state\n"
+        + json.dumps(state, ensure_ascii=False)
+    )
 
 
 def _segment_range(segment: HistorySegment) -> SourceRange:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ from handshake.runtime.state import Run, Session, ToolResult
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools.files import read_file
 from handshake.tools.registry import ToolBinding, ToolRegistry
-from tests.history_support import fresh_store, history, ingest
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, ingest
 
 _HISTORY: dict[str, list[ModelMessage]] = {}
 
@@ -234,7 +235,7 @@ def test_pressure_masks_stale_results_oldest_first_until_target(
     estimator = CharacterTokenEstimator()
     manager = AgentContextManager(
         _policy(
-            context_window=18_000,
+            context_window=16_000,
             trigger=0.65,
             target=0.45,
             recent_messages=2,
@@ -471,6 +472,7 @@ def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> No
             ToolRegistry(),
             context_manager=manager,
             store=store,
+            agent_spec=TEST_AGENT_SPEC,
         )
     assert model.contexts == []
 
@@ -520,6 +522,10 @@ def test_loop_externalizes_large_result_but_persists_complete_result(
         registry,
         store=store,
         context_manager=manager,
+        agent_spec=replace(
+            TEST_AGENT_SPEC,
+            allowed_tools=TEST_AGENT_SPEC.allowed_tools | {"large_read"},
+        ),
     )
 
     visible = model.contexts[1].messages[-1].content[0]["content"]

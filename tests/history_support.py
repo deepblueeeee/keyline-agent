@@ -4,9 +4,29 @@ from pathlib import Path
 
 from handshake.context import AgentContextManager, SequencedMessage
 from handshake.models.protocol import ModelMessage
+from handshake.runtime.agents import AgentSpec
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.state import Run, Session
 from handshake.storage.sqlite import SQLiteStateStore
+from handshake.tools import create_default_registry, runtime_tool_definitions
+
+TEST_AGENT_SPEC = AgentSpec(
+    spec_id="test",
+    model_name="scripted",
+    instructions="Follow the scripted test turns.",
+    allowed_tools=frozenset(
+        {
+            "not_registered",
+            *(definition.name for definition in runtime_tool_definitions()),
+            *(
+                definition.name
+                for definition in create_default_registry(
+                    lambda _cwd, _argv: True
+                ).definitions()
+            ),
+        }
+    ),
+)
 
 
 def fresh_store(path: Path, session: Session) -> SQLiteStateStore:

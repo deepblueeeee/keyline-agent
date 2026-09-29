@@ -7,7 +7,7 @@ from handshake.models.scripted import ScriptedModel
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
-from tests.history_support import fresh_store
+from tests.history_support import TEST_AGENT_SPEC, fresh_store
 
 
 def _tool_turn(call: ToolCall) -> ModelTurn:
@@ -87,6 +87,7 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
         model,
         create_default_registry(approve),
         store=fresh_store(tmp_path, session),
+        agent_spec=TEST_AGENT_SPEC,
     )
 
     assert run.status is RunStatus.COMPLETED

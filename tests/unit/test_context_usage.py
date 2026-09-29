@@ -24,7 +24,7 @@ from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.loop import continue_run, start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools.registry import ToolRegistry
-from tests.history_support import fresh_store, ingest
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, ingest
 
 
 def text_message(text: str, role: str = "user") -> ModelMessage:
@@ -130,7 +130,10 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
     )
     model = ScriptedModel((wait_turn,))
     manager = AgentContextManager()
-    start_run(session, run, model, ToolRegistry(), store=store, context_manager=manager)
+    start_run(
+        session, run, model, ToolRegistry(), store=store,
+        context_manager=manager, agent_spec=TEST_AGENT_SPEC,
+    )
     assert run.status is RunStatus.WAITING
     checkpoint = store.load_context_checkpoint(run.context_scope_id)
     assert checkpoint is not None and checkpoint.token_measurement is not None
@@ -143,8 +146,12 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
         store.message_count(run.context_scope_id),
         lambda start, end: store.read_messages(run.context_scope_id, start, end),
     )
-    assert restored.measure_pressure(session, run, model.tool_sets[0]) == (
-        manager.measure_pressure(session, run, model.tool_sets[0])
+    assert restored.measure_pressure(
+        session, run, model.tool_sets[0], instructions=TEST_AGENT_SPEC.instructions
+    ) == (
+        manager.measure_pressure(
+            session, run, model.tool_sets[0], instructions=TEST_AGENT_SPEC.instructions
+        )
     )
     resumed_model = ScriptedModel(
         (
@@ -169,6 +176,7 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
         store=store,
         context_manager=restored,
         pending_messages=(continuation,),
+        agent_spec=TEST_AGENT_SPEC,
     )
     assert completed.status is RunStatus.COMPLETED
     saved = store.load_context_checkpoint(run.context_scope_id)
@@ -188,7 +196,9 @@ def test_low_actual_usage_avoids_unnecessary_compaction(tmp_path: Path) -> None:
     ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     assert estimate_model_context(manager.build(session, run), (), manager.estimator) > 1000
     assert manager.measure_pressure(session, run, ()) == 110
-    assert manager.prepare(session, run, ()).messages == manager.build(session, run).messages
+    assert manager.prepare(
+        session, run, (), instructions=""
+    ).messages == manager.build(session, run).messages
 
 
 def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
@@ -231,7 +241,7 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
     ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     assert estimate_model_context(manager.build(session, run), (), manager.estimator) < 5000
     assert manager.measure_pressure(session, run, ()) == 9000
-    prepared = manager.prepare(session, run, ())
+    prepared = manager.prepare(session, run, (), instructions="")
     assert condenser.calls == 1
     assert "Compacted history episode" in prepared.messages[0].content[0]["text"]
     assert manager.measure_pressure(session, run, ()) == (
@@ -254,4 +264,28 @@ def test_actual_usage_enforces_hard_limit_for_protected_context(tmp_path: Path) 
     manager.record_usage(session.context_scope, context, (), turn)
     ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     with pytest.raises(ContextPressureError):
-        manager.prepare(session, run, ())
+        manager.prepare(session, run, (), instructions="")
+
+
+def test_prepare_measures_the_instructions_passed_for_this_request(tmp_path: Path) -> None:
+    session = Session(workspace=tmp_path)
+    run = Run(goal="review", session_id=session.session_id, agent_spec_id="reviewer")
+    manager = AgentContextManager()
+    short_instructions = "Review the change."
+    long_instructions = "Check every detail. " * 300
+    short_pressure = manager.measure_pressure(
+        session, run, (), instructions=short_instructions
+    )
+    long_pressure = manager.measure_pressure(
+        session, run, (), instructions=long_instructions
+    )
+    assert short_pressure < long_pressure
+
+    manager.policy = ContextBudgetPolicy(
+        context_window_tokens=long_pressure, reserved_output_tokens=0
+    )
+    assert short_instructions in manager.prepare(
+        session, run, (), instructions=short_instructions
+    ).system_prompt
+    with pytest.raises(ContextPressureError):
+        manager.prepare(session, run, (), instructions=long_instructions)

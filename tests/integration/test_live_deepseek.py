@@ -6,9 +6,10 @@ import pytest
 
 from handshake.config import DeepSeekConfig
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
+from handshake.runtime.agents import AgentSpec
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
-from handshake.tools import create_default_registry
+from handshake.tools import create_default_registry, runtime_tool_definitions
 from tests.history_support import fresh_store
 
 
@@ -33,15 +34,27 @@ def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
     run = Run(
         goal="Implement calculator.add and run the existing tests.",
         session_id=session.session_id,
-        agent_spec_id="test",
+        agent_spec_id="main",
+        model_name=config.model,
+    )
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    agent_spec = AgentSpec(
+        spec_id="main",
+        model_name=config.model,
+        instructions="Complete the coding request.",
+        allowed_tools=frozenset(
+            definition.name
+            for definition in (*runtime_tool_definitions(), *registry.definitions())
+        ),
     )
 
     start_run(
         session,
         run,
         model,
-        create_default_registry(lambda _cwd, _argv: True),
+        registry,
         store=fresh_store(tmp_path, session),
+        agent_spec=agent_spec,
     )
 
     assert run.status is RunStatus.COMPLETED
