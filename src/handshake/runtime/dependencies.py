@@ -10,7 +10,6 @@ from handshake.runtime.state import (
     Run,
     RunStatus,
     Session,
-    WorkItemStatus,
     utc_now,
 )
 
@@ -37,15 +36,10 @@ def resolve_text_dependency(
         raise WaitResolutionError(f"Dependency {dependency_id} is already satisfied")
     if run.status is not RunStatus.WAITING:
         raise WaitResolutionError(f"Run {run.run_id} is not waiting for input")
-    work_item = run.work_item_by_id(dependency.work_id)
-    if work_item is None or work_item.status is not WorkItemStatus.READY:
-        raise WaitResolutionError(
-            f"Dependency {dependency_id} has no resumable work item"
-        )
-
     dependency.transition(DependencyStatus.SATISFIED)
     dependency.resolved_at = utc_now()
-    run.transition(RunStatus.RUNNING)
+    if not run.open_dependencies():
+        run.transition(RunStatus.RUNNING)
     return ModelMessage(
         role="user",
         content=(
@@ -56,7 +50,7 @@ def resolve_text_dependency(
                     f"Dependency ID: {dependency.dependency_id}\n"
                     f"Question: {dependency.prompt}\n"
                     f"User response: {normalized}\n"
-                    "Continue the associated work using this information."
+                    "Continue the run using this information."
                 ),
             },
         ),

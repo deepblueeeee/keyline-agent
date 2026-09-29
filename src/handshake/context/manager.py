@@ -34,7 +34,6 @@ from handshake.context.state import (
     ContextCheckpoint,
     ContextDependency,
     ContextView,
-    ContextWorkItem,
     ExactContext,
     HistorySegment,
     RawHistorySegment,
@@ -302,14 +301,9 @@ class AgentContextManager:
             workspace=str(session.workspace),
             plan=tuple(run.plan),
             constraints=constraints,
-            work_items=tuple(
-                ContextWorkItem(item.work_id, item.description, item.status.value)
-                for item in run.work_items
-            ),
             dependencies=tuple(
                 ContextDependency(
                     dependency.dependency_id,
-                    dependency.work_id,
                     dependency.tool_call_id,
                     dependency.kind.value,
                     dependency.prompt,

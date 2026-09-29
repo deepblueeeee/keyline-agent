@@ -10,16 +10,8 @@ from handshake.models.protocol import ModelMessage
 
 
 @dataclass(frozen=True, slots=True)
-class ContextWorkItem:
-    work_id: str
-    description: str
-    status: str
-
-
-@dataclass(frozen=True, slots=True)
 class ContextDependency:
     dependency_id: str
-    work_id: str
     tool_call_id: str
     kind: str
     prompt: str
@@ -38,7 +30,6 @@ class ExactContext:
     workspace: str
     plan: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
-    work_items: tuple[ContextWorkItem, ...] = ()
     dependencies: tuple[ContextDependency, ...] = ()
 
 

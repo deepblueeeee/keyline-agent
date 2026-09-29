@@ -13,7 +13,6 @@ from handshake.runtime.state import (
     RunStatus,
     SecretHandleStatus,
     Session,
-    WorkItemStatus,
 )
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
@@ -85,7 +84,6 @@ def test_secret_dependency_and_command_complete_without_model_leak(
     dependency = run.dependencies[0]
     handle = run.secret_handles[0]
     assert run.status is RunStatus.WAITING
-    assert run.work_items[0].status is WorkItemStatus.READY
     assert dependency.kind is DependencyKind.SECRET
     assert dependency.status is DependencyStatus.OPEN
     assert handle.status is SecretHandleStatus.REQUESTED
@@ -137,7 +135,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
 
     assert run.status is RunStatus.COMPLETED
     assert handle.status is SecretHandleStatus.CONSUMED
-    assert run.tool_runs_for(run.work_items[0])[-1].arguments == secure_call.arguments
+    assert run.tool_runs[-1].arguments == secure_call.arguments
     assert canary not in repr(second_model.contexts)
     assert canary not in repr(history(state_store, session))
     assert canary not in repr(run.tool_runs)

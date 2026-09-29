@@ -16,7 +16,6 @@ from handshake.runtime.state import (
     SecretHandle,
     SecretHandleStatus,
     Session,
-    WorkItemStatus,
     utc_now,
 )
 
@@ -50,11 +49,6 @@ def resolve_secret_dependency(
         raise SecretInputError(f"Dependency {dependency_id} is not open")
     if run.status is not RunStatus.WAITING:
         raise SecretInputError(f"Run {run.run_id} is not waiting for input")
-    work_item = run.work_item_by_id(dependency.work_id)
-    if work_item is None or work_item.status is not WorkItemStatus.READY:
-        raise SecretInputError(
-            f"Dependency {dependency_id} has no resumable work item"
-        )
     handle = run.secret_handle_for(dependency)
     if handle is None or handle.status is not SecretHandleStatus.REQUESTED:
         raise SecretInputError(f"Dependency {dependency_id} has no requested Secret handle")
@@ -63,7 +57,8 @@ def resolve_secret_dependency(
     handle.transition(SecretHandleStatus.AVAILABLE)
     dependency.transition(DependencyStatus.SATISFIED)
     dependency.resolved_at = utc_now()
-    run.transition(RunStatus.RUNNING)
+    if not run.open_dependencies():
+        run.transition(RunStatus.RUNNING)
     return ModelMessage(
         role="user",
         content=(
@@ -77,7 +72,7 @@ def resolve_secret_dependency(
                     f"Purpose: {handle.purpose}\n"
                     f"Consumer: {handle.consumer}\n"
                     f"Environment variable: {handle.environment_variable}\n"
-                    "Continue the associated work using the designated consumer."
+                    "Continue the run using the designated consumer."
                 ),
             },
         ),
@@ -102,16 +97,9 @@ def reissue_lost_secret_dependencies(
             raise SecretInputError(
                 f"Secret handle {handle.secret_handle} has no dependency"
             )
-        work_item = run.work_item_by_id(dependency.work_id)
-        if work_item is None or work_item.status is not WorkItemStatus.READY:
-            raise SecretInputError(
-                f"Secret handle {handle.secret_handle} has no resumable work item"
-            )
-
         handle.transition(SecretHandleStatus.LOST)
         dependency.transition(DependencyStatus.LOST)
         replacement_dependency = Dependency(
-            work_id=work_item.work_id,
             tool_call_id=dependency.tool_call_id,
             prompt=dependency.prompt,
             kind=DependencyKind.SECRET,
@@ -122,18 +110,10 @@ def reissue_lost_secret_dependencies(
             consumer=handle.consumer,
             environment_variable=handle.environment_variable,
         )
-        run.add_dependency(work_item, replacement_dependency)
+        run.add_dependency(replacement_dependency)
         run.add_secret_handle(replacement_dependency, replacement_handle)
         changed = True
 
-    has_runnable_work = any(
-        work_item.status is WorkItemStatus.READY
-        and not any(
-            dependency.status is DependencyStatus.OPEN
-            for dependency in run.dependencies_for(work_item)
-        )
-        for work_item in run.work_items
-    )
-    if changed and run.status is RunStatus.RUNNING and not has_runnable_work:
+    if changed and run.status is RunStatus.RUNNING:
         run.transition(RunStatus.WAITING)
     return changed

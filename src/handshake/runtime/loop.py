@@ -26,15 +26,14 @@ from handshake.runtime.persistence import RunStore
 from handshake.runtime.secret_dependencies import reissue_lost_secret_dependencies
 from handshake.runtime.state import (
     Dependency,
-    DependencyStatus,
+    DependencyKind,
     Run,
     RunStatus,
+    SecretHandle,
     Session,
     ToolResult,
     ToolRun,
     ToolRunStatus,
-    WorkItem,
-    WorkItemStatus,
 )
 from handshake.tools import (
     PLAN_TOOL,
@@ -82,40 +81,6 @@ def _result_content(result: ToolResult) -> str:
     )
 
 
-def _running_work_item(run: Run) -> WorkItem:
-    running = tuple(
-        item for item in run.work_items if item.status is WorkItemStatus.RUNNING
-    )
-    if len(running) != 1:
-        raise AgentLoopError(
-            f"Run {run.run_id} must have exactly one running work item, found {len(running)}"
-        )
-    return running[0]
-
-
-def _is_runnable(run: Run, work_item: WorkItem) -> bool:
-    if work_item.status is not WorkItemStatus.READY:
-        return False
-    return not any(
-        dependency.status is DependencyStatus.OPEN
-        for dependency in run.dependencies_for(work_item)
-    )
-
-
-def _runnable_work_items(run: Run) -> tuple[WorkItem, ...]:
-    return tuple(item for item in run.work_items if _is_runnable(run, item))
-
-
-def _resume_one_work_item(run: Run) -> WorkItem:
-    runnable = _runnable_work_items(run)
-    if len(runnable) != 1:
-        raise AgentLoopError(
-            f"Run {run.run_id} must have exactly one runnable work item, found {len(runnable)}"
-        )
-    runnable[0].transition(WorkItemStatus.RUNNING)
-    return runnable[0]
-
-
 def _validate_turn_tool_calls(
     content: tuple[dict[str, Any], ...], calls: tuple[ToolCall, ...]
 ) -> None:
@@ -140,14 +105,12 @@ def _execute_tool_call(
     if call.name == PLAN_TOOL.name:
         return handle_plan(run, call)
 
-    work_item = _running_work_item(run)
     tool_run = ToolRun(
-        work_id=work_item.work_id,
         tool_call_id=call.id,
         tool_name=call.name,
         arguments=dict(call.arguments),
     )
-    run.add_tool_run(work_item, tool_run)
+    run.add_tool_run(tool_run)
     tool_run.transition(ToolRunStatus.RUNNING)
     emit(f"Running tool: {call.name}")
     try:
@@ -323,63 +286,66 @@ def _checkpoint(
         context_manager.checkpoint_saved(scope, saved)
 
 
-def _create_text_dependency(
+def _create_wait_dependencies(
     run: Run,
-    call: ToolCall,
+    calls: tuple[ToolCall, ...],
     pending_messages: list[ModelMessage],
-) -> Dependency | None:
-    work_item = _running_work_item(run)
-    prepared = prepare_text_dependency(call, work_item)
-    if isinstance(prepared, ToolResult):
-        _append_tool_results(pending_messages, run, (call,), (prepared,))
-        return None
+) -> tuple[Dependency, ...]:
+    prepared: list[tuple[Dependency, SecretHandle | None] | ToolResult] = []
+    for call in calls:
+        if call.name == TEXT_WAIT_TOOL.name:
+            text_dependency = prepare_text_dependency(call)
+            prepared.append(
+                text_dependency
+                if isinstance(text_dependency, ToolResult)
+                else (text_dependency, None)
+            )
+        else:
+            prepared.append(prepare_secret_dependency(call))
 
-    dependency = prepared
-    run.add_dependency(work_item, dependency)
-    work_item.transition(WorkItemStatus.READY)
-    result = ToolResult(
-        ok=True,
-        stdout=(
-            f"Registered text dependency {dependency.dependency_id} "
-            f"for work item {work_item.work_id}"
-        ),
-    )
-    _append_tool_results(pending_messages, run, (call,), (result,))
+    if any(isinstance(item, ToolResult) for item in prepared):
+        rejected_results = tuple(
+            item
+            if isinstance(item, ToolResult)
+            else ToolResult(
+                ok=False,
+                stderr="Wait request was not registered because another request was invalid",
+            )
+            for item in prepared
+        )
+        _append_tool_results(pending_messages, run, calls, rejected_results)
+        return ()
 
-    if not _runnable_work_items(run) and run.open_dependencies():
-        run.transition(RunStatus.WAITING)
-    return dependency
-
-
-def _create_secret_dependency(
-    run: Run,
-    call: ToolCall,
-    pending_messages: list[ModelMessage],
-) -> Dependency | None:
-    work_item = _running_work_item(run)
-    prepared = prepare_secret_dependency(call, work_item)
-    if isinstance(prepared, ToolResult):
-        _append_tool_results(pending_messages, run, (call,), (prepared,))
-        return None
-
-    dependency, handle = prepared
-    run.add_dependency(work_item, dependency)
-    run.add_secret_handle(dependency, handle)
-    work_item.transition(WorkItemStatus.READY)
-    result = ToolResult(
-        ok=True,
-        stdout=(
-            f"Registered Secret dependency {dependency.dependency_id}\n"
-            f"Secret handle: {handle.secret_handle}\n"
-            f"Consumer: {handle.consumer}\n"
-            f"Environment variable: {handle.environment_variable}"
-        ),
-    )
-    _append_tool_results(pending_messages, run, (call,), (result,))
-
-    if not _runnable_work_items(run) and run.open_dependencies():
-        run.transition(RunStatus.WAITING)
-    return dependency
+    dependencies: list[Dependency] = []
+    results: list[ToolResult] = []
+    for item in prepared:
+        assert not isinstance(item, ToolResult)
+        dependency, handle = item
+        run.add_dependency(dependency)
+        dependencies.append(dependency)
+        if handle is None:
+            results.append(
+                ToolResult(
+                    ok=True,
+                    stdout=f"Registered text dependency {dependency.dependency_id}",
+                )
+            )
+        else:
+            run.add_secret_handle(dependency, handle)
+            results.append(
+                ToolResult(
+                    ok=True,
+                    stdout=(
+                        f"Registered Secret dependency {dependency.dependency_id}\n"
+                        f"Secret handle: {handle.secret_handle}\n"
+                        f"Consumer: {handle.consumer}\n"
+                        f"Environment variable: {handle.environment_variable}"
+                    ),
+                )
+            )
+    _append_tool_results(pending_messages, run, calls, tuple(results))
+    run.transition(RunStatus.WAITING)
+    return tuple(dependencies)
 
 
 def _run_turns(
@@ -436,14 +402,12 @@ def _run_turns(
                     for call in turn.tool_calls
                     if call.name in {TEXT_WAIT_TOOL.name, SECRET_WAIT_TOOL.name}
                 )
-                if dependency_calls and (
-                    len(dependency_calls) != 1 or len(turn.tool_calls) != 1
-                ):
+                if dependency_calls and len(dependency_calls) != len(turn.tool_calls):
                     dependency_error = ToolResult(
                         ok=False,
                         stderr=(
-                            "wait_for_text or wait_for_secret must be the only "
-                            "tool call in its turn"
+                            "A turn containing wait_for_text or wait_for_secret "
+                            "may contain only wait tool calls"
                         ),
                     )
                     _append_tool_results(
@@ -453,27 +417,25 @@ def _run_turns(
                         tuple(dependency_error for _call in turn.tool_calls),
                     )
                     messages_after_checkpoint.append(
-                        "Rejected tool turn: dependency request must be called alone"
+                        "Rejected tool turn: wait requests cannot be mixed with other tools"
                     )
                 elif dependency_calls:
-                    dependency_call = dependency_calls[0]
-                    if dependency_call.name == TEXT_WAIT_TOOL.name:
-                        dependency = _create_text_dependency(
-                            run, dependency_call, pending_messages
+                    dependencies = _create_wait_dependencies(
+                        run, dependency_calls, pending_messages
+                    )
+                    if not dependencies:
+                        messages_after_checkpoint.append(
+                            "Wait requests were not registered"
                         )
-                        wait_message = "Waiting for text"
                     else:
-                        dependency = _create_secret_dependency(
-                            run, dependency_call, pending_messages
-                        )
-                        wait_message = "Waiting for Secret input"
-                    if dependency is None:
-                        messages_after_checkpoint.append(
-                            f"Tool {dependency_call.name}: failed"
-                        )
-                    elif run.status is RunStatus.WAITING:
-                        messages_after_checkpoint.append(
-                            f"{wait_message}: {dependency.prompt}"
+                        messages_after_checkpoint.extend(
+                            (
+                                "Waiting for text: "
+                                if dependency.kind is DependencyKind.TEXT
+                                else "Waiting for Secret input: "
+                            )
+                            + dependency.prompt
+                            for dependency in dependencies
                         )
                         return_after_checkpoint = True
                 else:
@@ -506,7 +468,6 @@ def _run_turns(
                             )
             elif turn.stop_reason == "end_turn" and turn.text:
                 run.final_summary = turn.text
-                _running_work_item(run).transition(WorkItemStatus.COMPLETED)
                 run.transition(RunStatus.COMPLETED)
                 messages_after_checkpoint.append("Run completed")
                 return_after_checkpoint = True
@@ -537,15 +498,8 @@ def _run_turns(
 
 def _terminate_run(run: Run, status: RunStatus, error: str) -> None:
     run.error = error
-    _fail_running_work_items(run)
     if run.status in {RunStatus.RUNNING, RunStatus.WAITING}:
         run.transition(status)
-
-
-def _fail_running_work_items(run: Run) -> None:
-    for work_item in run.work_items:
-        if work_item.status is WorkItemStatus.RUNNING:
-            work_item.transition(WorkItemStatus.FAILED)
 
 
 def start_run(
@@ -580,7 +534,6 @@ def start_run(
     current_context_manager.bind_scope(run.context_scope_id)
     session.workspace = session.workspace.resolve()
     run.transition(RunStatus.RUNNING)
-    _resume_one_work_item(run)
     pending_messages = [
         ModelMessage(
             role="user",
@@ -640,8 +593,12 @@ def continue_run(
     agent_spec: AgentSpec,
 ) -> Run:
     """Persist a resolved dependency, then continue its durable run."""
-    if run.status is not RunStatus.RUNNING:
-        raise AgentLoopError("Only a running run can continue")
+    if run.status not in {RunStatus.RUNNING, RunStatus.WAITING}:
+        raise AgentLoopError("Only a run resolving dependencies can continue")
+    if run.status is RunStatus.RUNNING and run.open_dependencies():
+        raise AgentLoopError("Run cannot resume while dependencies remain open")
+    if run.status is RunStatus.WAITING and not run.open_dependencies():
+        raise AgentLoopError("Waiting run has no open dependencies")
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
     if not store.has_run_messages(run.run_id):
@@ -657,8 +614,10 @@ def continue_run(
     _sync_context(run, store, current_context_manager)
     pending = list(pending_messages)
     _checkpoint(session, run, store, current_context_manager, pending)
+    if run.status is RunStatus.WAITING:
+        output(f"Input received; {len(run.open_dependencies())} dependencies remain")
+        return run
     output("Input received; resuming run")
-    _resume_one_work_item(run)
     return _run_turns(
         session,
         run,

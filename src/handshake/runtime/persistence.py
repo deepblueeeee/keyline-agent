@@ -76,7 +76,7 @@ class RunStore(Protocol):
         ...
 
     def load_run(self, run_id: str) -> Run:
-        """Restore a complete run state, including work items and dependencies."""
+        """Restore a complete run state, including dependencies."""
         ...
 
     def list_runs(self, session_id: str | None = None) -> tuple[Run, ...]:

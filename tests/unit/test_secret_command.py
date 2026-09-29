@@ -17,14 +17,12 @@ def _available_secret(
     raw_value: str,
 ) -> tuple[Run, SecretHandle, object, SecretCommandRunner]:
     run = Run(goal="integration test", session_id="session", agent_spec_id="test")
-    work = run.work_items[0]
     dependency = Dependency(
-        work_id=work.work_id,
         tool_call_id="ask-secret",
         prompt="Provide test API key",
         kind=DependencyKind.SECRET,
     )
-    run.add_dependency(work, dependency)
+    run.add_dependency(dependency)
     handle = SecretHandle(
         dependency_id=dependency.dependency_id,
         purpose="authenticate the integration test",

@@ -29,8 +29,6 @@ from handshake.runtime.state import (
     SecretHandle,
     SecretHandleStatus,
     Session,
-    WorkItem,
-    WorkItemStatus,
     utc_now,
 )
 from handshake.storage.errors import RunNotFoundError, SessionNotFoundError, StorageError
@@ -287,21 +285,9 @@ class SQLiteStateStore(RunStore):
         if row is None:
             raise RunNotFoundError(f"Run not found: {run_id}")
         try:
-            work_items = [
-                WorkItem(
-                    work_id=str(item_row["work_id"]),
-                    description=str(item_row["description"]),
-                    status=WorkItemStatus(item_row["status"]),
-                )
-                for item_row in connection.execute(
-                    "SELECT * FROM work_items WHERE run_id = ? ORDER BY position",
-                    (run_id,),
-                )
-            ]
             dependencies = [
                 Dependency(
                     dependency_id=str(dependency_row["dependency_id"]),
-                    work_id=str(dependency_row["work_id"]),
                     tool_call_id=str(dependency_row["tool_call_id"]),
                     prompt=str(dependency_row["prompt"]),
                     kind=DependencyKind(dependency_row["kind"]),
@@ -344,7 +330,6 @@ class SQLiteStateStore(RunStore):
                 goal=str(row["goal"]),
                 status=RunStatus(row["status"]),
                 plan=plan,
-                work_items=work_items,
                 dependencies=dependencies,
                 secret_handles=secret_handles,
                 final_summary=row["final_summary"],
@@ -647,36 +632,17 @@ class SQLiteStateStore(RunStore):
     ) -> None:
         connection.execute("DELETE FROM secret_handles WHERE run_id = ?", (run.run_id,))
         connection.execute("DELETE FROM dependencies WHERE run_id = ?", (run.run_id,))
-        connection.execute("DELETE FROM work_items WHERE run_id = ?", (run.run_id,))
-        connection.executemany(
-            """
-            INSERT INTO work_items (
-                work_id, run_id, position, description, status
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                (
-                    item.work_id,
-                    run.run_id,
-                    index,
-                    item.description,
-                    item.status.value,
-                )
-                for index, item in enumerate(run.work_items)
-            ),
-        )
         connection.executemany(
             """
             INSERT INTO dependencies (
-                dependency_id, run_id, work_id, position, tool_call_id, kind,
+                dependency_id, run_id, position, tool_call_id, kind,
                 prompt, status, created_at, resolved_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
                     dependency.dependency_id,
                     run.run_id,
-                    dependency.work_id,
                     index,
                     dependency.tool_call_id,
                     dependency.kind.value,

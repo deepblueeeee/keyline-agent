@@ -75,6 +75,40 @@ class _WaitThenFinishModel:
         )
 
 
+class _MultipleWaitThenFinishModel:
+    def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+        answers = [
+            str(block["text"])
+            for message in context.messages
+            for block in message.content
+            if block.get("type") == "text"
+            and "User response:" in str(block.get("text", ""))
+        ]
+        if answers:
+            assert len(answers) == 2
+            return ModelTurn(
+                content=({"type": "text", "text": "Applied both choices."},),
+                stop_reason="end_turn",
+            )
+        calls = (
+            ToolCall("ask-color", "wait_for_text", {"prompt": "Which color?"}),
+            ToolCall("ask-size", "wait_for_text", {"prompt": "Which size?"}),
+        )
+        return ModelTurn(
+            content=tuple(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+                for call in calls
+            ),
+            tool_calls=calls,
+            stop_reason="tool_use",
+        )
+
+
 class _RecordingFinishModel:
     def __init__(self, summary: str) -> None:
         self.summary = summary
@@ -434,6 +468,44 @@ def test_run_answers_text_wait_and_finishes_in_same_process(
     store = _store(home)
     session = store.load_session(runs[0].session_id)
     assert "User response: navy" in history(store, session)[-2].content[0]["text"]
+
+
+def test_multiple_waits_resume_after_partial_input_across_cli_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "state"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: _MultipleWaitThenFinishModel())
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+    answers = iter(("navy", None))
+
+    def first_inputs(_prompt: str) -> str:
+        answer = next(answers)
+        if answer is None:
+            raise EOFError
+        return answer
+
+    monkeypatch.setattr("builtins.input", first_inputs)
+    assert cli.main(["run", str(tmp_path), "configure button"]) == 2
+    stored_run = _store(home).list_runs()[0]
+    assert stored_run.status is RunStatus.WAITING
+    assert [dependency.status for dependency in stored_run.dependencies] == [
+        DependencyStatus.SATISFIED,
+        DependencyStatus.OPEN,
+    ]
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: "large" if prompt == "Response: " else "/exit",
+    )
+
+    assert cli.main(["resume", stored_run.session_id]) == 0
+    completed = _store(home).load_run(stored_run.run_id)
+    assert completed.status is RunStatus.COMPLETED
+    assert completed.final_summary == "Applied both choices."
+    assert all(
+        dependency.status is DependencyStatus.SATISFIED
+        for dependency in completed.dependencies
+    )
 
 
 def test_wait_survives_noninteractive_exit_interrupt_and_resume(

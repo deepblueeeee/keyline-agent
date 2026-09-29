@@ -157,13 +157,10 @@ def _create_secret_capabilities(
     return store.writer(), SecretCommandRunner(store.consumer(), approval)
 
 
-def _single_open_dependency(run: Run) -> Dependency:
+def _next_open_dependency(run: Run) -> Dependency:
     dependencies = run.open_dependencies()
-    if len(dependencies) != 1:
-        raise HandshakeError(
-            f"Run {run.run_id} must have exactly one open dependency, "
-            f"found {len(dependencies)}"
-        )
+    if not dependencies:
+        raise HandshakeError(f"Waiting run {run.run_id} has no open dependency")
     return dependencies[0]
 
 
@@ -243,7 +240,7 @@ def _drive_run(
     context_manager: AgentContextManager | None = None,
 ) -> tuple[int, Run]:
     while run.status is RunStatus.WAITING:
-        dependency = _single_open_dependency(run)
+        dependency = _next_open_dependency(run)
         if dependency.kind is DependencyKind.TEXT:
             response = _read_dependency_response(session, run, dependency)
             if response is None:
@@ -563,12 +560,6 @@ def _inspect_run(args: argparse.Namespace) -> int:
             print(f"  - {step}")
     else:
         print("  (not set)")
-    print("Work items:")
-    for work_item in run.work_items:
-        print(
-            f"  - {work_item.work_id} [{work_item.status.value}] "
-            f"{work_item.description}"
-        )
     print("Dependencies:")
     if run.dependencies:
         for dependency in run.dependencies:

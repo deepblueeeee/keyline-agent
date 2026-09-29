@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from handshake.models.base import ToolDefinition
 from handshake.models.protocol import ToolCall
-from handshake.runtime.state import Dependency, ToolResult, WorkItem
+from handshake.runtime.state import Dependency, ToolResult
 
 TEXT_WAIT_TOOL = ToolDefinition(
     name="wait_for_text",
     description=(
-        "Pause the current work to ask for a non-sensitive fact that cannot be inferred from "
+        "Pause the run to ask for a non-sensitive fact that cannot be inferred from "
         "the workspace. Never use this for passwords, API keys, tokens, or other secrets. "
-        "This must be the only tool call in the assistant turn."
+        "It may be combined only with other wait requests."
     ),
     input_schema={
         "type": "object",
@@ -28,16 +28,13 @@ TEXT_WAIT_TOOL = ToolDefinition(
 )
 
 
-def prepare_text_dependency(
-    call: ToolCall, work_item: WorkItem
-) -> Dependency | ToolResult:
-    """Validate one request and describe the dependency blocking current work."""
+def prepare_text_dependency(call: ToolCall) -> Dependency | ToolResult:
+    """Validate one request and describe the dependency blocking the run."""
     prompt = call.arguments.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return ToolResult(ok=False, stderr="prompt must be a non-empty string")
     normalized_prompt = prompt.strip()
     return Dependency(
-        work_id=work_item.work_id,
         tool_call_id=call.id,
         prompt=normalized_prompt,
     )

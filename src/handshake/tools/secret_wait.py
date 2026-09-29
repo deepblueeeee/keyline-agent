@@ -9,7 +9,6 @@ from handshake.runtime.state import (
     DependencyKind,
     SecretHandle,
     ToolResult,
-    WorkItem,
 )
 
 SECRET_COMMAND_CONSUMER = "run_command_with_secret"
@@ -22,7 +21,7 @@ SECRET_WAIT_TOOL = ToolDefinition(
     description=(
         "Request a credential through Handshake's out-of-band, no-echo Secret channel. "
         "Use only when run_command_with_secret needs one of the supported environment variables. "
-        "This must be the only tool call in the assistant turn."
+        "It may be combined only with other wait requests."
     ),
     input_schema={
         "type": "object",
@@ -48,9 +47,7 @@ SECRET_WAIT_TOOL = ToolDefinition(
 )
 
 
-def prepare_secret_dependency(
-    call: ToolCall, work_item: WorkItem
-) -> tuple[Dependency, SecretHandle] | ToolResult:
+def prepare_secret_dependency(call: ToolCall) -> tuple[Dependency, SecretHandle] | ToolResult:
     """Validate a Secret request without obtaining or storing its raw value."""
     prompt = call.arguments.get("prompt")
     purpose = call.arguments.get("purpose")
@@ -65,7 +62,6 @@ def prepare_secret_dependency(
             stderr="environment_variable must be one of the supported test variables",
         )
     dependency = Dependency(
-        work_id=work_item.work_id,
         tool_call_id=call.id,
         prompt=prompt.strip(),
         kind=DependencyKind.SECRET,

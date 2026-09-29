@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -62,18 +62,9 @@ CREATE TABLE context_checkpoints (
     snapshot_json TEXT NOT NULL
 );
 
-CREATE TABLE work_items (
-    work_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    description TEXT NOT NULL,
-    status TEXT NOT NULL
-);
-
 CREATE TABLE dependencies (
     dependency_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    work_id TEXT NOT NULL REFERENCES work_items(work_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     tool_call_id TEXT NOT NULL,
     kind TEXT NOT NULL,

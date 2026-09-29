@@ -74,16 +74,25 @@ def _system_prompt(
     if "wait_for_text" in tool_names:
         protocol.extend(
             (
-                "- Call wait_for_text alone to request non-sensitive user input; "
-                "never use it for credentials.",
+                "- Use wait_for_text for non-sensitive user input; never use it "
+                "for credentials.",
                 "- Its tool result registers a dependency. The answer arrives later as "
                 "a user continuation message.",
             )
         )
     if "wait_for_secret" in tool_names:
         protocol.append(
-            "- Call wait_for_secret alone for a credential. Its result contains an "
+            "- Use wait_for_secret for a credential. Its result contains an "
             "opaque handle, never the secret value."
+        )
+    wait_tools = tuple(
+        name for name in ("wait_for_text", "wait_for_secret") if name in tool_names
+    )
+    if wait_tools:
+        protocol.append(
+            "- A turn may request multiple waits, but it must contain only "
+            + " or ".join(wait_tools)
+            + " tool calls. The run continues after every requested input is resolved."
         )
     if "run_command_with_secret" in tool_names:
         protocol.append(
@@ -95,7 +104,6 @@ def _system_prompt(
         "workspace": exact.workspace,
         "plan": exact.plan,
         "constraints": exact.constraints,
-        "work_items": [asdict(item) for item in exact.work_items],
         "dependencies": [asdict(item) for item in exact.dependencies],
     }
     return (

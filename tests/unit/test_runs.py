@@ -5,7 +5,7 @@ import pytest
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.errors import AgentLoopError
 from handshake.runtime.runs import create_followup_run, create_initial_run
-from handshake.runtime.state import Run, RunStatus, Session, WorkItemStatus
+from handshake.runtime.state import Run, RunStatus, Session
 from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 
@@ -19,7 +19,6 @@ def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, .
         agent_spec_id="test",
     )
     run.transition(RunStatus.RUNNING)
-    run.work_items[0].transition(WorkItemStatus.RUNNING)
     messages = (
         ModelMessage(
             role="user",
@@ -33,7 +32,6 @@ def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, .
         ),
     )
     run.final_summary = "first result"
-    run.work_items[0].transition(WorkItemStatus.COMPLETED)
     run.transition(RunStatus.COMPLETED)
     return run, messages
 
@@ -69,7 +67,6 @@ def test_active_run_blocks_followup(tmp_path: Path) -> None:
         agent_spec_id="test",
     )
     active.transition(RunStatus.RUNNING)
-    active.work_items[0].transition(WorkItemStatus.RUNNING)
 
     with pytest.raises(AgentLoopError, match="already has an active run"):
         create_followup_run(session, [active], "must wait")
@@ -88,9 +85,7 @@ def test_failed_or_cancelled_run_allows_followup(
         agent_spec_id="test",
     )
     run.transition(RunStatus.RUNNING)
-    run.work_items[0].transition(WorkItemStatus.RUNNING)
     run.error = "stopped"
-    run.work_items[0].transition(WorkItemStatus.FAILED)
     run.transition(status)
     session.context_scope = session.context_scope.advance(run)
 
@@ -116,7 +111,6 @@ def test_competing_followup_run_cannot_fork_session_history(tmp_path: Path) -> N
     pending: dict[str, tuple[ModelMessage, ...]] = {}
     for candidate in (candidate_a, candidate_b):
         candidate.transition(RunStatus.RUNNING)
-        candidate.work_items[0].transition(WorkItemStatus.RUNNING)
         pending[candidate.run_id] = (
             ModelMessage(
                 role="user",

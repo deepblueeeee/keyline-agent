@@ -1,4 +1,4 @@
-"""Runtime execution state for sessions, runs, work, tools, and dependencies."""
+"""Runtime execution state for sessions, runs, tools, and dependencies."""
 
 from __future__ import annotations
 
@@ -26,13 +26,6 @@ class ToolRunStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
-    FAILED = "failed"
-
-
-class WorkItemStatus(StrEnum):
-    READY = "ready"
-    RUNNING = "running"
-    COMPLETED = "completed"
     FAILED = "failed"
 
 
@@ -70,17 +63,6 @@ _RUN_TRANSITIONS = {
     RunStatus.COMPLETED: set(),
     RunStatus.FAILED: set(),
     RunStatus.CANCELLED: set(),
-}
-
-_WORK_ITEM_TRANSITIONS = {
-    WorkItemStatus.READY: {WorkItemStatus.RUNNING, WorkItemStatus.FAILED},
-    WorkItemStatus.RUNNING: {
-        WorkItemStatus.READY,
-        WorkItemStatus.COMPLETED,
-        WorkItemStatus.FAILED,
-    },
-    WorkItemStatus.COMPLETED: set(),
-    WorkItemStatus.FAILED: set(),
 }
 
 _DEPENDENCY_TRANSITIONS = {
@@ -125,7 +107,6 @@ class ToolResult:
 
 @dataclass(slots=True)
 class ToolRun:
-    work_id: str
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any]
@@ -142,22 +123,7 @@ class ToolRun:
 
 
 @dataclass(slots=True)
-class WorkItem:
-    description: str
-    work_id: str = field(default_factory=lambda: str(uuid4()))
-    status: WorkItemStatus = WorkItemStatus.READY
-
-    def transition(self, target: WorkItemStatus) -> None:
-        if target not in _WORK_ITEM_TRANSITIONS[self.status]:
-            raise InvalidStateTransitionError(
-                f"Cannot transition work item from {self.status} to {target}"
-            )
-        self.status = target
-
-
-@dataclass(slots=True)
 class Dependency:
-    work_id: str
     tool_call_id: str
     prompt: str
     dependency_id: str = field(default_factory=lambda: str(uuid4()))
@@ -267,7 +233,6 @@ class Run:
     status: RunStatus = RunStatus.CREATED
     plan: list[str] = field(default_factory=list)
     tool_runs: list[ToolRun] = field(default_factory=list)
-    work_items: list[WorkItem] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     secret_handles: list[SecretHandle] = field(default_factory=list)
     final_summary: str | None = None
@@ -285,8 +250,6 @@ class Run:
             self.context_scope_id = (
                 str(uuid4()) if self.parent_run_id is not None else self.session_id
             )
-        if not self.work_items:
-            self.work_items.append(WorkItem(description=self.goal))
 
     def transition(self, target: RunStatus) -> None:
         if target not in _RUN_TRANSITIONS[self.status]:
@@ -294,13 +257,6 @@ class Run:
                 f"Cannot transition run from {self.status} to {target}"
             )
         self.status = target
-
-    def work_item_by_id(self, work_id: str) -> WorkItem | None:
-        """Return the work item identified within this run, if present."""
-        return next(
-            (item for item in self.work_items if item.work_id == work_id),
-            None,
-        )
 
     def dependency_by_id(self, dependency_id: str) -> Dependency | None:
         """Return the dependency identified within this run, if present."""
@@ -324,30 +280,16 @@ class Run:
             None,
         )
 
-    def add_dependency(
-        self, work_item: WorkItem, dependency: Dependency
-    ) -> None:
-        """Associate a dependency with work owned by this run."""
-        owned_work_item = self._require_work_item(work_item)
-        if dependency.work_id != owned_work_item.work_id:
-            raise InvalidStateTransitionError(
-                f"Dependency {dependency.dependency_id} is bound to work item "
-                f"{dependency.work_id}, not {owned_work_item.work_id}"
-            )
+    def add_dependency(self, dependency: Dependency) -> None:
+        """Associate a dependency with this run."""
         if self.dependency_by_id(dependency.dependency_id) is not None:
             raise InvalidStateTransitionError(
                 f"Dependency {dependency.dependency_id} already belongs to run {self.run_id}"
             )
         self.dependencies.append(dependency)
 
-    def add_tool_run(self, work_item: WorkItem, tool_run: ToolRun) -> None:
-        """Associate an executed tool action with work owned by this run."""
-        owned_work_item = self._require_work_item(work_item)
-        if tool_run.work_id != owned_work_item.work_id:
-            raise InvalidStateTransitionError(
-                f"Tool run {tool_run.tool_run_id} is bound to work item "
-                f"{tool_run.work_id}, not {owned_work_item.work_id}"
-            )
+    def add_tool_run(self, tool_run: ToolRun) -> None:
+        """Associate an executed tool action with this run."""
         if any(
             existing.tool_run_id == tool_run.tool_run_id
             for existing in self.tool_runs
@@ -401,32 +343,6 @@ class Run:
             ),
             None,
         )
-
-    def dependencies_for(self, work_item: WorkItem) -> tuple[Dependency, ...]:
-        """Return dependencies associated with work owned by this run."""
-        owned_work_item = self._require_work_item(work_item)
-        return tuple(
-            dependency
-            for dependency in self.dependencies
-            if dependency.work_id == owned_work_item.work_id
-        )
-
-    def tool_runs_for(self, work_item: WorkItem) -> tuple[ToolRun, ...]:
-        """Return tool runs associated with work owned by this run."""
-        owned_work_item = self._require_work_item(work_item)
-        return tuple(
-            tool_run
-            for tool_run in self.tool_runs
-            if tool_run.work_id == owned_work_item.work_id
-        )
-
-    def _require_work_item(self, work_item: WorkItem) -> WorkItem:
-        owned_work_item = self.work_item_by_id(work_item.work_id)
-        if owned_work_item is None:
-            raise InvalidStateTransitionError(
-                f"Work item {work_item.work_id} does not belong to run {self.run_id}"
-            )
-        return owned_work_item
 
     def open_dependencies(self) -> tuple[Dependency, ...]:
         return tuple(

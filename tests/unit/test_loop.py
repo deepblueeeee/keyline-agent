@@ -5,6 +5,7 @@ import pytest
 
 import handshake.runtime.loop as runtime_loop
 from handshake.context import SequencedMessage
+from handshake.inputs import EphemeralSecretStore
 from handshake.models.errors import ModelProtocolError, ModelProviderError
 from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
@@ -16,16 +17,18 @@ from handshake.runtime.errors import (
 from handshake.runtime.loop import continue_run, start_run
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.runs import create_followup_run
+from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
+    DependencyKind,
     DependencyStatus,
     Run,
     RunStatus,
     Session,
-    WorkItemStatus,
 )
 from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
+from handshake.tools.secret_command import SecretCommandRunner
 from tests.history_support import TEST_AGENT_SPEC, fresh_store, history
 
 
@@ -74,7 +77,7 @@ class _RecordingStore(SQLiteStateStore):
         self.events = events
         self.fail_checkpoint = fail_checkpoint
         self.snapshots: list[
-            tuple[RunStatus, WorkItemStatus, DependencyStatus | None, int]
+            tuple[RunStatus, DependencyStatus | None, int]
         ] = []
 
     def create_run(
@@ -98,7 +101,6 @@ class _RecordingStore(SQLiteStateStore):
         self.snapshots.append(
             (
                 run.status,
-                run.work_items[0].status,
                 dependency_status,
                 self.message_count(run.context_scope_id) + len(messages),
             )
@@ -169,10 +171,6 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
         "read_file",
         "write_file",
     ]
-    assert {tool_run.work_id for tool_run in run.tool_runs} == {
-        run.work_items[0].work_id
-    }
-    assert run.work_items[0].status is WorkItemStatus.COMPLETED
     tool_results = model.contexts[1].messages[-1].content
     assert [block["tool_use_id"] for block in tool_results] == ["read", "write"]
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new"
@@ -458,7 +456,6 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
     )
 
     assert run.status is RunStatus.WAITING
-    assert run.work_items[0].status is WorkItemStatus.READY
     assert run.dependencies[0].status is DependencyStatus.OPEN
     immediate_result = history(store, session)[-1].content[0]
     assert immediate_result["type"] == "tool_result"
@@ -503,8 +500,146 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         for block in message.content
     ) == 1
     assert resumed_run.status is RunStatus.COMPLETED
-    assert resumed_run.work_items[0].status is WorkItemStatus.COMPLETED
     assert store.load_run(run.run_id).final_summary == "used navy"
+
+
+def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
+    tmp_path: Path,
+) -> None:
+    calls = (
+        ToolCall("ask-color", "wait_for_text", {"prompt": "Which color?"}),
+        ToolCall(
+            "ask-key",
+            "wait_for_secret",
+            {
+                "prompt": "Integration key?",
+                "purpose": "run a local test",
+                "environment_variable": "TEST_API_KEY",
+            },
+        ),
+        ToolCall("ask-size", "wait_for_text", {"prompt": "Which size?"}),
+    )
+    session, run, store = _session_run(tmp_path, "configure the test")
+    secret_store = EphemeralSecretStore()
+    runner = SecretCommandRunner(
+        secret_store.consumer(), lambda _cwd, _argv: True
+    )
+    start_run(
+        session,
+        run,
+        ScriptedModel([tool_turn(*calls)]),
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+        agent_spec=TEST_AGENT_SPEC,
+    )
+
+    assert run.status is RunStatus.WAITING
+    assert [dependency.kind for dependency in run.dependencies] == [
+        DependencyKind.TEXT,
+        DependencyKind.SECRET,
+        DependencyKind.TEXT,
+    ]
+    assert [block["tool_use_id"] for block in history(store, session)[-1].content] == [
+        call.id for call in calls
+    ]
+    assert all(not block["is_error"] for block in history(store, session)[-1].content)
+
+    loaded_session = store.load_session(session.session_id)
+    loaded_run = store.load_run(run.run_id)
+    first_answer = resolve_text_dependency(
+        loaded_session, loaded_run, loaded_run.dependencies[0].dependency_id, "navy"
+    )
+    assert loaded_run.status is RunStatus.WAITING
+    continue_run(
+        loaded_session,
+        loaded_run,
+        ScriptedModel([]),
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+        pending_messages=(first_answer,),
+        agent_spec=TEST_AGENT_SPEC,
+    )
+    assert store.load_run(run.run_id).status is RunStatus.WAITING
+    assert len(store.load_run(run.run_id).open_dependencies()) == 2
+
+    key_value = "multi-wait-canary"
+    loaded_run = store.load_run(run.run_id)
+    key_answer = resolve_secret_dependency(
+        loaded_session,
+        loaded_run,
+        loaded_run.dependencies[1].dependency_id,
+        key_value,
+        secret_store.writer(),
+    )
+    assert loaded_run.status is RunStatus.WAITING
+    continue_run(
+        loaded_session,
+        loaded_run,
+        ScriptedModel([]),
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+        pending_messages=(key_answer,),
+        secret_command_runner=runner,
+        agent_spec=TEST_AGENT_SPEC,
+    )
+    assert key_value.encode() not in store.database_path.read_bytes()
+    assert len(store.load_run(run.run_id).open_dependencies()) == 1
+
+    loaded_run = store.load_run(run.run_id)
+    last_answer = resolve_text_dependency(
+        loaded_session, loaded_run, loaded_run.dependencies[2].dependency_id, "large"
+    )
+    assert loaded_run.status is RunStatus.RUNNING
+    final_model = ScriptedModel([final_turn("configured")])
+    continue_run(
+        loaded_session,
+        loaded_run,
+        final_model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+        pending_messages=(last_answer,),
+        secret_command_runner=runner,
+        agent_spec=TEST_AGENT_SPEC,
+    )
+    assert loaded_run.status is RunStatus.COMPLETED
+    assert loaded_run.open_dependencies() == ()
+    assert [dependency.status for dependency in loaded_run.dependencies] == [
+        DependencyStatus.SATISFIED
+    ] * 3
+    assert len(final_model.contexts) == 1
+    assert all(
+        answer in repr(final_model.contexts[0].messages)
+        for answer in ("navy", "large")
+    )
+    assert key_value not in repr(final_model.contexts[0].messages)
+
+
+def test_invalid_wait_rejects_entire_wait_batch(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            tool_turn(
+                ToolCall("valid", "wait_for_text", {"prompt": "Which color?"}),
+                ToolCall("invalid", "wait_for_text", {"prompt": "  "}),
+            ),
+            final_turn("recovered"),
+        ]
+    )
+    session, run, store = _session_run(tmp_path, "choose color")
+
+    start_run(
+        session,
+        run,
+        model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+        agent_spec=TEST_AGENT_SPEC,
+    )
+
+    assert run.status is RunStatus.COMPLETED
+    assert run.dependencies == []
+    rejected = model.contexts[1].messages[-1].content
+    assert [block["tool_use_id"] for block in rejected] == ["valid", "invalid"]
+    assert all(block["is_error"] for block in rejected)
 
 
 def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
@@ -546,9 +681,9 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     )
 
     assert store.snapshots == [
-        (RunStatus.WAITING, WorkItemStatus.READY, DependencyStatus.OPEN, 3),
-        (RunStatus.RUNNING, WorkItemStatus.READY, DependencyStatus.SATISFIED, 4),
-        (RunStatus.COMPLETED, WorkItemStatus.COMPLETED, DependencyStatus.SATISFIED, 5),
+        (RunStatus.WAITING, DependencyStatus.OPEN, 3),
+        (RunStatus.RUNNING, DependencyStatus.SATISFIED, 4),
+        (RunStatus.COMPLETED, DependencyStatus.SATISFIED, 5),
     ]
     assert events.index("checkpoint:running") < events.index(
         "Input received; resuming run"
@@ -579,7 +714,6 @@ def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -
         )
 
     assert run.status is RunStatus.WAITING
-    assert run.work_items[0].status is WorkItemStatus.READY
     assert run.error is None
     assert "Waiting for text: Which color?" not in events
 

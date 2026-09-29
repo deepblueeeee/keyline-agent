@@ -11,7 +11,6 @@ from handshake.runtime.state import (
     Run,
     RunStatus,
     Session,
-    WorkItemStatus,
 )
 
 
@@ -19,8 +18,6 @@ def _waiting_run(tmp_path: Path) -> tuple[Session, Run, list[ModelMessage]]:
     session = Session(workspace=tmp_path, session_id="test-session")
     run = Run(goal="选择发布颜色", session_id=session.session_id, agent_spec_id="test")
     run.transition(RunStatus.RUNNING)
-    work = run.work_items[0]
-    work.transition(WorkItemStatus.RUNNING)
     messages = [
             ModelMessage(
                 role="assistant",
@@ -48,14 +45,11 @@ def _waiting_run(tmp_path: Path) -> tuple[Session, Run, list[ModelMessage]]:
             ),
         ]
     run.add_dependency(
-        work,
         Dependency(
-            work_id=work.work_id,
             tool_call_id="ask-1",
             prompt="发布按钮使用什么颜色？",
         ),
     )
-    work.transition(WorkItemStatus.READY)
     run.transition(RunStatus.WAITING)
     return session, run, messages
 
@@ -70,7 +64,6 @@ def test_resolving_dependency_appends_a_separate_continuation_message(
 
     assert run.status is RunStatus.RUNNING
     assert run.dependencies[0].status is DependencyStatus.SATISFIED
-    assert run.work_items[0].status is WorkItemStatus.READY
     continuation = messages[-1].content[0]
     assert messages[-1].run_id == run.run_id
     assert continuation["type"] == "text"

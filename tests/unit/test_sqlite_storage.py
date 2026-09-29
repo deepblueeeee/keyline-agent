@@ -12,7 +12,6 @@ from handshake.runtime.state import (
     Run,
     RunStatus,
     Session,
-    WorkItemStatus,
 )
 from handshake.storage.errors import RunNotFoundError, StorageError
 from handshake.storage.sqlite import SQLiteStateStore
@@ -28,8 +27,6 @@ def _waiting_run(session: Session) -> tuple[Run, list[ModelMessage]]:
         agent_spec_id="test",
     )
     run.transition(RunStatus.RUNNING)
-    work = run.work_items[0]
-    work.transition(WorkItemStatus.RUNNING)
     messages = [
             ModelMessage(
                 role="user",
@@ -63,14 +60,11 @@ def _waiting_run(session: Session) -> tuple[Run, list[ModelMessage]]:
             ),
         ]
     run.add_dependency(
-        work,
         Dependency(
-            work_id=work.work_id,
             tool_call_id="ask-1",
             prompt="发布按钮使用什么颜色？",
         ),
     )
-    work.transition(WorkItemStatus.READY)
     run.transition(RunStatus.WAITING)
     return run, messages
 
@@ -95,7 +89,6 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
     assert loaded_messages[1].message.content[0]["thinking"] == "需要用户决定"
     assert loaded_messages[1].message.run_id == run.run_id
     assert loaded_run.dependencies[0].tool_call_id == "ask-1"
-    assert loaded_run.work_items[0].status is WorkItemStatus.READY
     assert loaded_run.session_id == session.session_id
     assert not hasattr(loaded_session, "messages")
     with sqlite3.connect(database) as connection:
@@ -120,6 +113,8 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
     assert not hasattr(loaded_session, "version")
     assert not hasattr(loaded_run, "version")
     assert "dependencies" in tables
+    assert "work_items" not in tables
+    assert "work_id" not in dependency_columns
     assert "wait_conditions" not in tables
 
     with pytest.raises(RunNotFoundError):

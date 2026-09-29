@@ -140,12 +140,11 @@ def test_capture_preserves_exact_state_and_sequences_complete_history(
 ) -> None:
     session, run = _session_run(tmp_path)
     dependency = Dependency(
-        work_id=run.work_items[0].work_id,
         tool_call_id="ask",
         kind=DependencyKind.TEXT,
         prompt="Which version must remain supported?",
     )
-    run.add_dependency(run.work_items[0], dependency)
+    run.add_dependency(dependency)
     run.plan.append("Check compatibility")
     messages = [
             ModelMessage("user", ({"type": "text", "text": "request"},), "prior"),
@@ -167,7 +166,6 @@ def test_capture_preserves_exact_state_and_sequences_complete_history(
     assert view.exact.dependencies[0].prompt == "Which version must remain supported?"
     assert view.exact.dependencies[0].dependency_id == dependency.dependency_id
     assert view.exact.dependencies[0].status == "open"
-    assert view.exact.work_items[0].work_id == run.work_items[0].work_id
     assert view.history == ()
     assert view.source_message_count == 2
     assert tuple(item.sequence for item in view.protected_recent.messages) == (0, 1)
