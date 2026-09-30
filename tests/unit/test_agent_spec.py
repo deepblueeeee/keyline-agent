@@ -51,12 +51,23 @@ def test_named_specs_define_their_own_instructions() -> None:
     demo = demo_agent_spec(("run_tests",))
 
     assert main.spec_id == "main"
-    assert "main coding agent" in main.instructions
+    assert main.instructions.startswith(
+        "You are Handshake, a local coding agent operating on one workspace."
+    )
+    assert "main coding agent" not in main.instructions
+    assert "delegate" not in main.instructions
     assert main.default_budget is budget
     assert main.allowed_tools == {"read_file", "run_tests"}
     assert demo.spec_id == "demo"
     assert "isolated coding demo" in demo.instructions
     assert demo.instructions != main.instructions
+
+
+def test_delegation_guidance_requires_the_tool() -> None:
+    main = main_agent_spec("model", ("read_file", "delegate"), ContextBudgetPolicy())
+
+    assert "explorer" in main.instructions
+    assert "reviewer" in main.instructions
 
 
 def test_agent_spec_rejects_invalid_configuration() -> None:

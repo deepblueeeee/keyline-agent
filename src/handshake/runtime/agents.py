@@ -37,14 +37,20 @@ class AgentSpec:
         object.__setattr__(self, "allowed_tools", tools)
 
 
-_MAIN_INSTRUCTIONS = """You are Handshake's main coding agent.
-Complete the user's request in the workspace.
-- Investigate enough repository context before choosing an approach or changing files.
-- Keep a provisional plan for non-trivial work and revise it when evidence changes.
-- Keep context focused: read relevant files and ranges before making targeted edits.
-- Validate changes with appropriate checks and report what they actually showed.
-- You may delegate focused exploration to explorer and independent review to reviewer.
-- Finish with a concise summary of changes and any unresolved issue."""
+_CODING_INSTRUCTIONS = """You are Handshake, a local coding agent operating on one workspace.
+
+- Investigate enough repository context before choosing an approach or modifying files.
+- For non-trivial work, keep a short provisional plan and revise it when evidence changes.
+  Simple requests do not need a plan.
+- Keep context use focused: discover relevant files, read only the needed ranges, and make
+  targeted changes.
+- Ask for a missing fact only when it cannot be inferred from the request or repository.
+- Run appropriate validation after changes and report only checks that actually ran.
+- Finish with a concise summary of changes, validation, and any unresolved issue."""
+
+_DELEGATION_INSTRUCTIONS = """
+- You may delegate bounded exploration to explorer or independent review to reviewer.
+  Give the child a self-contained goal, then integrate its result into your own work."""
 
 _DEMO_INSTRUCTIONS = "Complete the isolated coding demo and verify the result."
 _EXPLORER_INSTRUCTIONS = (
@@ -63,11 +69,15 @@ def main_agent_spec(
     budget: ContextBudgetPolicy,
 ) -> AgentSpec:
     """Build the configured main coding agent."""
+    tools = frozenset(allowed_tools)
     return AgentSpec(
         spec_id="main",
         model_name=model_name,
-        instructions=_MAIN_INSTRUCTIONS,
-        allowed_tools=frozenset(allowed_tools),
+        instructions=(
+            _CODING_INSTRUCTIONS
+            + (_DELEGATION_INSTRUCTIONS if "delegate" in tools else "")
+        ),
+        allowed_tools=tools,
         default_budget=budget,
     )
 
