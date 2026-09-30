@@ -9,8 +9,8 @@ DELEGATE_TOOL = ToolDefinition(
     description=(
         "Run a configured child agent on a specific goal in its own model context. "
         "The child shares the workspace, but not your message history. "
-        "Use one delegation per tool turn; its structured result is returned when "
-        "the child finishes."
+        "A tool turn may delegate to several child agents and no other tools. "
+        "Their structured results return together after every child finishes."
     ),
     input_schema={
         "type": "object",

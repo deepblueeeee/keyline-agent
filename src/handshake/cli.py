@@ -54,6 +54,7 @@ from handshake.runtime.runs import (
     create_initial_run,
     latest_run,
 )
+from handshake.runtime.scheduler import CooperativeScheduler
 from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
     Dependency,
@@ -353,11 +354,14 @@ def _process_current_run(
             if run.status is RunStatus.WAITING and not run.open_dependencies():
                 return _WAITING_EXIT_CODE, run
         elif run.status is RunStatus.RUNNING:
-            run = resume_run(
-                session, run, current_model, registry, store=store,
-                agent_spec=agent_spec, delegation=delegation, emit=print,
-                secret_command_runner=secret_command_runner,
-                context_manager=current_context,
+            run = delegation.scheduler.advance_runnable(
+                run,
+                lambda runnable: resume_run(
+                    session, runnable, current_model, registry, store=store,
+                    agent_spec=agent_spec, delegation=delegation, emit=print,
+                    secret_command_runner=secret_command_runner,
+                    context_manager=current_context,
+                ),
             )
         elif run.status is RunStatus.WAITING and not run.open_dependencies():
             run = continue_delegation(
@@ -453,7 +457,9 @@ def _settle_run(
     context_managers: ActiveContextManagers,
     initial_model: ModelAdapter | None = None,
 ) -> tuple[int, Run]:
-    """Drive the active child chain and hand terminal results back to parents."""
+    """Advance runnable children, route a wait, then join through the parent."""
+    if run.parent_run_id is not None:
+        run = store.load_run(run.parent_run_id)
     model = initial_model
     while True:
         result_code, run = _process_current_run(
@@ -476,13 +482,14 @@ def _settle_run(
             )
             if not children:
                 raise AgentLoopError("Delegating run has no child after resume")
-            run = children[-1]
+            child = CooperativeScheduler().waiting_child(children)
+            if child is None:
+                raise AgentLoopError("Delegation batch has no waiting child to route")
+            run = child
             continue
-        if run.parent_run_id is not None and run.status in {
-            RunStatus.COMPLETED,
-            RunStatus.FAILED,
-            RunStatus.CANCELLED,
-        }:
+        if run.parent_run_id is not None:
+            if result_code == _WAITING_EXIT_CODE:
+                return result_code, run
             run = store.load_run(run.parent_run_id)
             continue
         return result_code, run
@@ -538,12 +545,14 @@ def _resume_session(args: argparse.Namespace) -> int:
     secret_writer, secret_command_runner = _create_secret_capabilities(
         _approval_callback(settings.approval_mode, with_secret=True)
     )
-    if prepare_run_for_resume(
-        session,
-        run,
-        secret_command_runner,
-        store=store,
-    ):
+    secrets_reissued = False
+    for active in store.list_runs(session.session_id):
+        if active.status in {RunStatus.RUNNING, RunStatus.WAITING}:
+            secrets_reissued = (
+                prepare_run_for_resume(session, active, secret_command_runner, store=store)
+                or secrets_reissued
+            )
+    if secrets_reissued:
         print("A process-local Secret was lost and must be entered again.")
     return _drive_session(
         session,

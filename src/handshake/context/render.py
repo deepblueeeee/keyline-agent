@@ -101,8 +101,8 @@ def _system_prompt(
         )
     if "delegate" in tool_names:
         protocol.append(
-            "- Call delegate alone in a tool turn. The child uses its own message "
-            "history and returns a structured result when it finishes."
+            "- A turn may contain multiple delegate calls, but no other tools. Each child "
+            "uses its own message history; results arrive together after every child finishes."
         )
     state = {
         "goal": exact.goal,

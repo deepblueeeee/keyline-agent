@@ -332,6 +332,7 @@ def _run_turns(
         pending_messages: list[ModelMessage] = []
         messages_after_checkpoint: list[str] = []
         return_after_checkpoint = False
+        joined_parent = False
         try:
             if run.model_turns >= run.max_steps:
                 raise StepLimitExceededError(
@@ -371,7 +372,7 @@ def _run_turns(
                 delegate_calls = tuple(
                     call for call in turn.tool_calls if call.name == DELEGATE_TOOL.name
                 )
-                if delegate_calls and len(turn.tool_calls) != 1:
+                if delegate_calls and len(delegate_calls) != len(turn.tool_calls):
                     _append_tool_results(
                         pending_messages,
                         run,
@@ -379,51 +380,50 @@ def _run_turns(
                         tuple(
                             ToolResult(
                                 ok=False,
-                                stderr="delegate must be the only tool call in its turn",
+                                stderr="A delegation turn may contain only delegate calls",
                             )
                             for _call in turn.tool_calls
                         ),
                     )
                     messages_after_checkpoint.append("Rejected mixed delegation turn")
                 elif delegate_calls:
-                    call = delegate_calls[0]
                     prepared = (
-                        delegation.prepare(call)
+                        delegation.prepare_batch(delegate_calls)
                         if delegation is not None
                         else ToolResult(ok=False, stderr="Delegation is unavailable")
                     )
                     if isinstance(prepared, ToolResult):
-                        _append_tool_results(pending_messages, run, (call,), (prepared,))
-                        messages_after_checkpoint.append(f"Delegation rejected: {prepared.stderr}")
+                        _append_tool_results(
+                            pending_messages,
+                            run,
+                            delegate_calls,
+                            tuple(prepared for _call in delegate_calls),
+                        )
+                        messages_after_checkpoint.append("Delegation batch rejected")
                     else:
-                        spec, goal = prepared
                         assert delegation is not None
                         run.transition(RunStatus.WAITING)
                         _checkpoint(session, run, store, context_manager, pending_messages)
-                        child = delegation.run_child(
+                        children = delegation.run_batch(
                             session,
                             run,
-                            call,
-                            spec,
-                            goal,
+                            delegate_calls,
+                            prepared,
                             registry,
                             secret_command_runner,
                             emit,
                             store,
                         )
-                        if child.status in {
-                            RunStatus.COMPLETED,
-                            RunStatus.FAILED,
-                            RunStatus.CANCELLED,
-                        }:
-                            delegation.append_result(pending_messages, run, child)
+                        if delegation.scheduler.ready_to_join(children):
+                            delegation.append_results(pending_messages, run, children)
                             run.transition(RunStatus.RUNNING)
+                            joined_parent = True
                             messages_after_checkpoint.append(
-                                f"Child run {child.run_id}: {child.status.value}"
+                                f"Joined {len(children)} child runs"
                             )
                         else:
                             messages_after_checkpoint.append(
-                                f"Child run {child.run_id} is waiting for input"
+                                "Delegation batch is waiting for child input"
                             )
                             return_after_checkpoint = True
                 elif dependency_calls and len(dependency_calls) != len(turn.tool_calls):
@@ -514,6 +514,15 @@ def _run_turns(
             emit(message)
         if return_after_checkpoint:
             return run
+        if joined_parent:
+            assert delegation is not None
+            return delegation.scheduler.advance_runnable(
+                run,
+                lambda parent: _run_turns(
+                    session, parent, model, registry, secret_command_runner,
+                    emit, store, context_manager, agent_spec, delegation,
+                ),
+            )
 
 
 def _terminate_run(run: Run, status: RunStatus, error: str) -> None:

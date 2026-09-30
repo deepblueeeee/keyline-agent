@@ -573,6 +573,88 @@ def test_delegated_child_wait_resumes_parent_across_cli_processes(
     assert len(tuple(store.read_messages(child.context_scope_id))) == 5
 
 
+def test_batch_wait_does_not_block_sibling_and_joins_after_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BatchModel:
+        def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+            if context.goal == "Explore":
+                if any(
+                    "User response:" in str(block.get("text", ""))
+                    for message in context.messages for block in message.content
+                ):
+                    return ModelTurn(
+                        content=({"type": "text", "text": "Explorer done"},),
+                        stop_reason="end_turn",
+                    )
+                calls = (
+                    ToolCall("ask", "wait_for_text", {"prompt": "Which file?"}),
+                )
+            elif context.goal == "Review":
+                return ModelTurn(
+                    content=({"type": "text", "text": "Reviewer done"},),
+                    stop_reason="end_turn",
+                )
+            elif any(
+                block.get("type") == "tool_result"
+                for message in context.messages for block in message.content
+            ):
+                return ModelTurn(
+                    content=({"type": "text", "text": "Used both child results"},),
+                    stop_reason="end_turn",
+                )
+            else:
+                calls = (
+                    ToolCall(
+                        "explore", "delegate",
+                        {"agent_spec_id": "explorer", "goal": "Explore"},
+                    ),
+                    ToolCall(
+                        "review", "delegate",
+                        {"agent_spec_id": "reviewer", "goal": "Review"},
+                    ),
+                )
+            return ModelTurn(
+                content=tuple(
+                    {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
+                    for call in calls
+                ),
+                tool_calls=calls,
+                stop_reason="tool_use",
+            )
+
+    home = tmp_path / "state"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: BatchModel())
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
+    assert cli.main(["run", str(tmp_path), "Investigate"]) == 2
+    store = _store(home)
+    runs = store.list_runs()
+    parent = next(run for run in runs if run.parent_run_id is None)
+    parent, explorer, reviewer = store.list_runs(parent.session_id)
+    assert [run.status for run in (parent, explorer, reviewer)] == [
+        RunStatus.WAITING, RunStatus.WAITING, RunStatus.COMPLETED,
+    ]
+    assert len(tuple(store.read_messages(parent.context_scope_id))) == 2
+
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: "A" if prompt == "Response: " else "/exit",
+    )
+    assert cli.main(["resume", parent.session_id]) == 0
+    store = _store(home)
+    parent, explorer, reviewer = store.list_runs(parent.session_id)
+    assert parent.status is RunStatus.COMPLETED
+    assert parent.final_summary == "Used both child results"
+    assert explorer.status is RunStatus.COMPLETED
+    assert reviewer.status is RunStatus.COMPLETED
+    messages = tuple(store.read_messages(parent.context_scope_id))
+    assert [block["tool_use_id"] for block in messages[2].message.content] == [
+        "explore", "review",
+    ]
+
+
 def test_wait_survives_noninteractive_exit_interrupt_and_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
