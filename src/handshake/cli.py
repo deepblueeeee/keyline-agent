@@ -33,10 +33,12 @@ from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.agents import (
     AgentSpec,
+    child_agent_specs,
     demo_agent_spec,
     main_agent_spec,
     model_name_for_run,
 )
+from handshake.runtime.delegation import DelegationRuntime, continue_delegation
 from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.errors import AgentLoopError, UserCancelledError
 from handshake.runtime.loop import (
@@ -46,6 +48,7 @@ from handshake.runtime.loop import (
     start_run,
 )
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.recovery import resume_run
 from handshake.runtime.runs import (
     create_followup_run,
     create_initial_run,
@@ -67,18 +70,15 @@ from handshake.tools.shell import ApprovalCallback
 
 _WAITING_EXIT_CODE = 2
 
+
 def _agent_specs(settings: RuntimeSettings, registry: ToolRegistry) -> dict[str, AgentSpec]:
     main = main_agent_spec(
         settings.provider.model,
-        (
-            definition.name
-            for definition in (*runtime_tool_definitions(), *registry.definitions())
-        ),
+        (definition.name for definition in (*runtime_tool_definitions(), *registry.definitions())),
         settings.context,
     )
-    return {
-        main.spec_id: main,
-    }
+    specs = (main, *child_agent_specs(settings.provider.model, settings.context))
+    return {spec.spec_id: spec for spec in specs}
 
 
 def _spec_for_run(run: Run, specs: Mapping[str, AgentSpec]) -> AgentSpec:
@@ -90,9 +90,7 @@ def _spec_for_run(run: Run, specs: Mapping[str, AgentSpec]) -> AgentSpec:
     return spec
 
 
-def _interactive_approval(
-    cwd: Path, argv: tuple[str, ...], *, with_secret: bool = False
-) -> bool:
+def _interactive_approval(cwd: Path, argv: tuple[str, ...], *, with_secret: bool = False) -> bool:
     print("\nApproval required")
     print(f"  cwd:  {cwd}")
     print(f"  argv: {shlex.join(argv)}")
@@ -168,9 +166,7 @@ def _resume_command(session: Session) -> str:
     return f"handshake resume {session.session_id}"
 
 
-def _read_dependency_response(
-    session: Session, run: Run, dependency: Dependency
-) -> str | None:
+def _read_dependency_response(session: Session, run: Run, dependency: Dependency) -> str | None:
     print("\nInput required")
     print(f"  session:  {session.session_id}")
     print(f"  run:      {run.run_id}")
@@ -192,14 +188,10 @@ def _read_dependency_response(
         raise UserCancelledError("User interrupted text input") from exc
 
 
-def _read_secret_value(
-    session: Session, run: Run, dependency: Dependency
-) -> str | None:
+def _read_secret_value(session: Session, run: Run, dependency: Dependency) -> str | None:
     handle = run.secret_handle_for(dependency)
     if handle is None:
-        raise HandshakeError(
-            f"Secret dependency {dependency.dependency_id} has no handle metadata"
-        )
+        raise HandshakeError(f"Secret dependency {dependency.dependency_id} has no handle metadata")
     print("\nSecret input required")
     print(f"  session:    {session.session_id}")
     print(f"  run:        {run.run_id}")
@@ -238,8 +230,11 @@ def _drive_run(
     secret_command_runner: SecretCommandRunner,
     agent_spec: AgentSpec,
     context_manager: AgentContextManager | None = None,
+    delegation: DelegationRuntime | None = None,
 ) -> tuple[int, Run]:
     while run.status is RunStatus.WAITING:
+        if not run.open_dependencies():
+            return _WAITING_EXIT_CODE, run
         dependency = _next_open_dependency(run)
         if dependency.kind is DependencyKind.TEXT:
             response = _read_dependency_response(session, run, dependency)
@@ -248,9 +243,7 @@ def _drive_run(
             if not response.strip():
                 print("Response must not be empty; the run is still waiting.")
                 continue
-            continuation = resolve_text_dependency(
-                session, run, dependency.dependency_id, response
-            )
+            continuation = resolve_text_dependency(session, run, dependency.dependency_id, response)
         elif dependency.kind is DependencyKind.SECRET:
             secret_value = _read_secret_value(session, run, dependency)
             if secret_value is None:
@@ -267,9 +260,7 @@ def _drive_run(
             )
             del secret_value
         else:
-            raise HandshakeError(
-                f"Unsupported dependency kind: {dependency.kind.value}"
-            )
+            raise HandshakeError(f"Unsupported dependency kind: {dependency.kind.value}")
         run = continue_run(
             session,
             run,
@@ -280,12 +271,11 @@ def _drive_run(
             secret_command_runner=secret_command_runner,
             context_manager=context_manager,
             agent_spec=agent_spec,
+            delegation=delegation,
             pending_messages=(continuation,),
         )
     if run.status is not RunStatus.COMPLETED:
-        raise HandshakeError(
-            f"Run {run.run_id} stopped in unsupported state {run.status.value}"
-        )
+        raise HandshakeError(f"Run {run.run_id} stopped in unsupported state {run.status.value}")
     _print_final_summary(run)
     return 0, run
 
@@ -337,14 +327,15 @@ def _process_current_run(
 ) -> tuple[int, Run]:
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         return _print_terminal_run(run), run
-    if run.status not in {RunStatus.CREATED, RunStatus.WAITING}:
+    if run.status not in {RunStatus.CREATED, RunStatus.WAITING, RunStatus.RUNNING}:
         return _print_terminal_run(run), run
 
     agent_spec = _spec_for_run(run, agent_specs)
     current_model = model or _create_real_model(model_name_for_run(run, agent_spec))
-    current_context = context_manager_for_run(
-        context_managers, run, agent_spec, current_model
+    delegation = DelegationRuntime(
+        agent_specs, lambda spec: _create_real_model(spec.model_name), context_managers
     )
+    current_context = context_manager_for_run(context_managers, run, agent_spec, current_model)
     try:
         if run.status is RunStatus.CREATED:
             run = start_run(
@@ -357,7 +348,31 @@ def _process_current_run(
                 secret_command_runner=secret_command_runner,
                 context_manager=current_context,
                 agent_spec=agent_spec,
+                delegation=delegation,
             )
+            if run.status is RunStatus.WAITING and not run.open_dependencies():
+                return _WAITING_EXIT_CODE, run
+        elif run.status is RunStatus.RUNNING:
+            run = resume_run(
+                session, run, current_model, registry, store=store,
+                agent_spec=agent_spec, delegation=delegation, emit=print,
+                secret_command_runner=secret_command_runner,
+                context_manager=current_context,
+            )
+        elif run.status is RunStatus.WAITING and not run.open_dependencies():
+            run = continue_delegation(
+                session,
+                run,
+                current_model,
+                registry,
+                store=store,
+                agent_spec=agent_spec,
+                delegation=delegation,
+                emit=print,
+                secret_command_runner=secret_command_runner,
+            )
+            if run.status is RunStatus.WAITING and not run.open_dependencies():
+                return _WAITING_EXIT_CODE, run
         return _drive_run(
             session,
             run,
@@ -368,6 +383,7 @@ def _process_current_run(
             secret_command_runner,
             agent_spec,
             current_context,
+            delegation,
         )
     except UserCancelledError:
         raise
@@ -392,7 +408,7 @@ def _drive_session(
     initial_model: ModelAdapter | None = None,
 ) -> int:
     context_managers = ActiveContextManagers()
-    result_code, run = _process_current_run(
+    result_code, run = _settle_run(
         session,
         run,
         registry,
@@ -412,7 +428,7 @@ def _drive_session(
             return 0
         runs = store.list_runs(session.session_id)
         run = create_followup_run(session, runs, goal)
-        result_code, run = _process_current_run(
+        result_code, run = _settle_run(
             session,
             run,
             registry,
@@ -426,6 +442,52 @@ def _drive_session(
             return result_code
 
 
+def _settle_run(
+    session: Session,
+    run: Run,
+    registry: ToolRegistry,
+    store: RunStore,
+    secret_writer: SecretWriter,
+    secret_command_runner: SecretCommandRunner,
+    agent_specs: Mapping[str, AgentSpec],
+    context_managers: ActiveContextManagers,
+    initial_model: ModelAdapter | None = None,
+) -> tuple[int, Run]:
+    """Drive the active child chain and hand terminal results back to parents."""
+    model = initial_model
+    while True:
+        result_code, run = _process_current_run(
+            session,
+            run,
+            registry,
+            store,
+            secret_writer,
+            secret_command_runner,
+            agent_specs,
+            context_managers,
+            model,
+        )
+        model = None
+        if run.status is RunStatus.WAITING and not run.open_dependencies():
+            children = tuple(
+                child
+                for child in store.list_runs(session.session_id)
+                if child.parent_run_id == run.run_id
+            )
+            if not children:
+                raise AgentLoopError("Delegating run has no child after resume")
+            run = children[-1]
+            continue
+        if run.parent_run_id is not None and run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        }:
+            run = store.load_run(run.parent_run_id)
+            continue
+        return result_code, run
+
+
 def _run_real(args: argparse.Namespace) -> int:
     workspace = Path(args.repo).expanduser().resolve()
     if not workspace.is_dir():
@@ -436,15 +498,14 @@ def _run_real(args: argparse.Namespace) -> int:
     session = Session(workspace=workspace)
     approval = _approval_callback(settings.approval_mode)
     registry = create_default_registry(approval)
-    main_spec = _agent_specs(settings, registry)["main"]
+    agent_specs = _agent_specs(settings, registry)
+    main_spec = agent_specs["main"]
     model = _create_real_model(main_spec.model_name)
     run = create_initial_run(
         session,
         args.request,
         model_name=main_spec.model_name,
-        max_steps=(
-            main_spec.default_max_steps if args.max_steps is None else args.max_steps
-        ),
+        max_steps=(main_spec.default_max_steps if args.max_steps is None else args.max_steps),
         agent_spec_id=main_spec.spec_id,
     )
     store.create_session(session)
@@ -459,7 +520,7 @@ def _run_real(args: argparse.Namespace) -> int:
         store,
         secret_writer,
         secret_command_runner,
-        {main_spec.spec_id: main_spec},
+        agent_specs,
         model,
     )
 
@@ -664,8 +725,7 @@ def _run_demo(_args: argparse.Namespace) -> int:
         session = Session(workspace=workspace)
         registry = create_default_registry(lambda _cwd, _argv: True)
         demo_spec = demo_agent_spec(
-            definition.name
-            for definition in (*runtime_tool_definitions(), *registry.definitions())
+            definition.name for definition in (*runtime_tool_definitions(), *registry.definitions())
         )
         run = Run(
             goal="Implement the missing calculator.add function",
@@ -676,8 +736,13 @@ def _run_demo(_args: argparse.Namespace) -> int:
         store = SQLiteStateStore(Path(temporary) / "demo.db")
         store.create_session(session)
         start_run(
-            session, run, _demo_model(), registry,
-            emit=print, store=store, agent_spec=demo_spec,
+            session,
+            run,
+            _demo_model(),
+            registry,
+            emit=print,
+            store=store,
+            agent_spec=demo_spec,
         )
         _print_final_summary(run)
         return 0
@@ -740,9 +805,7 @@ def _parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("session_id", help="durable session ID")
     inspect_parser.set_defaults(handler=_inspect_session)
 
-    inspect_run_parser = subparsers.add_parser(
-        "inspect-run", help="inspect one durable run"
-    )
+    inspect_run_parser = subparsers.add_parser("inspect-run", help="inspect one durable run")
     inspect_run_parser.add_argument("run_id", help="durable run ID")
     inspect_run_parser.set_defaults(handler=_inspect_run)
 

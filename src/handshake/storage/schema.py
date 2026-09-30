@@ -6,7 +6,7 @@ import sqlite3
 
 from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -29,6 +29,7 @@ CREATE TABLE runs (
     sequence INTEGER NOT NULL,
     previous_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
     parent_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    delegation_tool_call_id TEXT,
     agent_spec_id TEXT NOT NULL CHECK (length(trim(agent_spec_id)) > 0),
     context_scope_id TEXT NOT NULL,
     goal TEXT NOT NULL,
@@ -42,6 +43,7 @@ CREATE TABLE runs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (session_id, sequence),
+    UNIQUE (parent_run_id, delegation_tool_call_id),
     UNIQUE (run_id, session_id),
     FOREIGN KEY (context_scope_id, session_id)
         REFERENCES context_scopes(scope_id, session_id) ON DELETE RESTRICT
@@ -54,6 +56,20 @@ CREATE TABLE messages (
     role TEXT NOT NULL,
     content_json TEXT NOT NULL,
     PRIMARY KEY (scope_id, sequence)
+);
+
+CREATE TABLE tool_runs (
+    tool_run_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    model_turn INTEGER NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    replay_policy TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT,
+    UNIQUE (run_id, model_turn, tool_call_id)
 );
 
 CREATE TABLE context_checkpoints (
@@ -89,6 +105,7 @@ CREATE TABLE secret_handles (
 );
 
 CREATE INDEX runs_session_sequence ON runs(session_id, sequence);
+CREATE INDEX tool_runs_run_position ON tool_runs(run_id, position);
 CREATE INDEX dependencies_run_status ON dependencies(run_id, status);
 CREATE INDEX secret_handles_run_status ON secret_handles(run_id, status);
 """

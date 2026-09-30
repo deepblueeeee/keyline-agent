@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from handshake.context import (
     ActiveContextManagers,
@@ -20,6 +20,7 @@ from handshake.runtime.agents import AgentSpec, model_name_for_run
 from handshake.runtime.errors import (
     AgentLoopError,
     StepLimitExceededError,
+    ToolOutcomeUnknownError,
     UserCancelledError,
 )
 from handshake.runtime.persistence import RunStore
@@ -32,12 +33,12 @@ from handshake.runtime.state import (
     SecretHandle,
     Session,
     ToolResult,
-    ToolRun,
     ToolRunStatus,
 )
+from handshake.runtime.tool_execution import execute_tool_call
 from handshake.tools import (
+    DELEGATE_TOOL,
     PLAN_TOOL,
-    SECRET_COMMAND_TOOL,
     SECRET_WAIT_TOOL,
     TEXT_WAIT_TOOL,
     handle_plan,
@@ -47,6 +48,9 @@ from handshake.tools import (
 )
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
+
+if TYPE_CHECKING:
+    from handshake.runtime.delegation import DelegationRuntime
 
 EmitCallback = Callable[[str], None]
 
@@ -84,61 +88,12 @@ def _result_content(result: ToolResult) -> str:
 def _validate_turn_tool_calls(
     content: tuple[dict[str, Any], ...], calls: tuple[ToolCall, ...]
 ) -> None:
-    content_ids = [
-        block.get("id") for block in content if block.get("type") == "tool_use"
-    ]
+    content_ids = [block.get("id") for block in content if block.get("type") == "tool_use"]
     call_ids = [call.id for call in calls]
     if content_ids != call_ids:
         raise ModelProtocolError("Model tool calls do not match assistant content blocks")
     if len(call_ids) != len(set(call_ids)):
         raise ModelProtocolError("Model returned duplicate tool call IDs")
-
-
-def _execute_tool_call(
-    session: Session,
-    run: Run,
-    call: ToolCall,
-    registry: ToolRegistry,
-    secret_command_runner: SecretCommandRunner | None,
-    emit: EmitCallback,
-) -> ToolResult:
-    if call.name == PLAN_TOOL.name:
-        return handle_plan(run, call)
-
-    tool_run = ToolRun(
-        tool_call_id=call.id,
-        tool_name=call.name,
-        arguments=dict(call.arguments),
-    )
-    run.add_tool_run(tool_run)
-    tool_run.transition(ToolRunStatus.RUNNING)
-    emit(f"Running tool: {call.name}")
-    try:
-        if call.name == SECRET_COMMAND_TOOL.name:
-            if secret_command_runner is None:
-                result = ToolResult(
-                    ok=False,
-                    stderr=(
-                        "Secret command capability is unavailable; "
-                        "no shell fallback was used"
-                    ),
-                )
-            else:
-                result = secret_command_runner.execute(
-                    run, session.workspace, call.arguments
-                )
-        else:
-            result = registry.execute(call.name, session.workspace, call.arguments)
-    except Exception as exc:
-        tool_run.result = ToolResult(
-            ok=False,
-            stderr=f"Tool execution interrupted ({type(exc).__name__})",
-        )
-        tool_run.transition(ToolRunStatus.FAILED)
-        raise
-    tool_run.result = result
-    tool_run.transition(ToolRunStatus.SUCCEEDED if result.ok else ToolRunStatus.FAILED)
-    return result
 
 
 def _append_tool_results(
@@ -171,21 +126,29 @@ def _execute_tool_calls(
     registry: ToolRegistry,
     secret_command_runner: SecretCommandRunner | None,
     emit: EmitCallback,
+    store: RunStore,
     pending_messages: list[ModelMessage],
 ) -> tuple[ToolResult, ...]:
     results: list[ToolResult] = []
     for index, call in enumerate(calls):
         try:
-            results.append(
-                _execute_tool_call(
-                    session, run, call, registry, secret_command_runner, emit
+            if call.name == PLAN_TOOL.name:
+                result = handle_plan(run, call)
+                store.checkpoint_run(session, run)
+            else:
+                result = execute_tool_call(
+                    session, run, call, registry, secret_command_runner, emit, store
                 )
-            )
+            results.append(result)
         except Exception as exc:
             results.append(
                 ToolResult(
                     ok=False,
-                    stderr=f"Tool execution interrupted ({type(exc).__name__})",
+                    stderr=(
+                        str(exc)
+                        if isinstance(exc, ToolOutcomeUnknownError)
+                        else f"Tool execution interrupted ({type(exc).__name__})"
+                    ),
                 )
             )
             results.extend(
@@ -212,9 +175,7 @@ def _sync_context(
             scope,
             store.load_context_checkpoint(run.context_scope_id),
             end,
-            lambda start, stop: store.read_messages(
-                run.context_scope_id, start, stop
-            ),
+            lambda start, stop: store.read_messages(run.context_scope_id, start, stop),
         )
         return
     start = context_manager.message_count(scope)
@@ -358,11 +319,14 @@ def _run_turns(
     store: RunStore,
     context_manager: AgentContextManager,
     agent_spec: AgentSpec,
+    delegation: DelegationRuntime | None = None,
 ) -> Run:
     definitions = tuple(
         definition
         for definition in (*runtime_tool_definitions(), *registry.definitions())
         if definition.name in agent_spec.allowed_tools
+        and (delegation is not None or definition.name != DELEGATE_TOOL.name)
+        and (run.parent_run_id is None or definition.name != DELEGATE_TOOL.name)
     )
     while True:
         pending_messages: list[ModelMessage] = []
@@ -383,7 +347,9 @@ def _run_turns(
                 raise ModelProtocolError("Model returned an empty turn")
             _validate_turn_tool_calls(turn.content, turn.tool_calls)
             for call in turn.tool_calls:
-                if call.name not in agent_spec.allowed_tools:
+                if call.name not in agent_spec.allowed_tools or (
+                    run.parent_run_id is not None and call.name == DELEGATE_TOOL.name
+                ):
                     raise ModelProtocolError(
                         f"Agent {agent_spec.spec_id} cannot use tool {call.name}"
                     )
@@ -402,7 +368,65 @@ def _run_turns(
                     for call in turn.tool_calls
                     if call.name in {TEXT_WAIT_TOOL.name, SECRET_WAIT_TOOL.name}
                 )
-                if dependency_calls and len(dependency_calls) != len(turn.tool_calls):
+                delegate_calls = tuple(
+                    call for call in turn.tool_calls if call.name == DELEGATE_TOOL.name
+                )
+                if delegate_calls and len(turn.tool_calls) != 1:
+                    _append_tool_results(
+                        pending_messages,
+                        run,
+                        turn.tool_calls,
+                        tuple(
+                            ToolResult(
+                                ok=False,
+                                stderr="delegate must be the only tool call in its turn",
+                            )
+                            for _call in turn.tool_calls
+                        ),
+                    )
+                    messages_after_checkpoint.append("Rejected mixed delegation turn")
+                elif delegate_calls:
+                    call = delegate_calls[0]
+                    prepared = (
+                        delegation.prepare(call)
+                        if delegation is not None
+                        else ToolResult(ok=False, stderr="Delegation is unavailable")
+                    )
+                    if isinstance(prepared, ToolResult):
+                        _append_tool_results(pending_messages, run, (call,), (prepared,))
+                        messages_after_checkpoint.append(f"Delegation rejected: {prepared.stderr}")
+                    else:
+                        spec, goal = prepared
+                        assert delegation is not None
+                        run.transition(RunStatus.WAITING)
+                        _checkpoint(session, run, store, context_manager, pending_messages)
+                        child = delegation.run_child(
+                            session,
+                            run,
+                            call,
+                            spec,
+                            goal,
+                            registry,
+                            secret_command_runner,
+                            emit,
+                            store,
+                        )
+                        if child.status in {
+                            RunStatus.COMPLETED,
+                            RunStatus.FAILED,
+                            RunStatus.CANCELLED,
+                        }:
+                            delegation.append_result(pending_messages, run, child)
+                            run.transition(RunStatus.RUNNING)
+                            messages_after_checkpoint.append(
+                                f"Child run {child.run_id}: {child.status.value}"
+                            )
+                        else:
+                            messages_after_checkpoint.append(
+                                f"Child run {child.run_id} is waiting for input"
+                            )
+                            return_after_checkpoint = True
+                elif dependency_calls and len(dependency_calls) != len(turn.tool_calls):
                     dependency_error = ToolResult(
                         ok=False,
                         stderr=(
@@ -424,9 +448,7 @@ def _run_turns(
                         run, dependency_calls, pending_messages
                     )
                     if not dependencies:
-                        messages_after_checkpoint.append(
-                            "Wait requests were not registered"
-                        )
+                        messages_after_checkpoint.append("Wait requests were not registered")
                     else:
                         messages_after_checkpoint.extend(
                             (
@@ -439,6 +461,7 @@ def _run_turns(
                         )
                         return_after_checkpoint = True
                 else:
+                    _checkpoint(session, run, store, context_manager, pending_messages)
                     results = _execute_tool_calls(
                         session,
                         run,
@@ -446,11 +469,10 @@ def _run_turns(
                         registry,
                         secret_command_runner,
                         emit,
+                        store,
                         pending_messages,
                     )
-                    _append_tool_results(
-                        pending_messages, run, turn.tool_calls, results
-                    )
+                    _append_tool_results(pending_messages, run, turn.tool_calls, results)
                     for call, result in zip(turn.tool_calls, results, strict=True):
                         if call.name == PLAN_TOOL.name:
                             if result.ok:
@@ -463,9 +485,7 @@ def _run_turns(
                                 )
                         else:
                             outcome = "succeeded" if result.ok else "failed"
-                            messages_after_checkpoint.append(
-                                f"Tool {call.name}: {outcome}"
-                            )
+                            messages_after_checkpoint.append(f"Tool {call.name}: {outcome}")
             elif turn.stop_reason == "end_turn" and turn.text:
                 run.final_summary = turn.text
                 run.transition(RunStatus.COMPLETED)
@@ -513,6 +533,7 @@ def start_run(
     secret_command_runner: SecretCommandRunner | None = None,
     context_manager: AgentContextManager | None = None,
     agent_spec: AgentSpec,
+    delegation: DelegationRuntime | None = None,
 ) -> Run:
     """Start one user-request run and execute until terminal state or a wait."""
     if run.max_steps < 1:
@@ -560,6 +581,7 @@ def start_run(
         store,
         current_context_manager,
         agent_spec,
+        delegation,
     )
 
 
@@ -573,6 +595,10 @@ def prepare_run_for_resume(
     """Recover process-local Secret state and persist it before CLI presentation."""
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
+    if run.status is RunStatus.RUNNING and any(
+        tool_run.status is ToolRunStatus.RUNNING for tool_run in run.tool_runs
+    ):
+        return False
     changed = reissue_lost_secret_dependencies(run, secret_command_runner)
     if changed:
         store.checkpoint_run(session, run)
@@ -591,6 +617,7 @@ def continue_run(
     secret_command_runner: SecretCommandRunner | None = None,
     context_manager: AgentContextManager | None = None,
     agent_spec: AgentSpec,
+    delegation: DelegationRuntime | None = None,
 ) -> Run:
     """Persist a resolved dependency, then continue its durable run."""
     if run.status not in {RunStatus.RUNNING, RunStatus.WAITING}:
@@ -628,4 +655,5 @@ def continue_run(
         store,
         current_context_manager,
         agent_spec,
+        delegation,
     )

@@ -99,6 +99,11 @@ def _system_prompt(
             "- Pass an available one-time secret handle only to run_command_with_secret. "
             "Request a new handle before rerunning a command that started."
         )
+    if "delegate" in tool_names:
+        protocol.append(
+            "- Call delegate alone in a tool turn. The child uses its own message "
+            "history and returns a structured result when it finishes."
+        )
     state = {
         "goal": exact.goal,
         "workspace": exact.workspace,

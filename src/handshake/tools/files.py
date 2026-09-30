@@ -14,7 +14,7 @@ from typing import Any, TextIO
 from handshake.artifacts import ArtifactReferenceError, open_text_artifact
 from handshake.models.base import ToolDefinition
 from handshake.runtime.errors import ToolExecutionError
-from handshake.runtime.state import ToolResult
+from handshake.runtime.state import ReplayPolicy, ToolResult
 from handshake.tools.registry import ToolBinding
 
 _DEFAULT_READ_LINES = 200
@@ -465,6 +465,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 },
             ),
             handler=list_files,
+            replay_policy=ReplayPolicy.AUTO,
         ),
         ToolBinding(
             definition=ToolDefinition(
@@ -506,6 +507,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 },
             ),
             handler=read_file,
+            replay_policy=ReplayPolicy.AUTO,
         ),
         ToolBinding(
             definition=ToolDefinition(
@@ -533,6 +535,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 },
             ),
             handler=search_files,
+            replay_policy=ReplayPolicy.AUTO,
         ),
         ToolBinding(
             definition=ToolDefinition(

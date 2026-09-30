@@ -9,7 +9,7 @@ from typing import Any
 
 from handshake.models.base import ToolDefinition
 from handshake.runtime.errors import ToolExecutionError, UserCancelledError
-from handshake.runtime.state import ToolResult
+from handshake.runtime.state import ReplayPolicy, ToolResult
 
 ToolHandler = Callable[[Path, Mapping[str, Any]], ToolResult]
 
@@ -20,6 +20,7 @@ class ToolBinding:
 
     definition: ToolDefinition
     handler: ToolHandler
+    replay_policy: ReplayPolicy = ReplayPolicy.MANUAL
 
 
 class ToolRegistry:
@@ -34,6 +35,10 @@ class ToolRegistry:
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(binding.definition for binding in self._bindings.values())
+
+    def replay_policy(self, name: str) -> ReplayPolicy:
+        binding = self._bindings.get(name)
+        return ReplayPolicy.AUTO if binding is None else binding.replay_policy
 
     def execute(
         self, name: str, workspace: Path, arguments: Mapping[str, Any]

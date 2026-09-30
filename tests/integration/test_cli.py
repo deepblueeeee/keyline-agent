@@ -81,8 +81,7 @@ class _MultipleWaitThenFinishModel:
             str(block["text"])
             for message in context.messages
             for block in message.content
-            if block.get("type") == "text"
-            and "User response:" in str(block.get("text", ""))
+            if block.get("type") == "text" and "User response:" in str(block.get("text", ""))
         ]
         if answers:
             assert len(answers) == 2
@@ -105,6 +104,51 @@ class _MultipleWaitThenFinishModel:
                 for call in calls
             ),
             tool_calls=calls,
+            stop_reason="tool_use",
+        )
+
+
+class _DelegateWaitThenFinishModel:
+    def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+        child = "Explore the workspace" in context.system_prompt
+        if child:
+            answered = any(
+                "User response:" in str(block.get("text", ""))
+                for message in context.messages
+                for block in message.content
+            )
+            if answered:
+                return ModelTurn(
+                    content=({"type": "text", "text": "Found module A"},),
+                    stop_reason="end_turn",
+                )
+            call = ToolCall("child-wait", "wait_for_text", {"prompt": "Which module?"})
+        else:
+            returned = any(
+                block.get("type") == "tool_result"
+                for message in context.messages
+                for block in message.content
+            )
+            if returned:
+                return ModelTurn(
+                    content=({"type": "text", "text": "Used child result"},),
+                    stop_reason="end_turn",
+                )
+            call = ToolCall(
+                "delegate-1",
+                "delegate",
+                {"agent_spec_id": "explorer", "goal": "Find the requested module"},
+            )
+        return ModelTurn(
+            content=(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                },
+            ),
+            tool_calls=(call,),
             stop_reason="tool_use",
         )
 
@@ -145,8 +189,7 @@ class _SecretFlagshipModel:
                 str(block.get("text"))
                 for message in reversed(context.messages)
                 for block in message.content
-                if block.get("type") == "text"
-                and "Secret handle:" in str(block.get("text"))
+                if block.get("type") == "text" and "Secret handle:" in str(block.get("text"))
             ),
             None,
         )
@@ -200,9 +243,7 @@ def test_demo_runs_without_api_key(monkeypatch, capsys) -> None:  # type: ignore
     assert "verified the fixture tests pass" in captured.out
 
 
-def test_real_run_requires_api_key(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:  # type: ignore[no-untyped-def]
+def test_real_run_requires_api_key(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(
         provider_credentials,
@@ -273,8 +314,7 @@ def test_run_uses_configured_provider_and_context_budgets(
     config_home = Path.home() / ".handshake"
     config_home.mkdir(mode=0o700)
     (config_home / "config.toml").write_text(
-        "[model]\nmax_tokens = 4096\n"
-        "[context]\ncontext_window_tokens = 32768\n",
+        "[model]\nmax_tokens = 4096\n[context]\ncontext_window_tokens = 32768\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HANDSHAKE_HOME", str(home))
@@ -311,9 +351,7 @@ def test_resume_reloads_context_configuration(
     config_home = Path.home() / ".handshake"
     config_home.mkdir(mode=0o700)
     config_path = config_home / "config.toml"
-    config_path.write_text(
-        "[context]\ncontext_window_tokens = 131072\n", encoding="utf-8"
-    )
+    config_path.write_text("[context]\ncontext_window_tokens = 131072\n", encoding="utf-8")
     monkeypatch.setenv("HANDSHAKE_HOME", str(home))
     monkeypatch.setenv("DEEPSEEK_MODEL", "old-model")
     model_names: list[str] = []
@@ -337,9 +375,7 @@ def test_resume_reloads_context_configuration(
     stored_run = _store(home).list_runs()[0]
     assert stored_run.agent_spec_id == "main"
     session_id = stored_run.session_id
-    config_path.write_text(
-        "[context]\ncontext_window_tokens = 65536\n", encoding="utf-8"
-    )
+    config_path.write_text("[context]\ncontext_window_tokens = 65536\n", encoding="utf-8")
     monkeypatch.setenv("DEEPSEEK_MODEL", "new-model")
     monkeypatch.setattr(sys, "stdin", _TTY(True))
     monkeypatch.setattr(
@@ -398,9 +434,7 @@ def test_config_set_api_key_rejects_visible_getpass_fallback(
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
 
     def visible_fallback(_prompt: str) -> str:
-        warnings.warn(
-            "terminal echo would be enabled", cli.getpass.GetPassWarning, stacklevel=2
-        )
+        warnings.warn("terminal echo would be enabled", cli.getpass.GetPassWarning, stacklevel=2)
         return "must-not-be-saved"
 
     monkeypatch.setattr(cli.getpass, "getpass", visible_fallback)
@@ -503,9 +537,40 @@ def test_multiple_waits_resume_after_partial_input_across_cli_processes(
     assert completed.status is RunStatus.COMPLETED
     assert completed.final_summary == "Applied both choices."
     assert all(
-        dependency.status is DependencyStatus.SATISFIED
-        for dependency in completed.dependencies
+        dependency.status is DependencyStatus.SATISFIED for dependency in completed.dependencies
     )
+
+
+def test_delegated_child_wait_resumes_parent_across_cli_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "state"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: _DelegateWaitThenFinishModel())
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
+
+    assert cli.main(["run", str(tmp_path), "Locate a module"]) == 2
+    store = _store(home)
+    parent, child = store.list_runs()
+    assert parent.status is RunStatus.WAITING
+    assert child.status is RunStatus.WAITING
+    assert child.parent_run_id == parent.run_id
+    assert child.context_scope_id != parent.context_scope_id
+
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: "A" if prompt == "Response: " else "/exit",
+    )
+    assert cli.main(["resume", parent.session_id]) == 0
+    store = _store(home)
+    parent, child = store.list_runs(parent.session_id)
+    assert parent.status is RunStatus.COMPLETED
+    assert parent.final_summary == "Used child result"
+    assert child.status is RunStatus.COMPLETED
+    assert child.final_summary == "Found module A"
+    assert len(tuple(store.read_messages(parent.context_scope_id))) == 4
+    assert len(tuple(store.read_messages(child.context_scope_id))) == 5
 
 
 def test_wait_survives_noninteractive_exit_interrupt_and_resume(
@@ -566,9 +631,7 @@ def test_interactive_session_creates_followup_run_with_full_history(
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     monkeypatch.setattr("builtins.input", lambda _prompt: next(prompts))
 
-    exit_code = cli.main(
-        ["run", str(tmp_path), "first request", "--max-steps", "9"]
-    )
+    exit_code = cli.main(["run", str(tmp_path), "first request", "--max-steps", "9"])
 
     session = _store(home).list_sessions()[0]
     runs = _store(home).list_runs(session.session_id)
@@ -626,9 +689,7 @@ request = urllib.request.Request(
 with urllib.request.urlopen(request, timeout=3) as response:
     print(response.read().decode("utf-8"))
 """
-    (tmp_path / "integration_check.py").write_text(
-        integration_script, encoding="utf-8"
-    )
+    (tmp_path / "integration_check.py").write_text(integration_script, encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(
         ["git", "-c", "user.name=Handshake", "-c", "user.email=test@example.com", "add", "."],
@@ -673,9 +734,7 @@ with urllib.request.urlopen(request, timeout=3) as response:
 
     monkeypatch.setattr("builtins.input", answer)
     try:
-        exit_code = cli.main(
-            ["run", str(tmp_path), "run the authenticated integration test"]
-        )
+        exit_code = cli.main(["run", str(tmp_path), "run the authenticated integration test"])
     finally:
         server.shutdown()
         server.server_close()

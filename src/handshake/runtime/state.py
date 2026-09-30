@@ -27,6 +27,12 @@ class ToolRunStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class ReplayPolicy(StrEnum):
+    AUTO = "auto"
+    MANUAL = "manual"
 
 
 class DependencyKind(StrEnum):
@@ -91,9 +97,14 @@ def utc_now() -> str:
 
 _TOOL_RUN_TRANSITIONS = {
     ToolRunStatus.PENDING: {ToolRunStatus.RUNNING},
-    ToolRunStatus.RUNNING: {ToolRunStatus.SUCCEEDED, ToolRunStatus.FAILED},
+    ToolRunStatus.RUNNING: {
+        ToolRunStatus.SUCCEEDED,
+        ToolRunStatus.FAILED,
+        ToolRunStatus.UNKNOWN,
+    },
     ToolRunStatus.SUCCEEDED: set(),
     ToolRunStatus.FAILED: set(),
+    ToolRunStatus.UNKNOWN: {ToolRunStatus.RUNNING},
 }
 
 
@@ -110,11 +121,15 @@ class ToolRun:
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any]
+    model_turn: int = 0
+    replay_policy: ReplayPolicy = ReplayPolicy.MANUAL
     tool_run_id: str = field(default_factory=lambda: str(uuid4()))
     status: ToolRunStatus = ToolRunStatus.PENDING
     result: ToolResult | None = None
 
     def transition(self, target: ToolRunStatus) -> None:
+        if self.status is ToolRunStatus.UNKNOWN and self.replay_policy is ReplayPolicy.MANUAL:
+            raise InvalidStateTransitionError("Unknown non-idempotent tool cannot be replayed")
         if target not in _TOOL_RUN_TRANSITIONS[self.status]:
             raise InvalidStateTransitionError(
                 f"Cannot transition tool run from {self.status} to {target}"
@@ -229,6 +244,7 @@ class Run:
     sequence: int = 1
     previous_run_id: str | None = None
     parent_run_id: str | None = None
+    delegation_tool_call_id: str | None = None
     context_scope_id: str = ""
     status: RunStatus = RunStatus.CREATED
     plan: list[str] = field(default_factory=list)

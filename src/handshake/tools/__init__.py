@@ -1,6 +1,7 @@
 """Composition root for workspace tools exposed to models."""
 
 from handshake.models.base import ToolDefinition
+from handshake.tools.delegate import DELEGATE_TOOL
 from handshake.tools.files import file_tool_bindings
 from handshake.tools.plan import PLAN_TOOL, handle_plan
 from handshake.tools.registry import ToolRegistry
@@ -21,11 +22,12 @@ def create_default_registry(approval: ApprovalCallback) -> ToolRegistry:
 
 def runtime_tool_definitions() -> tuple[ToolDefinition, ...]:
     """Return tools whose lifecycle is coordinated directly by the runtime."""
-    return (PLAN_TOOL, TEXT_WAIT_TOOL, SECRET_WAIT_TOOL, SECRET_COMMAND_TOOL)
+    return (PLAN_TOOL, TEXT_WAIT_TOOL, SECRET_WAIT_TOOL, SECRET_COMMAND_TOOL, DELEGATE_TOOL)
 
 
 __all__ = [
     "ApprovalCallback",
+    "DELEGATE_TOOL",
     "PLAN_TOOL",
     "SECRET_WAIT_TOOL",
     "SECRET_COMMAND_TOOL",

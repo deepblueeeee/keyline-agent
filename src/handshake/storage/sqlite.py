@@ -24,11 +24,15 @@ from handshake.runtime.state import (
     Dependency,
     DependencyKind,
     DependencyStatus,
+    ReplayPolicy,
     Run,
     RunStatus,
     SecretHandle,
     SecretHandleStatus,
     Session,
+    ToolResult,
+    ToolRun,
+    ToolRunStatus,
     utc_now,
 )
 from handshake.storage.errors import RunNotFoundError, SessionNotFoundError, StorageError
@@ -164,6 +168,8 @@ class SQLiteStateStore(RunStore):
                         raise StorageError("Parent run must belong to the same session")
                     if str(parent["context_scope_id"]) == run.context_scope_id:
                         raise StorageError("Child run must have its own context scope")
+                    if not run.delegation_tool_call_id:
+                        raise StorageError("Child run must identify its delegation tool call")
                     if connection.execute(
                         "SELECT 1 FROM context_scopes WHERE scope_id = ?",
                         (run.context_scope_id,),
@@ -175,6 +181,8 @@ class SQLiteStateStore(RunStore):
                     )
                 elif run.context_scope_id != session.context_scope.scope_id:
                     raise StorageError("Root run must use the session's main context scope")
+                elif run.delegation_tool_call_id is not None:
+                    raise StorageError("Root run cannot have a delegation tool call")
                 scope = self._load_context_scope(connection, run.context_scope_id)
                 try:
                     advanced_scope = scope.advance(run)
@@ -316,6 +324,26 @@ class SQLiteStateStore(RunStore):
                     (run_id,),
                 )
             ]
+            tool_runs = [
+                ToolRun(
+                    tool_run_id=str(tool_row["tool_run_id"]),
+                    tool_call_id=str(tool_row["tool_call_id"]),
+                    tool_name=str(tool_row["tool_name"]),
+                    model_turn=int(tool_row["model_turn"]),
+                    arguments=_load_json(tool_row["arguments_json"], "tool arguments"),
+                    replay_policy=ReplayPolicy(tool_row["replay_policy"]),
+                    status=ToolRunStatus(tool_row["status"]),
+                    result=(
+                        ToolResult(**_load_json(tool_row["result_json"], "tool result"))
+                        if tool_row["result_json"] is not None
+                        else None
+                    ),
+                )
+                for tool_row in connection.execute(
+                    "SELECT * FROM tool_runs WHERE run_id = ? ORDER BY position",
+                    (run_id,),
+                )
+            ]
             plan = _load_json(row["plan_json"], "run plan")
             if not isinstance(plan, list) or any(not isinstance(item, str) for item in plan):
                 raise StorageError(f"Run {run_id} has an invalid stored plan")
@@ -325,11 +353,13 @@ class SQLiteStateStore(RunStore):
                 sequence=int(row["sequence"]),
                 previous_run_id=row["previous_run_id"],
                 parent_run_id=row["parent_run_id"],
+                delegation_tool_call_id=row["delegation_tool_call_id"],
                 agent_spec_id=row["agent_spec_id"],
                 context_scope_id=str(row["context_scope_id"]),
                 goal=str(row["goal"]),
                 status=RunStatus(row["status"]),
                 plan=plan,
+                tool_runs=tool_runs,
                 dependencies=dependencies,
                 secret_handles=secret_handles,
                 final_summary=row["final_summary"],
@@ -364,6 +394,7 @@ class SQLiteStateStore(RunStore):
         row = connection.execute(
             """
             SELECT session_id, sequence, previous_run_id, parent_run_id,
+                   delegation_tool_call_id,
                    agent_spec_id, context_scope_id, goal
             FROM runs WHERE run_id = ?
             """,
@@ -376,12 +407,14 @@ class SQLiteStateStore(RunStore):
             int(row["sequence"]),
             row["previous_run_id"],
             row["parent_run_id"],
+            row["delegation_tool_call_id"],
             row["agent_spec_id"],
             str(row["context_scope_id"]),
             str(row["goal"]),
         )
         expected = (
             run.session_id, run.sequence, run.previous_run_id, run.parent_run_id,
+            run.delegation_tool_call_id,
             run.agent_spec_id, run.context_scope_id, run.goal,
         )
         if membership != expected or run.session_id != session.session_id:
@@ -394,10 +427,11 @@ class SQLiteStateStore(RunStore):
             """
             INSERT INTO runs (
                 run_id, session_id, sequence, previous_run_id, parent_run_id,
+                delegation_tool_call_id,
                 agent_spec_id, context_scope_id, goal, status,
                 plan_json, final_summary, error, model_name, model_turns,
                 max_steps, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
@@ -405,6 +439,7 @@ class SQLiteStateStore(RunStore):
                 run.sequence,
                 run.previous_run_id,
                 run.parent_run_id,
+                run.delegation_tool_call_id,
                 run.agent_spec_id,
                 run.context_scope_id,
                 run.goal,
@@ -630,6 +665,30 @@ class SQLiteStateStore(RunStore):
     def _replace_run_children(
         self, connection: sqlite3.Connection, run: Run
     ) -> None:
+        connection.execute("DELETE FROM tool_runs WHERE run_id = ?", (run.run_id,))
+        connection.executemany(
+            """
+            INSERT INTO tool_runs (
+                tool_run_id, run_id, position, model_turn, tool_call_id, tool_name,
+                arguments_json, replay_policy, status, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    tool_run.tool_run_id,
+                    run.run_id,
+                    index,
+                    tool_run.model_turn,
+                    tool_run.tool_call_id,
+                    tool_run.tool_name,
+                    _dump_json(tool_run.arguments),
+                    tool_run.replay_policy.value,
+                    tool_run.status.value,
+                    _dump_json(asdict(tool_run.result)) if tool_run.result else None,
+                )
+                for index, tool_run in enumerate(run.tool_runs)
+            ),
+        )
         connection.execute("DELETE FROM secret_handles WHERE run_id = ?", (run.run_id,))
         connection.execute("DELETE FROM dependencies WHERE run_id = ?", (run.run_id,))
         connection.executemany(

@@ -43,9 +43,18 @@ Complete the user's request in the workspace.
 - Keep a provisional plan for non-trivial work and revise it when evidence changes.
 - Keep context focused: read relevant files and ranges before making targeted edits.
 - Validate changes with appropriate checks and report what they actually showed.
+- You may delegate focused exploration to explorer and independent review to reviewer.
 - Finish with a concise summary of changes and any unresolved issue."""
 
 _DEMO_INSTRUCTIONS = "Complete the isolated coding demo and verify the result."
+_EXPLORER_INSTRUCTIONS = (
+    "Explore the workspace for the assigned goal. Read relevant files, report concrete "
+    "findings with paths, and do not edit files."
+)
+_REVIEWER_INSTRUCTIONS = (
+    "Review the assigned code or change independently. Report specific defects and "
+    "evidence with paths. Do not edit files."
+)
 
 
 def main_agent_spec(
@@ -70,6 +79,27 @@ def demo_agent_spec(allowed_tools: Iterable[str]) -> AgentSpec:
         model_name="scripted",
         instructions=_DEMO_INSTRUCTIONS,
         allowed_tools=frozenset(allowed_tools),
+    )
+
+
+def child_agent_specs(model_name: str, budget: ContextBudgetPolicy) -> tuple[AgentSpec, ...]:
+    """Configured, non-persisted child profiles available to the main agent."""
+    read_tools = frozenset({"read_file", "search_files", "wait_for_text"})
+    return (
+        AgentSpec(
+            "explorer",
+            model_name,
+            _EXPLORER_INSTRUCTIONS,
+            allowed_tools=read_tools,
+            default_budget=budget,
+        ),
+        AgentSpec(
+            "reviewer",
+            model_name,
+            _REVIEWER_INSTRUCTIONS,
+            allowed_tools=read_tools,
+            default_budget=budget,
+        ),
     )
 
 

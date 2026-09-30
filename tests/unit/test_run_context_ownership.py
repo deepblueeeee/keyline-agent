@@ -39,13 +39,18 @@ def test_runtime_context_managers_reuse_only_the_same_stream(tmp_path: Path) -> 
     session = Session(workspace=tmp_path)
     parent = Run(goal="parent", session_id=session.session_id, agent_spec_id="main")
     child = Run(
-        goal="child", session_id=session.session_id,
-        parent_run_id=parent.run_id, agent_spec_id="explorer",
+        goal="child",
+        session_id=session.session_id,
+        parent_run_id=parent.run_id,
+        agent_spec_id="explorer",
     )
     followup = Run(
-        goal="followup", session_id=session.session_id,
-        sequence=2, previous_run_id=parent.run_id,
-        context_scope_id=parent.context_scope_id, agent_spec_id="main",
+        goal="followup",
+        session_id=session.session_id,
+        sequence=2,
+        previous_run_id=parent.run_id,
+        context_scope_id=parent.context_scope_id,
+        agent_spec_id="main",
     )
     parent_budget = ContextBudgetPolicy(context_window_tokens=1000, reserved_output_tokens=0)
     child_budget = ContextBudgetPolicy(context_window_tokens=2000, reserved_output_tokens=0)
@@ -79,6 +84,7 @@ def test_child_run_has_empty_private_history_and_checkpoint(tmp_path: Path) -> N
         session_id=session.session_id,
         sequence=2,
         parent_run_id=parent.run_id,
+        delegation_tool_call_id="delegate-child",
         agent_spec_id="reader",
     )
     store.create_run(session, child, (_message(child, "child goal"),))
@@ -92,9 +98,7 @@ def test_child_run_has_empty_private_history_and_checkpoint(tmp_path: Path) -> N
     assert store.message_count(child.context_scope_id) == 1
     assert store.load_context_checkpoint(child.context_scope_id) is None
     child_messages = tuple(store.read_messages(child.context_scope_id))
-    assert [item.message.content[0]["text"] for item in child_messages] == [
-        "child goal"
-    ]
+    assert [item.message.content[0]["text"] for item in child_messages] == ["child goal"]
 
     store.checkpoint_run(session, parent, (_message(parent, "parent continued"),))
     store.checkpoint_run(session, child, (_message(child, "child continued"),))
@@ -239,6 +243,7 @@ def test_user_followup_after_child_copies_root_not_child(tmp_path: Path) -> None
         session_id=session.session_id,
         sequence=2,
         parent_run_id=root.run_id,
+        delegation_tool_call_id="delegate-child",
         agent_spec_id="reader",
     )
     child.transition(RunStatus.RUNNING)
@@ -268,6 +273,7 @@ def test_user_followup_waits_for_active_parent_even_if_child_terminated(tmp_path
         session_id=session.session_id,
         sequence=2,
         parent_run_id=root.run_id,
+        delegation_tool_call_id="delegate-child",
         agent_spec_id="test",
     )
     child.transition(RunStatus.RUNNING)
