@@ -58,7 +58,7 @@ def mask_oldest_stale_result(state: ManagedContextState) -> bool:
     return False
 
 
-def compact_semantic_context(
+async def compact_semantic_context(
     state: ManagedContextState,
     *,
     run_id: str,
@@ -83,7 +83,7 @@ def compact_semantic_context(
         if not target:
             break
         try:
-            episodes = condenser.compact_raw(background, target)
+            episodes = await condenser.compact_raw(background, target)
             if not episodes:
                 break
             expected = target[0].sequence
@@ -122,7 +122,7 @@ def compact_semantic_context(
         if len(selected) < 2:
             break
         try:
-            merged = condenser.roll_up(selected)
+            merged = await condenser.roll_up(selected)
             if merged is None:
                 break
             start = selected[0].source_range.start_sequence

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -25,8 +26,21 @@ class ToolDefinition:
 class ModelAdapter(Protocol):
     """An Anthropic Messages model used by the agent loop."""
 
-    def complete(
+    async def complete(
         self, context: ModelContext, tools: tuple[ToolDefinition, ...]
     ) -> ModelTurn:
         """Produce the next assistant turn."""
         ...
+
+
+async def close_model(model: ModelAdapter) -> None:
+    """Release an adapter's optional process-local network resources."""
+    close = getattr(model, "aclose", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception as exc:
+            # Cleanup cannot replace a committed outcome or a primary execution error.
+            logging.getLogger(__name__).warning(
+                "Model resource cleanup failed (%s)", type(exc).__name__
+            )

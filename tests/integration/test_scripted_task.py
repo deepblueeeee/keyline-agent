@@ -7,7 +7,7 @@ from handshake.models.scripted import ScriptedModel
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
-from tests.history_support import TEST_AGENT_SPEC, fresh_store
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, run_async
 
 
 def _tool_turn(call: ToolCall) -> ModelTurn:
@@ -25,7 +25,8 @@ def _tool_turn(call: ToolCall) -> ModelTurn:
     )
 
 
-def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
+@run_async
+async def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
     fixture = Path(__file__).resolve().parents[2] / "examples" / "minimal_task"
     workspace = tmp_path / "workspace"
     shutil.copytree(fixture, workspace)
@@ -81,7 +82,7 @@ def test_scripted_model_completes_repository_edit(tmp_path: Path) -> None:
 
     session = Session(workspace=workspace)
     run = Run(goal="Implement add", session_id=session.session_id, agent_spec_id="test")
-    start_run(
+    await start_run(
         session,
         run,
         model,

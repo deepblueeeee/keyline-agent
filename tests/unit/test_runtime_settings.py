@@ -34,6 +34,7 @@ def test_defaults_and_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert settings.context.pressure_trigger_ratio == 0.8
     assert settings.context.pressure_target_ratio == 0.5
     assert settings.approval_mode is ApprovalMode.ALWAYS_ASK
+    assert settings.max_model_requests == 4
 
 
 def test_only_public_token_limits_override_internal_defaults(
@@ -66,6 +67,10 @@ context_window_tokens = 32768
 @pytest.mark.parametrize(
     ("content", "message"),
     [
+        ("[scheduler]\nmax_model_requests = true\n", "max_model_requests"),
+        ("[scheduler]\nmax_model_requests = 0\n", "max_model_requests"),
+        ("[scheduler]\nmax_model_requests = 1.5\n", "max_model_requests"),
+        ("[scheduler]\nunknown = 1\n", "unknown"),
         ("[model]\nmax_tokens = true\n", "model.max_tokens"),
         ("[model]\nmax_tokens = 0\n", "model.max_tokens"),
         ("[context]\ncontext_window_tokens = 16000\n", "context_window_tokens"),
@@ -128,3 +133,8 @@ def test_non_utf8_config_reports_domain_error(tmp_path: Path) -> None:
 
     with pytest.raises(HandshakeError, match="Cannot read configuration"):
         load_runtime_settings()
+
+
+def test_model_request_limit_is_configurable(tmp_path: Path) -> None:
+    _write_config(tmp_path / ".handshake", "[scheduler]\nmax_model_requests = 2\n")
+    assert load_runtime_settings().max_model_requests == 2

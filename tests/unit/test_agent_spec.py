@@ -18,6 +18,7 @@ from handshake.runtime.runs import create_initial_run
 from handshake.runtime.state import RunStatus, Session
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
+from tests.history_support import run_async
 
 
 def _tool_turn(call: ToolCall) -> ModelTurn:
@@ -92,7 +93,8 @@ def test_model_selection_uses_current_spec_for_bound_runs(tmp_path) -> None:
         model_name_for_run(bound, wrong_spec)
 
 
-def test_resumed_run_uses_current_agent_configuration(tmp_path) -> None:
+@run_async
+async def test_resumed_run_uses_current_agent_configuration(tmp_path) -> None:
     session = Session(workspace=tmp_path)
     store = SQLiteStateStore(tmp_path / "state.db")
     store.create_session(session)
@@ -111,7 +113,7 @@ def test_resumed_run_uses_current_agent_configuration(tmp_path) -> None:
         [_tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
     )
 
-    start_run(session, run, first_model, registry, store=store, agent_spec=original_spec)
+    await start_run(session, run, first_model, registry, store=store, agent_spec=original_spec)
 
     assert run.status is RunStatus.WAITING
     assert "Old instructions" in first_model.contexts[0].system_prompt
@@ -126,7 +128,7 @@ def test_resumed_run_uses_current_agent_configuration(tmp_path) -> None:
     )
     current_spec = AgentSpec("main", "new-model", "New instructions", allowed_tools={"read_file"})
     second_model = ScriptedModel([_final_turn()])
-    continue_run(
+    await continue_run(
         restored_session,
         restored_run,
         second_model,
@@ -145,7 +147,8 @@ def test_resumed_run_uses_current_agent_configuration(tmp_path) -> None:
     assert {tool.name for tool in second_model.tool_sets[0]} == {"read_file"}
 
 
-def test_agent_tool_allowance_blocks_unexpected_tool_call(tmp_path) -> None:
+@run_async
+async def test_agent_tool_allowance_blocks_unexpected_tool_call(tmp_path) -> None:
     session = Session(workspace=tmp_path)
     store = SQLiteStateStore(tmp_path / "state.db")
     store.create_session(session)
@@ -162,7 +165,7 @@ def test_agent_tool_allowance_blocks_unexpected_tool_call(tmp_path) -> None:
     spec = AgentSpec("reader", "scripted", "Read only.", allowed_tools={"read_file"})
 
     with pytest.raises(ModelProtocolError, match="cannot use tool write_file"):
-        start_run(
+        await start_run(
             session,
             run,
             model,
@@ -175,7 +178,8 @@ def test_agent_tool_allowance_blocks_unexpected_tool_call(tmp_path) -> None:
     assert not (tmp_path / "bad.txt").exists()
 
 
-def test_run_rejects_mismatched_agent_spec(tmp_path) -> None:
+@run_async
+async def test_run_rejects_mismatched_agent_spec(tmp_path) -> None:
     session = Session(workspace=tmp_path)
     store = SQLiteStateStore(tmp_path / "state.db")
     store.create_session(session)
@@ -188,7 +192,7 @@ def test_run_rejects_mismatched_agent_spec(tmp_path) -> None:
     )
 
     with pytest.raises(AgentLoopError, match="Agent spec missing is unavailable"):
-        start_run(
+        await start_run(
             session,
             run,
             ScriptedModel([_final_turn()]),
@@ -201,7 +205,8 @@ def test_run_rejects_mismatched_agent_spec(tmp_path) -> None:
     assert store.list_runs(session.session_id) == ()
 
 
-def test_run_rejects_context_manager_bound_to_another_scope(tmp_path) -> None:
+@run_async
+async def test_run_rejects_context_manager_bound_to_another_scope(tmp_path) -> None:
     session = Session(workspace=tmp_path)
     store = SQLiteStateStore(tmp_path / "state.db")
     store.create_session(session)
@@ -214,7 +219,7 @@ def test_run_rejects_context_manager_bound_to_another_scope(tmp_path) -> None:
     )
 
     with pytest.raises(ContextViewError, match="belongs to scope"):
-        start_run(
+        await start_run(
             session,
             run,
             ScriptedModel([_final_turn()]),

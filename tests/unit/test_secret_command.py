@@ -173,3 +173,29 @@ def test_secret_command_rejects_lost_handle_without_consuming(tmp_path: Path) ->
     assert not result.ok
     assert "lost" in result.stderr
     assert consumer.contains(handle.secret_handle)  # type: ignore[attr-defined]
+
+
+def test_cancelled_approval_does_not_consume_secret_or_start_process(tmp_path: Path) -> None:
+    from threading import Event
+
+    import pytest
+
+    from handshake.runtime.errors import UserCancelledError
+    from handshake.tools.cancellation import tool_cancellation
+
+    run, handle, consumer, _runner = _available_secret("secret-cancellation-canary")
+    cancelled = Event()
+
+    def late_approval(_cwd: Path, _argv: tuple[str, ...]) -> bool:
+        cancelled.set()
+        return True
+
+    runner = SecretCommandRunner(consumer, late_approval)
+    with tool_cancellation(cancelled), pytest.raises(UserCancelledError):
+        runner.execute(run, tmp_path, {
+            "secret_handle": handle.secret_handle,
+            "argv": [sys.executable, "-c", "open('started', 'w').write('started')"],
+        })
+    assert handle.status is SecretHandleStatus.AVAILABLE
+    assert consumer.contains(handle.secret_handle)  # type: ignore[attr-defined]
+    assert not (tmp_path / "started").exists()

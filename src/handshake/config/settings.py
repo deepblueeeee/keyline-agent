@@ -19,6 +19,7 @@ class RuntimeSettings:
     provider: DeepSeekConfig
     context: ContextBudgetPolicy
     approval_mode: ApprovalMode
+    max_model_requests: int = 4
 
 
 def settings_path() -> Path:
@@ -31,10 +32,15 @@ def load_runtime_settings(*, model_override: str | None = None) -> RuntimeSettin
     path = settings_path()
     data = _read_config(path)
 
-    _check_keys(data, {"model", "context", "approval"}, "configuration")
+    _check_keys(data, {"model", "context", "approval", "scheduler"}, "configuration")
     model = _section(data, "model")
     context = _section(data, "context")
     approval = _section(data, "approval")
+    scheduler = _section(data, "scheduler")
+    _check_keys(scheduler, {"max_model_requests"}, "scheduler")
+    max_model_requests = _integer(
+        scheduler.get("max_model_requests", 4), "scheduler.max_model_requests", 1
+    )
     _check_keys(model, {"max_tokens"}, "model")
     _check_keys(context, {"context_window_tokens"}, "context")
     _check_keys(approval, {"mode"}, "approval")
@@ -78,7 +84,10 @@ def load_runtime_settings(*, model_override: str | None = None) -> RuntimeSettin
         policy.pressure_target_tokens >= policy.pressure_trigger_tokens
     ):
         raise HandshakeError("Model token limits leave too little context input budget")
-    return RuntimeSettings(provider=provider, context=policy, approval_mode=mode)
+    return RuntimeSettings(
+        provider=provider, context=policy, approval_mode=mode,
+        max_model_requests=max_model_requests,
+    )
 
 
 def _read_config(path: Path) -> dict[str, object]:

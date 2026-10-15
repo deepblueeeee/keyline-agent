@@ -11,6 +11,7 @@ from typing import Any
 from handshake.models.base import ToolDefinition
 from handshake.runtime.errors import ToolExecutionError
 from handshake.runtime.state import ToolResult
+from handshake.tools.cancellation import check_tool_cancellation
 from handshake.tools.registry import ToolBinding
 
 ApprovalCallback = Callable[[Path, tuple[str, ...]], bool]
@@ -76,6 +77,7 @@ def process_tool_handler(
         cwd = workspace.resolve()
         if not approval(cwd, argv):
             return ToolResult(ok=False, stderr="Execution denied by user")
+        check_tool_cancellation()
         try:
             completed = subprocess.run(
                 argv,

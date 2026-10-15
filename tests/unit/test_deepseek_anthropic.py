@@ -11,7 +11,7 @@ from handshake.models.protocol import ModelContext, ModelMessage, ModelUsage
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry
-from tests.history_support import TEST_AGENT_SPEC, fresh_store
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, run_async
 
 
 class FakeMessages:
@@ -19,7 +19,7 @@ class FakeMessages:
         self.responses = responses
         self.requests: list[dict[str, Any]] = []
 
-    def create(self, **kwargs: Any) -> Any:
+    async def create(self, **kwargs: Any) -> Any:
         self.requests.append(kwargs)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -32,7 +32,8 @@ class FakeClient:
         self.messages = FakeMessages(responses)
 
 
-def test_normalizes_thinking_text_and_tool_use() -> None:
+@run_async
+async def test_normalizes_thinking_text_and_tool_use() -> None:
     client = FakeClient(
         [
             {
@@ -66,7 +67,7 @@ def test_normalizes_thinking_text_and_tool_use() -> None:
     )
     definition = ToolDefinition("read_file", "read", {"type": "object"})
 
-    turn = model.complete(context, (definition,))
+    turn = await model.complete(context, (definition,))
 
     assert turn.text == "Checking."
     assert turn.tool_calls[0].arguments == {"path": "x.py"}
@@ -79,7 +80,8 @@ def test_normalizes_thinking_text_and_tool_use() -> None:
     assert "run_id" not in request["messages"][0]
 
 
-def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
+@run_async
+async def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
     (tmp_path / "x.py").write_text("value = 1\n", encoding="utf-8")
     client = FakeClient(
         [
@@ -104,7 +106,7 @@ def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
 
-    start_run(
+    await start_run(
         session,
         run,
         DeepSeekAnthropicModel(api_key="canary", client=client),
@@ -120,7 +122,8 @@ def test_loop_round_trips_thinking_and_tool_result(tmp_path: Path) -> None:
     assert second_messages[-1]["content"][0]["tool_use_id"] == "call-1"
 
 
-def test_adapter_sends_consecutive_user_messages_without_domain_normalization() -> None:
+@run_async
+async def test_adapter_sends_consecutive_user_messages_without_domain_normalization() -> None:
     client = FakeClient(
         [
             {
@@ -155,7 +158,7 @@ def test_adapter_sends_consecutive_user_messages_without_domain_normalization() 
         ),
     )
 
-    model.complete(context, ())
+    await model.complete(context, ())
 
     messages = client.messages.requests[0]["messages"]
     assert [message["role"] for message in messages] == ["user", "user"]
@@ -164,14 +167,15 @@ def test_adapter_sends_consecutive_user_messages_without_domain_normalization() 
     assert all("run_id" not in message for message in messages)
 
 
-def test_provider_error_does_not_leak_api_key() -> None:
+@run_async
+async def test_provider_error_does_not_leak_api_key() -> None:
     secret = "canary-super-secret"
     client = FakeClient([RuntimeError(secret)])
     model = DeepSeekAnthropicModel(api_key=secret, client=client)
     context = ModelContext("system", "goal", "/tmp/work", (), ())
 
     with pytest.raises(ModelProviderError) as raised:
-        model.complete(context, ())
+        await model.complete(context, ())
 
     assert secret not in str(raised.value)
     assert secret not in repr(model)
@@ -179,7 +183,8 @@ def test_provider_error_does_not_leak_api_key() -> None:
 
 
 @pytest.mark.parametrize("sdk_response", [False, True])
-def test_usage_is_normalized_from_mapping_and_sdk_message(sdk_response: bool) -> None:
+@run_async
+async def test_usage_is_normalized_from_mapping_and_sdk_message(sdk_response: bool) -> None:
     payload: dict[str, Any] = {
         "id": "msg-1", "type": "message", "role": "assistant", "model": "test",
         "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn",
@@ -188,7 +193,7 @@ def test_usage_is_normalized_from_mapping_and_sdk_message(sdk_response: bool) ->
     }
     response = Message.model_validate(payload) if sdk_response else payload
     model = DeepSeekAnthropicModel(api_key="canary", client=FakeClient([response]))
-    turn = model.complete(ModelContext("system", "goal", "/tmp", (), ()), ())
+    turn = await model.complete(ModelContext("system", "goal", "/tmp", (), ()), ())
     assert turn.usage == ModelUsage(
         input_tokens=100, output_tokens=20, cache_write_tokens=30, cache_read_tokens=40,
     )
@@ -202,9 +207,10 @@ def test_usage_is_normalized_from_mapping_and_sdk_message(sdk_response: bool) ->
     {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": False},
     {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": "100"},
 ])
-def test_invalid_usage_is_rejected(usage: dict[str, Any]) -> None:
+@run_async
+async def test_invalid_usage_is_rejected(usage: dict[str, Any]) -> None:
     model = DeepSeekAnthropicModel(api_key="canary", client=FakeClient([{
         "content": [{"type": "text", "text": "done"}], "usage": usage,
     }]))
     with pytest.raises(ModelProtocolError, match="token usage"):
-        model.complete(ModelContext("system", "goal", "/tmp", (), ()), ())
+        await model.complete(ModelContext("system", "goal", "/tmp", (), ()), ())

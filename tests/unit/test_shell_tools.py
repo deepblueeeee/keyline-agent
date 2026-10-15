@@ -114,3 +114,24 @@ def test_normal_shell_can_observe_handle_but_cannot_obtain_secret(
     assert handle in result.stdout
     assert "None" in result.stdout
     assert canary not in result.stdout
+
+
+def test_cancelled_approval_cannot_start_command(tmp_path: Path) -> None:
+    from threading import Event
+
+    import pytest
+
+    from handshake.tools.cancellation import tool_cancellation
+
+    cancelled = Event()
+
+    def late_approval(_cwd: Path, _argv: tuple[str, ...]) -> bool:
+        cancelled.set()
+        return True
+
+    handler = process_tool_handler(late_approval)
+    with tool_cancellation(cancelled), pytest.raises(UserCancelledError):
+        handler(tmp_path, {
+            "argv": [sys.executable, "-c", "open('started', 'w').write('started')"],
+        })
+    assert not (tmp_path / "started").exists()

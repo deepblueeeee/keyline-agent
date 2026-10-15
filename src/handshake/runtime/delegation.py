@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from handshake.context import ActiveContextManagers
 from handshake.context.errors import ContextPressureError
 from handshake.errors import HandshakeError
-from handshake.models.base import ModelAdapter
+from handshake.models.base import ModelAdapter, close_model
 from handshake.models.protocol import ModelMessage, ToolCall
 from handshake.runtime.agents import AgentSpec, model_name_for_run
 from handshake.runtime.errors import AgentLoopError, UserCancelledError
@@ -49,7 +49,7 @@ class DelegationRuntime:
             return error
         return tuple(item for item in prepared if not isinstance(item, ToolResult))
 
-    def run_batch(
+    async def run_batch(
         self,
         session: Session,
         parent: Run,
@@ -61,7 +61,7 @@ class DelegationRuntime:
         store: RunStore,
     ) -> tuple[Run, ...]:
         children = _ensure_children(session, parent, calls, prepared, store)
-        return self.scheduler.advance(
+        return await self.scheduler.advance(
             children,
             lambda child: _run_child(
                 session, child, registry, secret_command_runner, emit, store, self
@@ -155,7 +155,7 @@ def _ensure_children(
     return tuple(children)
 
 
-def _run_child(
+async def _run_child(
     session: Session,
     child: Run,
     registry: ToolRegistry,
@@ -170,14 +170,15 @@ def _run_child(
         child.transition(RunStatus.FAILED)
         store.checkpoint_run(session, child)
         return child
+    model: ModelAdapter | None = None
     try:
-        model = delegation.model_for_spec(spec)
+        model = delegation.scheduler.model(delegation.model_for_spec(spec))
         manager = context_manager_for_run(delegation.context_managers, child, spec, model)
-        return resume_run(
+        return await resume_run(
             session, child, model, registry,
             store=store, agent_spec=spec, emit=emit,
             secret_command_runner=secret_command_runner,
-            context_manager=manager,
+            context_manager=manager, scheduler=delegation.scheduler,
         )
     except (UserCancelledError, StorageError):
         raise
@@ -193,6 +194,9 @@ def _run_child(
         persisted.transition(RunStatus.FAILED)
         store.checkpoint_run(session, persisted)
         return persisted
+    finally:
+        if model is not None:
+            await close_model(model)
 
 
 def _pending_calls(parent: Run, store: RunStore) -> tuple[ToolCall, ...]:
@@ -220,7 +224,7 @@ def _pending_calls(parent: Run, store: RunStore) -> tuple[ToolCall, ...]:
     return tuple(calls)
 
 
-def continue_delegation(
+async def continue_delegation(
     session: Session,
     parent: Run,
     model: ModelAdapter,
@@ -233,62 +237,68 @@ def continue_delegation(
     secret_command_runner: SecretCommandRunner | None = None,
 ) -> Run:
     """Recover a child batch, join it once, and resume the parent."""
-    if parent.status not in {RunStatus.WAITING, RunStatus.RUNNING} or parent.open_dependencies():
-        raise AgentLoopError("Run is not ready for a delegated child handoff")
-    if parent.session_id != session.session_id:
-        raise AgentLoopError("Delegating run does not belong to the session")
-    parent.model_name = model_name_for_run(parent, agent_spec)
-    output = emit or (lambda _message: None)
-    manager = context_manager_for_run(delegation.context_managers, parent, agent_spec, model)
-    _sync_context(parent, store, manager)
+    scheduler = delegation.scheduler
+    with scheduler.run_scope(parent):
+        if (
+            parent.status not in {RunStatus.WAITING, RunStatus.RUNNING}
+            or parent.open_dependencies()
+        ):
+            raise AgentLoopError("Run is not ready for a delegated child handoff")
+        if parent.session_id != session.session_id:
+            raise AgentLoopError("Delegating run does not belong to the session")
+        parent.model_name = model_name_for_run(parent, agent_spec)
+        output = emit or (lambda _message: None)
+        model = delegation.scheduler.model(model)
+        manager = context_manager_for_run(delegation.context_managers, parent, agent_spec, model)
+        _sync_context(parent, store, manager)
 
-    if parent.status is RunStatus.RUNNING:
-        messages = tuple(
-            item.message for item in store.read_messages(parent.context_scope_id)
-            if item.message.run_id == parent.run_id
+        if parent.status is RunStatus.RUNNING:
+            messages = tuple(
+                item.message for item in store.read_messages(parent.context_scope_id)
+                if item.message.run_id == parent.run_id
+            )
+            if len(messages) < 2 or messages[-1].role != "user" or messages[-2].role != "assistant":
+                raise AgentLoopError("Run has no completed child handoff to resume")
+            call_ids = tuple(
+                block.get("id") for block in messages[-2].content
+                if block.get("type") == "tool_use" and block.get("name") == DELEGATE_TOOL.name
+            )
+            result_ids = tuple(
+                block.get("tool_use_id") for block in messages[-1].content
+                if block.get("type") == "tool_result"
+            )
+            tool_uses = tuple(
+                block for block in messages[-2].content if block.get("type") == "tool_use"
+            )
+            if not call_ids or len(call_ids) != len(tool_uses) or call_ids != result_ids:
+                raise AgentLoopError("Run has no completed child handoff to resume")
+            return await delegation.scheduler.advance_runnable(
+                parent,
+                lambda runnable: _run_turns(
+                    session, runnable, model, registry, secret_command_runner,
+                    output, store, manager, agent_spec, delegation, delegation.scheduler,
+                ),
+            )
+
+        calls = _pending_calls(parent, store)
+        prepared = delegation.prepare_batch(calls)
+        if isinstance(prepared, ToolResult):
+            raise AgentLoopError("Stored delegation batch is no longer available")
+        children = await delegation.run_batch(
+            session, parent, calls, prepared, registry,
+            secret_command_runner, output, store,
         )
-        if len(messages) < 2 or messages[-1].role != "user" or messages[-2].role != "assistant":
-            raise AgentLoopError("Run has no completed child handoff to resume")
-        call_ids = tuple(
-            block.get("id") for block in messages[-2].content
-            if block.get("type") == "tool_use" and block.get("name") == DELEGATE_TOOL.name
-        )
-        result_ids = tuple(
-            block.get("tool_use_id") for block in messages[-1].content
-            if block.get("type") == "tool_result"
-        )
-        tool_uses = tuple(
-            block for block in messages[-2].content if block.get("type") == "tool_use"
-        )
-        if not call_ids or len(call_ids) != len(tool_uses) or call_ids != result_ids:
-            raise AgentLoopError("Run has no completed child handoff to resume")
-        return delegation.scheduler.advance_runnable(
+        if not delegation.scheduler.ready_to_join(children):
+            return parent
+        pending: list[ModelMessage] = []
+        delegation.append_results(pending, parent, children)
+        parent.transition(RunStatus.RUNNING)
+        _checkpoint(session, parent, store, manager, pending)
+        output(f"Joined {len(children)} child runs; resuming parent")
+        return await delegation.scheduler.advance_runnable(
             parent,
             lambda runnable: _run_turns(
                 session, runnable, model, registry, secret_command_runner,
-                output, store, manager, agent_spec, delegation,
+                output, store, manager, agent_spec, delegation, delegation.scheduler,
             ),
         )
-
-    calls = _pending_calls(parent, store)
-    prepared = delegation.prepare_batch(calls)
-    if isinstance(prepared, ToolResult):
-        raise AgentLoopError("Stored delegation batch is no longer available")
-    children = delegation.run_batch(
-        session, parent, calls, prepared, registry,
-        secret_command_runner, output, store,
-    )
-    if not delegation.scheduler.ready_to_join(children):
-        return parent
-    pending: list[ModelMessage] = []
-    delegation.append_results(pending, parent, children)
-    parent.transition(RunStatus.RUNNING)
-    _checkpoint(session, parent, store, manager, pending)
-    output(f"Joined {len(children)} child runs; resuming parent")
-    return delegation.scheduler.advance_runnable(
-        parent,
-        lambda runnable: _run_turns(
-            session, runnable, model, registry, secret_command_runner,
-            output, store, manager, agent_spec, delegation,
-        ),
-    )

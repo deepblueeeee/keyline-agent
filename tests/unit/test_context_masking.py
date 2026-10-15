@@ -24,7 +24,7 @@ from handshake.runtime.state import Run, Session, ToolResult
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools.files import read_file
 from handshake.tools.registry import ToolBinding, ToolRegistry
-from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, ingest
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, ingest, run_async
 
 _HISTORY: dict[str, list[ModelMessage]] = {}
 
@@ -455,7 +455,8 @@ def test_pressure_exhaustion_only_fails_at_hard_limit(tmp_path: Path) -> None:
         _apply_pressure(hard_limit, session, run)
 
 
-def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> None:
+@run_async
+async def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> None:
     session, run = _session_run(tmp_path)
     store = fresh_store(tmp_path, session)
     model = ScriptedModel([])
@@ -465,7 +466,7 @@ def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> No
     )
 
     with pytest.raises(ContextPressureError):
-        start_run(
+        await start_run(
             session,
             run,
             model,
@@ -477,7 +478,8 @@ def test_loop_does_not_call_model_above_hard_context_limit(tmp_path: Path) -> No
     assert model.contexts == []
 
 
-def test_loop_externalizes_large_result_but_persists_complete_result(
+@run_async
+async def test_loop_externalizes_large_result_but_persists_complete_result(
     tmp_path: Path, monkeypatch
 ) -> None:
     original = "BEGIN\n" + "value\n" * 400 + "END"
@@ -515,7 +517,7 @@ def test_loop_externalizes_large_result_but_persists_complete_result(
         _policy(recent_messages=8, ingress_tokens=600), CharacterTokenEstimator()
     )
 
-    start_run(
+    await start_run(
         session,
         run,
         model,

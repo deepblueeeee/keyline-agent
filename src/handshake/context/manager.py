@@ -97,7 +97,7 @@ class AgentContextManager:
         self.bind_scope(scope.scope_id)
         return self._state is not None
 
-    def prepare(
+    async def prepare(
         self,
         session: Session,
         run: Run,
@@ -120,7 +120,7 @@ class AgentContextManager:
                     session, run, tools, instructions=instructions
                 )
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
-                compact_semantic_context(
+                await compact_semantic_context(
                     state,
                     run_id=run.context_scope_id,
                     policy=self.policy,

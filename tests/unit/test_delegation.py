@@ -17,6 +17,7 @@ from handshake.runtime.recovery import resume_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
+from tests.history_support import run_async
 
 
 def _tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -80,7 +81,8 @@ def _child_result(store: SQLiteStateStore, parent: Run) -> dict[str, object]:
     return json.loads(block["content"])
 
 
-def test_delegation_runs_child_to_completion_with_private_context(tmp_path: Path) -> None:
+@run_async
+async def test_delegation_runs_child_to_completion_with_private_context(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -97,7 +99,7 @@ def test_delegation_runs_child_to_completion_with_private_context(tmp_path: Path
     )
     session, store, parent, main_spec, _, parent_model, child_model, registry, delegation = setup
 
-    start_run(
+    await start_run(
         session,
         parent,
         parent_model,
@@ -135,7 +137,8 @@ def test_delegation_runs_child_to_completion_with_private_context(tmp_path: Path
     }
 
 
-def test_batch_creates_all_children_before_running_and_joins_once(
+@run_async
+async def test_batch_creates_all_children_before_running_and_joins_once(
     tmp_path: Path,
 ) -> None:
     calls = (
@@ -169,7 +172,7 @@ def test_batch_creates_all_children_before_running_and_joins_once(
         return explorer_model if spec.spec_id == "explorer" else reviewer_model
 
     delegation.model_for_spec = model_for_spec
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -183,11 +186,11 @@ def test_batch_creates_all_children_before_running_and_joins_once(
     continuation = resolve_text_dependency(
         session, explorer, explorer.open_dependencies()[0].dependency_id, "parser.py"
     )
-    continue_run(
+    await continue_run(
         session, explorer, explorer_model, registry, store=store,
         pending_messages=(continuation,), agent_spec=explorer_spec,
     )
-    continue_delegation(
+    await continue_delegation(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -205,7 +208,8 @@ def test_batch_creates_all_children_before_running_and_joins_once(
     ] == ["Exploration done", "Review done"]
 
 
-def test_failed_child_does_not_prevent_sibling_or_batch_join(tmp_path: Path) -> None:
+@run_async
+async def test_failed_child_does_not_prevent_sibling_or_batch_join(tmp_path: Path) -> None:
     calls = (
         ToolCall("explore", "delegate", {"agent_spec_id": "explorer", "goal": "Explore"}),
         ToolCall("review", "delegate", {"agent_spec_id": "reviewer", "goal": "Review"}),
@@ -221,7 +225,7 @@ def test_failed_child_does_not_prevent_sibling_or_batch_join(tmp_path: Path) -> 
         "reviewer": ScriptedModel([_final("Review done")]),
     }
     delegation.model_for_spec = lambda spec: models[spec.spec_id]
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -232,7 +236,8 @@ def test_failed_child_does_not_prevent_sibling_or_batch_join(tmp_path: Path) -> 
     assert [block["is_error"] for block in results] == [True, False]
 
 
-def test_invalid_batch_creates_no_children_and_returns_all_results(
+@run_async
+async def test_invalid_batch_creates_no_children_and_returns_all_results(
     tmp_path: Path,
 ) -> None:
     calls = (
@@ -241,7 +246,7 @@ def test_invalid_batch_creates_no_children_and_returns_all_results(
     )
     setup = _setup(tmp_path, [_tool_turn(*calls), _final("Handled invalid batch")], [])
     session, store, parent, main_spec, _, parent_model, _, registry, delegation = setup
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -252,7 +257,8 @@ def test_invalid_batch_creates_no_children_and_returns_all_results(
     assert all(block["is_error"] for block in results)
 
 
-def test_two_children_of_same_spec_keep_independent_contexts(tmp_path: Path) -> None:
+@run_async
+async def test_two_children_of_same_spec_keep_independent_contexts(tmp_path: Path) -> None:
     calls = (
         ToolCall("first", "delegate", {"agent_spec_id": "explorer", "goal": "Find A"}),
         ToolCall("second", "delegate", {"agent_spec_id": "explorer", "goal": "Find B"}),
@@ -267,7 +273,7 @@ def test_two_children_of_same_spec_keep_independent_contexts(tmp_path: Path) -> 
         return model
 
     delegation.model_for_spec = model_for_spec
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -280,7 +286,8 @@ def test_two_children_of_same_spec_keep_independent_contexts(tmp_path: Path) -> 
     ]
 
 
-def test_waiting_child_hands_off_and_resumes_parent_after_restart(tmp_path: Path) -> None:
+@run_async
+async def test_waiting_child_hands_off_and_resumes_parent_after_restart(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -306,7 +313,7 @@ def test_waiting_child_hands_off_and_resumes_parent_after_restart(tmp_path: Path
         registry,
         delegation,
     ) = setup
-    start_run(
+    await start_run(
         session,
         parent,
         parent_model,
@@ -328,7 +335,7 @@ def test_waiting_child_hands_off_and_resumes_parent_after_restart(tmp_path: Path
     continuation = resolve_text_dependency(
         restored_session, child, child.open_dependencies()[0].dependency_id, "A"
     )
-    continue_run(
+    await continue_run(
         restored_session,
         child,
         child_model,
@@ -344,7 +351,7 @@ def test_waiting_child_hands_off_and_resumes_parent_after_restart(tmp_path: Path
     restored_delegation = DelegationRuntime(
         delegation.agent_specs, lambda _spec: child_model, ActiveContextManagers()
     )
-    continue_delegation(
+    await continue_delegation(
         restored_session,
         restored_parent,
         resumed_model,
@@ -359,7 +366,8 @@ def test_waiting_child_hands_off_and_resumes_parent_after_restart(tmp_path: Path
     assert "Found module A" in resumed_model.contexts[0].messages[-1].content[0]["content"]
 
 
-def test_child_failure_is_a_structured_tool_error_for_parent(tmp_path: Path) -> None:
+@run_async
+async def test_child_failure_is_a_structured_tool_error_for_parent(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -371,7 +379,7 @@ def test_child_failure_is_a_structured_tool_error_for_parent(tmp_path: Path) -> 
         [ModelTurn(content=(), stop_reason="end_turn")],
     )
     session, store, parent, main_spec, _, parent_model, _, registry, delegation = setup
-    start_run(
+    await start_run(
         session,
         parent,
         parent_model,
@@ -388,7 +396,8 @@ def test_child_failure_is_a_structured_tool_error_for_parent(tmp_path: Path) -> 
     assert result["error"]
 
 
-def test_child_setup_failure_is_a_structured_tool_error_for_parent(tmp_path: Path) -> None:
+@run_async
+async def test_child_setup_failure_is_a_structured_tool_error_for_parent(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -405,7 +414,7 @@ def test_child_setup_failure_is_a_structured_tool_error_for_parent(tmp_path: Pat
         raise RuntimeError("provider unavailable")
 
     delegation.model_for_spec = unavailable_model
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -420,7 +429,8 @@ def test_builtin_child_profiles_cannot_delegate() -> None:
         assert "delegate" not in spec.allowed_tools
 
 
-def test_delegation_rejects_a_spec_that_can_delegate(tmp_path: Path) -> None:
+@run_async
+async def test_delegation_rejects_a_spec_that_can_delegate(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -432,7 +442,7 @@ def test_delegation_rejects_a_spec_that_can_delegate(tmp_path: Path) -> None:
         [],
     )
     session, store, parent, main_spec, _, parent_model, _, registry, delegation = setup
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -440,7 +450,8 @@ def test_delegation_rejects_a_spec_that_can_delegate(tmp_path: Path) -> None:
     assert len(store.list_runs(session.session_id)) == 1
 
 
-def test_child_context_pressure_is_handed_back_to_parent(tmp_path: Path) -> None:
+@run_async
+async def test_child_context_pressure_is_handed_back_to_parent(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -460,7 +471,7 @@ def test_child_context_pressure_is_handed_back_to_parent(tmp_path: Path) -> None
             reserved_output_tokens=1,
         ),
     )
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -470,7 +481,8 @@ def test_child_context_pressure_is_handed_back_to_parent(tmp_path: Path) -> None
     assert _child_result(store, parent)["status"] == "failed"
 
 
-def test_mixed_delegation_turn_rejects_all_tools(tmp_path: Path) -> None:
+@run_async
+async def test_mixed_delegation_turn_rejects_all_tools(tmp_path: Path) -> None:
     setup = _setup(
         tmp_path,
         [
@@ -486,7 +498,7 @@ def test_mixed_delegation_turn_rejects_all_tools(tmp_path: Path) -> None:
         [],
     )
     session, store, parent, main_spec, _, parent_model, _, registry, delegation = setup
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -497,7 +509,8 @@ def test_mixed_delegation_turn_rejects_all_tools(tmp_path: Path) -> None:
     assert all(block["is_error"] for block in result_message.content)
 
 
-def test_checkpointed_delegation_creates_child_once_after_interruption(
+@run_async
+async def test_checkpointed_delegation_creates_child_once_after_interruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     setup = _setup(
@@ -512,12 +525,12 @@ def test_checkpointed_delegation_creates_child_once_after_interruption(
     session, store, parent, main_spec, _, parent_model, child_model, registry, delegation = setup
     original = runtime_delegation._run_child
 
-    def interrupt(*_args: object, **_kwargs: object) -> Run:
+    async def interrupt(*_args: object, **_kwargs: object) -> Run:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(runtime_delegation, "_run_child", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        start_run(
+        await start_run(
             session,
             parent,
             parent_model,
@@ -536,7 +549,7 @@ def test_checkpointed_delegation_creates_child_once_after_interruption(
     restored_delegation = DelegationRuntime(
         delegation.agent_specs, lambda _spec: child_model, ActiveContextManagers()
     )
-    continue_delegation(
+    await continue_delegation(
         store.load_session(session.session_id),
         resumed,
         resumed_model,
@@ -550,7 +563,8 @@ def test_checkpointed_delegation_creates_child_once_after_interruption(
     assert _child_result(store, resumed)["summary"] == "Found answer"
 
 
-def test_interrupted_batch_resumes_precreated_children_without_duplicates(
+@run_async
+async def test_interrupted_batch_resumes_precreated_children_without_duplicates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = (
@@ -565,12 +579,12 @@ def test_interrupted_batch_resumes_precreated_children_without_duplicates(
     )
     original = runtime_delegation._run_child
 
-    def interrupt(*_args: object, **_kwargs: object) -> Run:
+    async def interrupt(*_args: object, **_kwargs: object) -> Run:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(runtime_delegation, "_run_child", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        start_run(
+        await start_run(
             session, parent, parent_model, registry, store=store,
             agent_spec=main_spec, delegation=delegation,
         )
@@ -585,7 +599,7 @@ def test_interrupted_batch_resumes_precreated_children_without_duplicates(
         lambda spec: ScriptedModel([_final(f"{spec.spec_id} done")]),
         ActiveContextManagers(),
     )
-    continue_delegation(
+    await continue_delegation(
         store.load_session(session.session_id), restored,
         ScriptedModel([_final("Done")]), registry, store=store,
         agent_spec=main_spec, delegation=restored_delegation,
@@ -596,7 +610,8 @@ def test_interrupted_batch_resumes_precreated_children_without_duplicates(
     assert [block["tool_use_id"] for block in results] == ["explore", "review"]
 
 
-def test_interrupted_batch_creation_restores_only_missing_child(
+@run_async
+async def test_interrupted_batch_creation_restores_only_missing_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = (
@@ -622,7 +637,7 @@ def test_interrupted_batch_creation_restores_only_missing_child(
 
     monkeypatch.setattr(store, "create_run", interrupt_second_child)
     with pytest.raises(KeyboardInterrupt):
-        start_run(
+        await start_run(
             session, parent, parent_model, registry, store=store,
             agent_spec=main_spec, delegation=delegation,
         )
@@ -636,7 +651,7 @@ def test_interrupted_batch_creation_restores_only_missing_child(
         lambda spec: ScriptedModel([_final(f"{spec.spec_id} done")]),
         ActiveContextManagers(),
     )
-    continue_delegation(
+    await continue_delegation(
         store.load_session(session.session_id), restored,
         ScriptedModel([_final("Done")]), registry, store=store,
         agent_spec=main_spec, delegation=restored_delegation,
@@ -645,7 +660,8 @@ def test_interrupted_batch_creation_restores_only_missing_child(
     assert len(store.list_runs(session.session_id)) == 3
 
 
-def test_joined_batch_resumes_parent_without_duplicate_results(
+@run_async
+async def test_joined_batch_resumes_parent_without_duplicate_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = (
@@ -660,12 +676,12 @@ def test_joined_batch_resumes_parent_without_duplicate_results(
     )
     original_child = runtime_delegation._run_child
 
-    def interrupt(*_args: object, **_kwargs: object) -> Run:
+    async def interrupt(*_args: object, **_kwargs: object) -> Run:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(runtime_delegation, "_run_child", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        start_run(
+        await start_run(
             session, parent, parent_model, registry, store=store,
             agent_spec=main_spec, delegation=delegation,
         )
@@ -679,7 +695,7 @@ def test_joined_batch_resumes_parent_without_duplicate_results(
         ActiveContextManagers(),
     )
     with pytest.raises(KeyboardInterrupt):
-        continue_delegation(
+        await continue_delegation(
             store.load_session(session.session_id), restored,
             ScriptedModel([]), registry, store=store,
             agent_spec=main_spec, delegation=restored_delegation,
@@ -690,7 +706,7 @@ def test_joined_batch_resumes_parent_without_duplicate_results(
     messages = tuple(store.read_messages(parent.context_scope_id))
     assert len(messages[2].message.content) == 2
 
-    resume_run(
+    await resume_run(
         store.load_session(session.session_id), persisted,
         ScriptedModel([_final("Done")]), registry, store=store,
         agent_spec=main_spec, delegation=restored_delegation,
@@ -699,7 +715,8 @@ def test_joined_batch_resumes_parent_without_duplicate_results(
     assert len(tuple(store.read_messages(parent.context_scope_id))) == 4
 
 
-def test_committed_child_result_resumes_without_duplicate_after_interruption(
+@run_async
+async def test_committed_child_result_resumes_without_duplicate_after_interruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     setup = _setup(
@@ -721,7 +738,7 @@ def test_committed_child_result_resumes_without_duplicate_after_interruption(
         session, store, parent, main_spec, child_spec,
         parent_model, child_model, registry, delegation,
     ) = setup
-    start_run(
+    await start_run(
         session, parent, parent_model, registry, store=store,
         agent_spec=main_spec, delegation=delegation,
     )
@@ -729,13 +746,13 @@ def test_committed_child_result_resumes_without_duplicate_after_interruption(
     continuation = resolve_text_dependency(
         session, child, child.open_dependencies()[0].dependency_id, "A"
     )
-    continue_run(
+    await continue_run(
         session, child, child_model, registry, store=store,
         pending_messages=(continuation,), agent_spec=child_spec,
     )
     assert child.status is RunStatus.COMPLETED
 
-    def interrupt(*_args: object, **_kwargs: object) -> Run:
+    async def interrupt(*_args: object, **_kwargs: object) -> Run:
         raise KeyboardInterrupt
 
     restored_parent = store.load_run(parent.run_id)
@@ -745,7 +762,7 @@ def test_committed_child_result_resumes_without_duplicate_after_interruption(
     original_turns = runtime_delegation._run_turns
     monkeypatch.setattr(runtime_delegation, "_run_turns", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        continue_delegation(
+        await continue_delegation(
             store.load_session(session.session_id), restored_parent,
             ScriptedModel([]), registry, store=store,
             agent_spec=main_spec, delegation=restored_delegation,
@@ -754,7 +771,7 @@ def test_committed_child_result_resumes_without_duplicate_after_interruption(
     assert store.load_run(parent.run_id).status is RunStatus.RUNNING
 
     resumed = store.load_run(parent.run_id)
-    continue_delegation(
+    await continue_delegation(
         store.load_session(session.session_id), resumed,
         ScriptedModel([_final("Done")]), registry, store=store,
         agent_spec=main_spec, delegation=restored_delegation,
@@ -767,3 +784,252 @@ def test_committed_child_result_resumes_without_duplicate_after_interruption(
         if block.get("type") == "tool_result"
     ]
     assert len(result_blocks) == 1
+
+
+@run_async
+async def test_concurrent_children_finish_out_of_order_and_join_in_call_order(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    calls = tuple(
+        ToolCall(str(index), "delegate", {"agent_spec_id": "explorer", "goal": str(index)})
+        for index in range(3)
+    )
+    setup = _setup(tmp_path, [_tool_turn(*calls), _final("joined")], [])
+    session, store, parent, main_spec, _, model, _, registry, delegation = setup
+    starts: asyncio.Queue[str] = asyncio.Queue()
+    releases = {str(index): asyncio.Event() for index in range(3)}
+    finishes: list[str] = []
+
+    class ConcurrentModel:
+        async def complete(self, context, _tools) -> ModelTurn:
+            assert len(store.list_runs(session.session_id)) == 4
+            starts.put_nowait(context.goal)
+            await releases[context.goal].wait()
+            finishes.append(context.goal)
+            return _final(f"result {context.goal}")
+
+    delegation.model_for_spec = lambda _spec: ConcurrentModel()
+    task = asyncio.create_task(start_run(
+        session, parent, model, registry, store=store, agent_spec=main_spec,
+        delegation=delegation,
+    ))
+    try:
+        assert [await asyncio.wait_for(starts.get(), 1) for _ in range(3)] == ["0", "1", "2"]
+        assert len(model.contexts) == 1
+        assert len(tuple(store.read_messages(parent.context_scope_id))) == 2
+        releases["2"].set()
+        releases["1"].set()
+        await asyncio.sleep(0)
+        assert finishes == ["2", "1"]
+        assert len(model.contexts) == 1
+        releases["0"].set()
+        await task
+    finally:
+        for release in releases.values():
+            release.set()
+        await task
+    assert parent.status is RunStatus.COMPLETED
+    result_message = tuple(store.read_messages(parent.context_scope_id))[2].message
+    assert [block["tool_use_id"] for block in result_message.content] == ["0", "1", "2"]
+    assert [json.loads(block["content"])["summary"] for block in result_message.content] == [
+        "result 0", "result 1", "result 2",
+    ]
+
+
+@run_async
+async def test_cancellation_preserves_completed_child_and_resumes_only_interrupted_child(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    calls = (
+        ToolCall("done", "delegate", {"agent_spec_id": "explorer", "goal": "done"}),
+        ToolCall("pending", "delegate", {"agent_spec_id": "explorer", "goal": "pending"}),
+    )
+    setup = _setup(tmp_path, [_tool_turn(*calls), _final("joined")], [])
+    session, store, parent, main_spec, _, model, _, registry, delegation = setup
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    requests: list[str] = []
+
+    class InterruptibleModel:
+        async def complete(self, context, _tools) -> ModelTurn:
+            requests.append(context.goal)
+            if context.goal == "pending":
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return _final("completed")
+
+    delegation.model_for_spec = lambda _spec: InterruptibleModel()
+    task = asyncio.create_task(start_run(
+        session, parent, model, registry, store=store, agent_spec=main_spec,
+        delegation=delegation,
+    ))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+    restored_session = store.load_session(session.session_id)
+    restored_parent = store.load_run(parent.run_id)
+    assert restored_parent.status is RunStatus.WAITING
+    children = [run for run in store.list_runs(session.session_id) if run.parent_run_id]
+    assert [child.status for child in children] == [RunStatus.COMPLETED, RunStatus.RUNNING]
+    resumed = ScriptedModel([_final("recovered")])
+    recovered_delegation = DelegationRuntime(
+        delegation.agent_specs, lambda _spec: resumed, ActiveContextManagers()
+    )
+    await continue_delegation(
+        restored_session, restored_parent, model, registry, store=store,
+        agent_spec=main_spec, delegation=recovered_delegation,
+    )
+    assert restored_parent.status is RunStatus.COMPLETED
+    assert [context.goal for context in resumed.contexts] == ["pending"]
+    results = tuple(store.read_messages(parent.context_scope_id))[2].message.content
+    assert [json.loads(block["content"])["summary"] for block in results] == [
+        "completed", "recovered",
+    ]
+    assert requests == ["done", "pending"]
+
+
+@run_async
+async def test_storage_failure_interrupts_inflight_sibling_without_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from handshake.storage.errors import StorageError
+
+    calls = tuple(
+        ToolCall(goal, "delegate", {"agent_spec_id": "explorer", "goal": goal})
+        for goal in ("blocked", "fail")
+    )
+    setup = _setup(tmp_path, [_tool_turn(*calls)], [])
+    session, store, parent, main_spec, _, model, _, registry, delegation = setup
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    checkpoint = store.checkpoint_run
+
+    def fail_checkpoint(current_session, run, messages=()):
+        if run.goal == "fail":
+            raise StorageError("disk unavailable")
+        return checkpoint(current_session, run, messages)
+
+    monkeypatch.setattr(store, "checkpoint_run", fail_checkpoint)
+
+    class FailingBatchModel:
+        async def complete(self, context, _tools) -> ModelTurn:
+            if context.goal == "blocked":
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            await started.wait()
+            return _final("result")
+
+    delegation.model_for_spec = lambda _spec: FailingBatchModel()
+    with pytest.raises(StorageError, match="disk unavailable"):
+        await asyncio.wait_for(start_run(
+            session, parent, model, registry, store=store, agent_spec=main_spec,
+            delegation=delegation,
+        ), 1)
+    assert cancelled.is_set()
+    assert store.load_run(parent.run_id).status is RunStatus.WAITING
+    assert len(tuple(store.read_messages(parent.context_scope_id))) == 2
+    assert all(child.status is RunStatus.RUNNING for child in store.list_runs(session.session_id)
+               if child.parent_run_id)
+
+
+@pytest.mark.parametrize("outcome", ("completed", "failed", "waiting"))
+@run_async
+async def test_child_cleanup_failure_keeps_outcome_and_sibling_progress(
+    tmp_path: Path, outcome: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+
+    from handshake.models.errors import ModelProviderError
+
+    calls = tuple(
+        ToolCall(goal, "delegate", {"agent_spec_id": "explorer", "goal": goal})
+        for goal in ("first", "second")
+    )
+    setup = _setup(tmp_path, [_tool_turn(*calls), _final("joined")], [])
+    session, store, parent, main_spec, _, model, _, registry, delegation = setup
+    closed = asyncio.Event()
+    secret = "cleanup-exception-canary"
+
+    class ClosingModel:
+        async def complete(self, context, _tools) -> ModelTurn:
+            if context.goal == "first":
+                if outcome == "failed":
+                    raise ModelProviderError("Model failed")
+                if outcome == "waiting":
+                    return _tool_turn(ToolCall("wait", "wait_for_text", {"prompt": "Question"}))
+                return _final("first result")
+            await asyncio.wait_for(closed.wait(), 1)
+            return _final("second result")
+
+        async def aclose(self) -> None:
+            closed.set()
+            raise RuntimeError(secret)
+
+    delegation.model_for_spec = lambda _spec: ClosingModel()
+    await start_run(
+        session, parent, model, registry, store=store, agent_spec=main_spec,
+        delegation=delegation,
+    )
+    children = [run for run in store.list_runs(session.session_id) if run.parent_run_id]
+    assert children[0].status.value == outcome
+    assert children[1].status is RunStatus.COMPLETED
+    assert parent.status is (
+        RunStatus.WAITING if outcome == "waiting" else RunStatus.COMPLETED
+    )
+    assert secret not in caplog.text
+    assert "Model resource cleanup failed (RuntimeError)" in caplog.text
+    if outcome != "waiting":
+        results = tuple(store.read_messages(parent.context_scope_id))[2].message.content
+        assert json.loads(results[0]["content"])["status"] == outcome
+        assert json.loads(results[1]["content"])["summary"] == "second result"
+
+
+@run_async
+async def test_continue_delegation_cannot_reenter_a_running_parent(tmp_path: Path) -> None:
+    import asyncio
+
+    from handshake.runtime.errors import AgentLoopError
+
+    call = ToolCall("child", "delegate", {"agent_spec_id": "explorer", "goal": "child"})
+    setup = _setup(tmp_path, [_tool_turn(call), _final("joined")], [])
+    session, store, parent, main_spec, _, model, _, registry, delegation = setup
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class WaitingModel:
+        async def complete(self, _context, _tools) -> ModelTurn:
+            started.set()
+            await release.wait()
+            return _final("child result")
+
+    delegation.model_for_spec = lambda _spec: WaitingModel()
+    task = asyncio.create_task(start_run(
+        session, parent, model, registry, store=store, agent_spec=main_spec,
+        delegation=delegation,
+    ))
+    await asyncio.wait_for(started.wait(), 1)
+    try:
+        with pytest.raises(AgentLoopError, match="already has an active run"):
+            await continue_delegation(
+                session, store.load_run(parent.run_id), model, registry,
+                store=store, agent_spec=main_spec, delegation=delegation,
+            )
+        assert len(model.contexts) == 1
+    finally:
+        release.set()
+        await task
+    assert parent.status is RunStatus.COMPLETED

@@ -15,7 +15,7 @@ class ScriptedModel:
         self.contexts: list[ModelContext] = []
         self.tool_sets: list[tuple[ToolDefinition, ...]] = []
 
-    def complete(
+    async def complete(
         self, context: ModelContext, tools: tuple[ToolDefinition, ...]
     ) -> ModelTurn:
         self.contexts.append(context)

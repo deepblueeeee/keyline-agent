@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
+import inspect
 import os
 import readline  # noqa: F401  # Enable line editing for interactive input().
+import select
 import shlex
 import shutil
 import sys
 import tempfile
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
 
 from handshake.config import (
@@ -27,7 +30,7 @@ from handshake.config.settings import RuntimeSettings
 from handshake.context import ActiveContextManagers, AgentContextManager
 from handshake.errors import HandshakeError
 from handshake.inputs import EphemeralSecretStore, SecretWriter
-from handshake.models.base import ModelAdapter
+from handshake.models.base import ModelAdapter, close_model
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.models.protocol import ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
@@ -65,6 +68,7 @@ from handshake.runtime.state import (
 )
 from handshake.storage import SQLiteStateStore, StorageError
 from handshake.tools import create_default_registry, runtime_tool_definitions
+from handshake.tools.cancellation import check_tool_cancellation, has_tool_cancellation
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
 from handshake.tools.shell import ApprovalCallback
@@ -101,11 +105,36 @@ def _interactive_approval(cwd: Path, argv: tuple[str, ...], *, with_secret: bool
         print("Denied: stdin is not interactive")
         return False
     try:
-        answer = input("Execute this command once? [y/N] ")
+        answer = _read_approval_answer("Execute this command once? [y/N] ")
     except (EOFError, KeyboardInterrupt) as exc:
         print()
         raise UserCancelledError("User cancelled shell approval") from exc
     return answer.strip().lower() in {"y", "yes"}
+
+
+def _read_approval_answer(prompt: str) -> str:
+    """Wait for a complete stdin line while a worker's approval remains cancellable."""
+    check_tool_cancellation()
+    if not has_tool_cancellation():
+        return input(prompt)
+    try:
+        descriptor = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        raise HandshakeError("Approval input does not support cancellable reading") from None
+    print(prompt, end="", flush=True)
+    answer_bytes = bytearray()
+    while True:
+        check_tool_cancellation()
+        readable, _, _ = select.select([descriptor], [], [], 0.05)
+        if readable:
+            check_tool_cancellation()
+            character = os.read(descriptor, 1)
+            if not character:
+                raise EOFError
+            if character == b"\n":
+                check_tool_cancellation()
+                return answer_bytes.decode(sys.stdin.encoding or "utf-8").strip()
+            answer_bytes.extend(character)
 
 
 def _approval_callback(mode: ApprovalMode, *, with_secret: bool = False) -> ApprovalCallback:
@@ -221,7 +250,7 @@ def _print_final_summary(run: Run) -> None:
     print(run.final_summary or "(none)")
 
 
-def _drive_run(
+async def _drive_run(
     session: Session,
     run: Run,
     model: ModelAdapter,
@@ -262,7 +291,7 @@ def _drive_run(
             del secret_value
         else:
             raise HandshakeError(f"Unsupported dependency kind: {dependency.kind.value}")
-        run = continue_run(
+        run = await continue_run(
             session,
             run,
             model,
@@ -315,7 +344,7 @@ def _read_next_goal(session: Session) -> str | None:
         print("Request must not be empty. Enter /exit to leave the session.")
 
 
-def _process_current_run(
+async def _process_current_run(
     session: Session,
     run: Run,
     registry: ToolRegistry,
@@ -325,6 +354,7 @@ def _process_current_run(
     agent_specs: Mapping[str, AgentSpec],
     context_managers: ActiveContextManagers,
     model: ModelAdapter | None = None,
+    scheduler: CooperativeScheduler | None = None,
 ) -> tuple[int, Run]:
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         return _print_terminal_run(run), run
@@ -334,12 +364,14 @@ def _process_current_run(
     agent_spec = _spec_for_run(run, agent_specs)
     current_model = model or _create_real_model(model_name_for_run(run, agent_spec))
     delegation = DelegationRuntime(
-        agent_specs, lambda spec: _create_real_model(spec.model_name), context_managers
+        agent_specs, lambda spec: _create_real_model(spec.model_name), context_managers,
+        scheduler=scheduler or CooperativeScheduler(),
     )
+    current_model = delegation.scheduler.model(current_model)
     current_context = context_manager_for_run(context_managers, run, agent_spec, current_model)
     try:
         if run.status is RunStatus.CREATED:
-            run = start_run(
+            run = await start_run(
                 session,
                 run,
                 current_model,
@@ -354,7 +386,7 @@ def _process_current_run(
             if run.status is RunStatus.WAITING and not run.open_dependencies():
                 return _WAITING_EXIT_CODE, run
         elif run.status is RunStatus.RUNNING:
-            run = delegation.scheduler.advance_runnable(
+            run = await delegation.scheduler.advance_runnable(
                 run,
                 lambda runnable: resume_run(
                     session, runnable, current_model, registry, store=store,
@@ -364,7 +396,7 @@ def _process_current_run(
                 ),
             )
         elif run.status is RunStatus.WAITING and not run.open_dependencies():
-            run = continue_delegation(
+            run = await continue_delegation(
                 session,
                 run,
                 current_model,
@@ -377,7 +409,7 @@ def _process_current_run(
             )
             if run.status is RunStatus.WAITING and not run.open_dependencies():
                 return _WAITING_EXIT_CODE, run
-        return _drive_run(
+        return await _drive_run(
             session,
             run,
             current_model,
@@ -399,9 +431,11 @@ def _process_current_run(
         if persisted.status is not RunStatus.FAILED:
             raise
         return _print_terminal_run(persisted), persisted
+    finally:
+        await close_model(current_model)
 
 
-def _drive_session(
+async def _drive_session(
     session: Session,
     run: Run,
     registry: ToolRegistry,
@@ -410,9 +444,11 @@ def _drive_session(
     secret_command_runner: SecretCommandRunner,
     agent_specs: Mapping[str, AgentSpec],
     initial_model: ModelAdapter | None = None,
+    max_model_requests: int = 4,
 ) -> int:
     context_managers = ActiveContextManagers()
-    result_code, run = _settle_run(
+    scheduler = CooperativeScheduler(max_model_requests)
+    result_code, run = await _settle_run(
         session,
         run,
         registry,
@@ -422,6 +458,7 @@ def _drive_session(
         agent_specs,
         context_managers,
         initial_model,
+        scheduler,
     )
     if result_code == _WAITING_EXIT_CODE or not sys.stdin.isatty():
         return result_code
@@ -432,7 +469,7 @@ def _drive_session(
             return 0
         runs = store.list_runs(session.session_id)
         run = create_followup_run(session, runs, goal)
-        result_code, run = _settle_run(
+        result_code, run = await _settle_run(
             session,
             run,
             registry,
@@ -441,12 +478,13 @@ def _drive_session(
             secret_command_runner,
             agent_specs,
             context_managers,
+            scheduler=scheduler,
         )
         if result_code == _WAITING_EXIT_CODE:
             return result_code
 
 
-def _settle_run(
+async def _settle_run(
     session: Session,
     run: Run,
     registry: ToolRegistry,
@@ -456,13 +494,15 @@ def _settle_run(
     agent_specs: Mapping[str, AgentSpec],
     context_managers: ActiveContextManagers,
     initial_model: ModelAdapter | None = None,
+    scheduler: CooperativeScheduler | None = None,
 ) -> tuple[int, Run]:
     """Advance runnable children, route a wait, then join through the parent."""
     if run.parent_run_id is not None:
         run = store.load_run(run.parent_run_id)
     model = initial_model
+    scheduler = scheduler or CooperativeScheduler()
     while True:
-        result_code, run = _process_current_run(
+        result_code, run = await _process_current_run(
             session,
             run,
             registry,
@@ -472,6 +512,7 @@ def _settle_run(
             agent_specs,
             context_managers,
             model,
+            scheduler,
         )
         model = None
         if run.status is RunStatus.WAITING and not run.open_dependencies():
@@ -495,7 +536,7 @@ def _settle_run(
         return result_code, run
 
 
-def _run_real(args: argparse.Namespace) -> int:
+async def _run_real(args: argparse.Namespace) -> int:
     workspace = Path(args.repo).expanduser().resolve()
     if not workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {workspace}")
@@ -520,7 +561,7 @@ def _run_real(args: argparse.Namespace) -> int:
     secret_writer, secret_command_runner = _create_secret_capabilities(
         _approval_callback(settings.approval_mode, with_secret=True)
     )
-    return _drive_session(
+    return await _drive_session(
         session,
         run,
         registry,
@@ -529,10 +570,11 @@ def _run_real(args: argparse.Namespace) -> int:
         secret_command_runner,
         agent_specs,
         model,
+        max_model_requests=settings.max_model_requests,
     )
 
 
-def _resume_session(args: argparse.Namespace) -> int:
+async def _resume_session(args: argparse.Namespace) -> int:
     store = _state_store()
     session = store.load_session(args.session_id)
     if not session.workspace.is_dir():
@@ -554,7 +596,7 @@ def _resume_session(args: argparse.Namespace) -> int:
             )
     if secrets_reissued:
         print("A process-local Secret was lost and must be entered again.")
-    return _drive_session(
+    return await _drive_session(
         session,
         run,
         registry,
@@ -562,6 +604,7 @@ def _resume_session(args: argparse.Namespace) -> int:
         secret_writer,
         secret_command_runner,
         _agent_specs(settings, registry),
+        max_model_requests=settings.max_model_requests,
     )
 
 
@@ -723,7 +766,7 @@ def add(left: int, right: int) -> int:
     )
 
 
-def _run_demo(_args: argparse.Namespace) -> int:
+async def _run_demo(_args: argparse.Namespace) -> int:
     fixture = Path(__file__).resolve().parents[2] / "examples" / "minimal_task"
     if not fixture.is_dir():
         raise HandshakeError(f"Bundled demo fixture is missing: {fixture}")
@@ -744,7 +787,7 @@ def _run_demo(_args: argparse.Namespace) -> int:
         )
         store = SQLiteStateStore(Path(temporary) / "demo.db")
         store.create_session(session)
-        start_run(
+        await start_run(
             session,
             run,
             _demo_model(),
@@ -783,6 +826,8 @@ def _show_config(_args: argparse.Namespace) -> int:
     print(f"max_tokens = {settings.provider.max_tokens}")
     print("\n[context]")
     print(f"context_window_tokens = {settings.context.context_window_tokens}")
+    print("\n[scheduler]")
+    print(f"max_model_requests = {settings.max_model_requests}")
     print("\n[approval]")
     print(f'mode = "{settings.approval_mode.value}"')
     return 0
@@ -841,11 +886,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _await_command(result: Awaitable[int]) -> int:
+    return await result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         handler = args.handler
-        return int(handler(args))
+        result = handler(args)
+        if inspect.isawaitable(result):
+            return int(asyncio.run(_await_command(result)))
+        return int(result)
+    except KeyboardInterrupt:
+        print("Cancelled: user interrupted execution", file=sys.stderr)
+        return 130
     except UserCancelledError as exc:
         print(f"Cancelled: {exc}", file=sys.stderr)
         return 130

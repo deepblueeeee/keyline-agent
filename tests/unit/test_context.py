@@ -17,7 +17,7 @@ from handshake.context import (
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.state import Dependency, DependencyKind, Run, Session
 from handshake.tools import TEXT_WAIT_TOOL
-from tests.history_support import ingest
+from tests.history_support import ingest, run_async
 
 
 def _session_run(tmp_path: Path) -> tuple[Session, Run]:
@@ -74,10 +74,13 @@ def test_build_renders_current_plan(tmp_path: Path) -> None:
     assert state["plan"] == ["Inspect the implementation", "Run focused tests"]
 
 
-def test_tool_protocol_notes_follow_visible_tools_and_agent_instructions(tmp_path: Path) -> None:
+@run_async
+async def test_tool_protocol_notes_follow_visible_tools_and_agent_instructions(
+    tmp_path: Path,
+) -> None:
     session, run = _session_run(tmp_path)
     manager = AgentContextManager()
-    context = manager.prepare(
+    context = await manager.prepare(
         session,
         run,
         (TEXT_WAIT_TOOL,),
@@ -92,14 +95,14 @@ def test_tool_protocol_notes_follow_visible_tools_and_agent_instructions(tmp_pat
 
     other_session, other_run = _session_run(tmp_path / "other")
     with pytest.raises(ContextViewError, match="belongs to scope"):
-        manager.prepare(
+        await manager.prepare(
             other_session,
             other_run,
             (),
             instructions="Explore the repository structure.",
         )
     other_manager = AgentContextManager(scope_id=other_run.context_scope_id)
-    other = other_manager.prepare(
+    other = await other_manager.prepare(
         other_session,
         other_run,
         (),

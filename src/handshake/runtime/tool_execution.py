@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+from dataclasses import replace
+from threading import Event
 
 from handshake.models.protocol import ToolCall
-from handshake.runtime.errors import AgentLoopError, ToolOutcomeUnknownError
+from handshake.runtime.errors import AgentLoopError, ToolOutcomeUnknownError, UserCancelledError
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.scheduler import CooperativeScheduler
 from handshake.runtime.state import (
     ReplayPolicy,
     Run,
@@ -15,11 +19,12 @@ from handshake.runtime.state import (
     ToolRun,
     ToolRunStatus,
 )
+from handshake.tools.cancellation import tool_cancellation
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
 
 
-def execute_tool_call(
+async def execute_tool_call(
     session: Session,
     run: Run,
     call: ToolCall,
@@ -27,6 +32,50 @@ def execute_tool_call(
     secret_command_runner: SecretCommandRunner | None,
     emit: Callable[[str], None],
     store: RunStore,
+    scheduler: CooperativeScheduler,
+) -> ToolResult:
+    """Commit intent before execution and outcome afterward, replaying only safe tools."""
+    async with scheduler.tool_slot():
+        cancellation = Event()
+
+        async def execute() -> ToolResult | BaseException:
+            try:
+                with tool_cancellation(cancellation):
+                    return await _execute_tool_call(
+                        session, run, call, registry, secret_command_runner, emit, store, scheduler
+                    )
+            except BaseException as exc:
+                return exc
+
+        task = asyncio.create_task(execute(), name=f"tool:{call.id}")
+        try:
+            outcome = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancellation.set()
+            # Preserve the actual result if a running tool finishes during cancellation.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            outcome = task.result()
+            if isinstance(outcome, UserCancelledError):
+                raise outcome from None
+            raise
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+async def _execute_tool_call(
+    session: Session,
+    run: Run,
+    call: ToolCall,
+    registry: ToolRegistry,
+    secret_command_runner: SecretCommandRunner | None,
+    emit: Callable[[str], None],
+    store: RunStore,
+    scheduler: CooperativeScheduler,
 ) -> ToolResult:
     """Commit intent before execution and outcome afterward, replaying only safe tools."""
     tool_run = next(
@@ -74,6 +123,10 @@ def execute_tool_call(
             raise AgentLoopError("Persisted tool has no executable state")
 
     emit(f"Running tool: {call.name}")
+    secret_run = (
+        replace(run, secret_handles=[replace(handle) for handle in run.secret_handles])
+        if call.name == "run_command_with_secret" else None
+    )
     try:
         if call.name == "run_command_with_secret":
             if secret_command_runner is None:
@@ -82,15 +135,28 @@ def execute_tool_call(
                     stderr="Secret command capability is unavailable; no shell fallback was used",
                 )
             else:
-                result = secret_command_runner.execute(
-                    run, session.workspace, call.arguments
+                assert secret_run is not None
+                result = await scheduler.run_tool(
+                    lambda: secret_command_runner.execute(
+                        secret_run, session.workspace, call.arguments
+                    )
                 )
         else:
-            result = registry.execute(call.name, session.workspace, call.arguments)
-    except Exception:
+            result = await scheduler.run_tool(
+                lambda: registry.execute(call.name, session.workspace, call.arguments)
+            )
+    except (Exception, asyncio.CancelledError):
         tool_run.transition(ToolRunStatus.UNKNOWN)
-        store.checkpoint_run(session, run)
         raise
+    finally:
+        if secret_run is not None:
+            for handle in secret_run.secret_handles:
+                current = run.secret_handle_by_id(handle.secret_handle)
+                if current is not None:
+                    current.status = handle.status
+                    current.updated_at = handle.updated_at
+        if tool_run.status is ToolRunStatus.UNKNOWN:
+            store.checkpoint_run(session, run)
     tool_run.result = result
     tool_run.transition(ToolRunStatus.SUCCEEDED if result.ok else ToolRunStatus.FAILED)
     store.checkpoint_run(session, run)

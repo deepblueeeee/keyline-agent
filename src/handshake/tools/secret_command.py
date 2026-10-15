@@ -10,6 +10,7 @@ from typing import Any
 from handshake.inputs import SecretConsumer
 from handshake.models.base import ToolDefinition
 from handshake.runtime.state import Run, SecretHandleStatus, ToolResult
+from handshake.tools.cancellation import check_tool_cancellation
 from handshake.tools.secret_wait import (
     SECRET_COMMAND_CONSUMER,
     SECRET_ENVIRONMENT_VARIABLES,
@@ -92,6 +93,7 @@ class SecretCommandRunner:
         if not self._consumer.contains(handle.secret_handle):
             return ToolResult(ok=False, stderr="Secret value is unavailable; request it again")
 
+        check_tool_cancellation()
         raw_value = self._consumer.consume(handle.secret_handle)
         try:
             environment = safe_process_environment()

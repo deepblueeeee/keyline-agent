@@ -1,6 +1,10 @@
 """Helpers for tests whose context streams are owned by SQLite."""
 
+import asyncio
+from collections.abc import Callable, Coroutine
+from functools import wraps
 from pathlib import Path
+from typing import Any, ParamSpec, TypeVar
 
 from handshake.context import AgentContextManager, SequencedMessage
 from handshake.models.protocol import ModelMessage
@@ -65,3 +69,16 @@ def ingest(
             for index, message in enumerate(messages)
         ),
     )
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def run_async(function: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, _R]:
+    """Run one deterministic async scenario in a fresh event loop."""
+    @wraps(function)
+    def run(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        return asyncio.run(function(*args, **kwargs))
+
+    return run

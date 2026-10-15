@@ -43,7 +43,7 @@ def _isolated_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
 
 class _WaitThenFinishModel:
-    def complete(self, context: ModelContext, tools: tuple[Any, ...]) -> ModelTurn:
+    async def complete(self, context: ModelContext, tools: tuple[Any, ...]) -> ModelTurn:
         assert any(tool.name == "wait_for_text" for tool in tools)
         has_answer = any(
             block.get("type") == "text" and "User response:" in block.get("text", "")
@@ -76,7 +76,7 @@ class _WaitThenFinishModel:
 
 
 class _MultipleWaitThenFinishModel:
-    def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+    async def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
         answers = [
             str(block["text"])
             for message in context.messages
@@ -109,7 +109,7 @@ class _MultipleWaitThenFinishModel:
 
 
 class _DelegateWaitThenFinishModel:
-    def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+    async def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
         child = "Explore the workspace" in context.system_prompt
         if child:
             answered = any(
@@ -158,7 +158,7 @@ class _RecordingFinishModel:
         self.summary = summary
         self.contexts: list[ModelContext] = []
 
-    def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+    async def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
         self.contexts.append(context)
         return ModelTurn(
             content=({"type": "text", "text": self.summary},),
@@ -171,7 +171,7 @@ class _SecretFlagshipModel:
         self.api_url = api_url
         self.contexts: list[ModelContext] = []
 
-    def complete(self, context: ModelContext, tools: tuple[Any, ...]) -> ModelTurn:
+    async def complete(self, context: ModelContext, tools: tuple[Any, ...]) -> ModelTurn:
         self.contexts.append(context)
         assert any(tool.name == "wait_for_secret" for tool in tools)
         assert any(tool.name == "run_command_with_secret" for tool in tools)
@@ -577,7 +577,7 @@ def test_batch_wait_does_not_block_sibling_and_joins_after_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class BatchModel:
-        def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
+        async def complete(self, context: ModelContext, _tools: tuple[Any, ...]) -> ModelTurn:
             if context.goal == "Explore":
                 if any(
                     "User response:" in str(block.get("text", ""))
@@ -815,6 +815,7 @@ with urllib.request.urlopen(request, timeout=3) as response:
         return "/exit"
 
     monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr(cli, "_read_approval_answer", answer)
     try:
         exit_code = cli.main(["run", str(tmp_path), "run the authenticated integration test"])
     finally:
@@ -851,3 +852,85 @@ with urllib.request.urlopen(request, timeout=3) as response:
     assert canary.encode() not in state_store.database_path.read_bytes()
     assert canary not in workspace_text
     assert canary not in git_diff
+
+
+def test_sigint_during_approval_exits_without_starting_command(tmp_path: Path) -> None:
+    import os
+    import select
+    import signal
+    import time
+
+    script = tmp_path / "approval_scenario.py"
+    script.write_text('''
+import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+import handshake.cli as cli
+from handshake.models.protocol import ModelTurn, ToolCall
+from handshake.models.scripted import ScriptedModel
+
+workspace = Path(sys.argv[1])
+os.environ["HANDSHAKE_HOME"] = str(workspace / "state")
+call = ToolCall("shell", "run_shell", {"argv": [
+    sys.executable, "-c",
+    "from pathlib import Path; Path('command-started').write_text('started')",
+]})
+model = ScriptedModel([
+    ModelTurn(content=({"type": "tool_use", "id": call.id, "name": call.name,
+                        "input": call.arguments},), tool_calls=(call,), stop_reason="tool_use"),
+    ModelTurn(content=({"type": "text", "text": "done"},), stop_reason="end_turn"),
+])
+cli._create_real_model = lambda _name: model
+sys.stdin.isatty = lambda: True
+with patch.object(Path, "home", return_value=workspace):
+    raise SystemExit(cli.main(["run", str(workspace), "test approval cancellation"]))
+''', encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, "-u", str(script), str(tmp_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+    transcript = b""
+    try:
+        deadline = time.monotonic() + 5
+        while b"Execute this command once?" not in transcript and time.monotonic() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], 0.1)
+            if ready:
+                chunk = os.read(process.stdout.fileno(), 8192)
+                if not chunk:
+                    break
+                transcript += chunk
+        assert b"Execute this command once?" in transcript, transcript.decode()
+        # A partial line must not make the cancellation-aware reader block on readline().
+        assert process.stdin is not None
+        process.stdin.write(b"y")
+        process.stdin.flush()
+        process.send_signal(signal.SIGINT)
+        assert process.wait(timeout=3) == 130
+        assert not (tmp_path / "command-started").exists()
+        store = _store(tmp_path / "state")
+        run = store.list_runs()[0]
+        assert run.status is RunStatus.CANCELLED
+        assert not run.secret_handles
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.communicate()
+
+
+def test_cli_cleanup_failure_does_not_replace_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ClosingModel(_RecordingFinishModel):
+        async def aclose(self) -> None:
+            raise RuntimeError("cleanup-sensitive-canary")
+
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(sys, "stdin", _TTY(False))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: ClosingModel("done"))
+    assert cli.main(["run", str(tmp_path), "test cleanup"]) == 0
+    assert _store(tmp_path / "state").list_runs()[0].status is RunStatus.COMPLETED
+    assert "cleanup-sensitive-canary" not in caplog.text
+    assert "Model resource cleanup failed (RuntimeError)" in caplog.text

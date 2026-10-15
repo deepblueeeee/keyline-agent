@@ -34,18 +34,23 @@ class DeepSeekAnthropicModel:
             raise ValueError("api_key must not be empty")
         self.model = model
         self.max_tokens = max_tokens
-        self._client: Any = client or anthropic.Anthropic(
+        self._owns_client = client is None
+        self._client: Any = client or anthropic.AsyncAnthropic(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout_seconds,
             max_retries=max_retries,
         )
 
-    def complete(
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.close()
+
+    async def complete(
         self, context: ModelContext, tools: tuple[ToolDefinition, ...]
     ) -> ModelTurn:
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=context.system_prompt,

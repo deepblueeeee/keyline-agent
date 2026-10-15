@@ -17,7 +17,7 @@ from handshake.runtime.state import (
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.secret_command import SecretCommandRunner
-from tests.history_support import TEST_AGENT_SPEC, fresh_store, history
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, run_async
 
 
 def _tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -43,7 +43,8 @@ def _final_turn() -> ModelTurn:
     )
 
 
-def test_secret_dependency_and_command_complete_without_model_leak(
+@run_async
+async def test_secret_dependency_and_command_complete_without_model_leak(
     tmp_path: Path,
 ) -> None:
     canary = "runtime-canary-secret"
@@ -71,7 +72,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
     )
     first_model = ScriptedModel([_tool_turn(wait_call)])
 
-    start_run(
+    await start_run(
         session,
         run,
         first_model,
@@ -122,7 +123,7 @@ def test_secret_dependency_and_command_complete_without_model_leak(
         },
     )
     second_model = ScriptedModel([_tool_turn(secure_call), _final_turn()])
-    continue_run(
+    await continue_run(
         session,
         run,
         second_model,
@@ -145,7 +146,8 @@ def test_secret_dependency_and_command_complete_without_model_leak(
     assert canary not in secure_result["content"]
 
 
-def test_secret_wait_mixed_with_other_tool_has_no_side_effect(tmp_path: Path) -> None:
+@run_async
+async def test_secret_wait_mixed_with_other_tool_has_no_side_effect(tmp_path: Path) -> None:
     state_store = SQLiteStateStore(tmp_path / "state.db")
     session = Session(workspace=tmp_path)
     run = Run(goal="safe request", session_id=session.session_id, agent_spec_id="test")
@@ -172,7 +174,7 @@ def test_secret_wait_mixed_with_other_tool_has_no_side_effect(tmp_path: Path) ->
         ]
     )
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -187,7 +189,8 @@ def test_secret_wait_mixed_with_other_tool_has_no_side_effect(tmp_path: Path) ->
     assert not (tmp_path / "should-not-exist").exists()
 
 
-def test_secret_command_without_capability_fails_without_shell_fallback(
+@run_async
+async def test_secret_command_without_capability_fails_without_shell_fallback(
     tmp_path: Path,
 ) -> None:
     model = ScriptedModel(
@@ -206,7 +209,7 @@ def test_secret_command_without_capability_fails_without_shell_fallback(
     run = Run(goal="no fallback", session_id=session.session_id, agent_spec_id="test")
     state_store = fresh_store(tmp_path, session)
 
-    start_run(
+    await start_run(
         session,
         run,
         model,

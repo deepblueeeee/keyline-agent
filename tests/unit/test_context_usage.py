@@ -24,7 +24,7 @@ from handshake.runtime.dependencies import resolve_text_dependency
 from handshake.runtime.loop import continue_run, start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools.registry import ToolRegistry
-from tests.history_support import TEST_AGENT_SPEC, fresh_store, ingest
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, ingest, run_async
 
 
 def text_message(text: str, role: str = "user") -> ModelMessage:
@@ -111,7 +111,8 @@ def test_missing_usage_uses_local_estimator() -> None:
     )
 
 
-def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> None:
+@run_async
+async def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     run = Run(goal="ask", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
@@ -130,7 +131,7 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
     )
     model = ScriptedModel((wait_turn,))
     manager = AgentContextManager()
-    start_run(
+    await start_run(
         session, run, model, ToolRegistry(), store=store,
         context_manager=manager, agent_spec=TEST_AGENT_SPEC,
     )
@@ -168,7 +169,7 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
         run.open_dependencies()[0].dependency_id,
         "blue",
     )
-    completed = continue_run(
+    completed = await continue_run(
         session,
         run,
         resumed_model,
@@ -184,7 +185,8 @@ def test_usage_survives_wait_checkpoint_and_process_recovery(tmp_path: Path) -> 
     assert saved.token_measurement.tokens == 11005
 
 
-def test_low_actual_usage_avoids_unnecessary_compaction(tmp_path: Path) -> None:
+@run_async
+async def test_low_actual_usage_avoids_unnecessary_compaction(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     run = Run(goal="continue", session_id=session.session_id, agent_spec_id="test")
     policy = ContextBudgetPolicy(context_window_tokens=1000, reserved_output_tokens=0)
@@ -196,18 +198,19 @@ def test_low_actual_usage_avoids_unnecessary_compaction(tmp_path: Path) -> None:
     ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     assert estimate_model_context(manager.build(session, run), (), manager.estimator) > 1000
     assert manager.measure_pressure(session, run, ()) == 110
-    assert manager.prepare(
+    assert (await manager.prepare(
         session, run, (), instructions=""
-    ).messages == manager.build(session, run).messages
+    )).messages == manager.build(session, run).messages
 
 
-def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
+@run_async
+async def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
     tmp_path: Path,
 ) -> None:
     class Condenser:
         calls = 0
 
-        def compact_raw(
+        async def compact_raw(
             self,
             background: tuple[HistoryEpisode, ...],
             target: tuple[SequencedMessage, ...],
@@ -221,7 +224,7 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
                 ),
             )
 
-        def roll_up(self, episodes: tuple[HistoryEpisode, ...]) -> HistoryEpisode | None:
+        async def roll_up(self, episodes: tuple[HistoryEpisode, ...]) -> HistoryEpisode | None:
             return None
 
     session = Session(workspace=tmp_path)
@@ -241,7 +244,7 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
     ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     assert estimate_model_context(manager.build(session, run), (), manager.estimator) < 5000
     assert manager.measure_pressure(session, run, ()) == 9000
-    prepared = manager.prepare(session, run, (), instructions="")
+    prepared = await manager.prepare(session, run, (), instructions="")
     assert condenser.calls == 1
     assert "Compacted history episode" in prepared.messages[0].content[0]["text"]
     assert manager.measure_pressure(session, run, ()) == (
@@ -249,7 +252,8 @@ def test_high_actual_usage_triggers_semantic_compaction_even_with_low_estimate(
     )
 
 
-def test_actual_usage_enforces_hard_limit_for_protected_context(tmp_path: Path) -> None:
+@run_async
+async def test_actual_usage_enforces_hard_limit_for_protected_context(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     run = Run(goal="continue", session_id=session.session_id, agent_spec_id="test")
     manager = AgentContextManager(
@@ -264,10 +268,11 @@ def test_actual_usage_enforces_hard_limit_for_protected_context(tmp_path: Path) 
     manager.record_usage(session.context_scope, context, (), turn)
     ingest(manager, session, (text_message("reply", "assistant"),), start=1)
     with pytest.raises(ContextPressureError):
-        manager.prepare(session, run, (), instructions="")
+        await manager.prepare(session, run, (), instructions="")
 
 
-def test_prepare_measures_the_instructions_passed_for_this_request(tmp_path: Path) -> None:
+@run_async
+async def test_prepare_measures_the_instructions_passed_for_this_request(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     run = Run(goal="review", session_id=session.session_id, agent_spec_id="reviewer")
     manager = AgentContextManager()
@@ -284,8 +289,8 @@ def test_prepare_measures_the_instructions_passed_for_this_request(tmp_path: Pat
     manager.policy = ContextBudgetPolicy(
         context_window_tokens=long_pressure, reserved_output_tokens=0
     )
-    assert short_instructions in manager.prepare(
+    assert short_instructions in (await manager.prepare(
         session, run, (), instructions=short_instructions
-    ).system_prompt
+    )).system_prompt
     with pytest.raises(ContextPressureError):
-        manager.prepare(session, run, (), instructions=long_instructions)
+        await manager.prepare(session, run, (), instructions=long_instructions)

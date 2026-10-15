@@ -19,7 +19,7 @@ from handshake.runtime.state import (
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.secret_command import SecretCommandRunner
-from tests.history_support import TEST_AGENT_SPEC
+from tests.history_support import TEST_AGENT_SPEC, run_async
 
 
 def _secret_wait_turn() -> ModelTurn:
@@ -46,14 +46,15 @@ def _secret_wait_turn() -> ModelTurn:
     )
 
 
-def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> None:
+@run_async
+async def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> None:
     canary = "restart-canary-value"
     state_store = SQLiteStateStore(tmp_path / "state.db")
     first_secret_store = EphemeralSecretStore()
     session = Session(workspace=tmp_path)
     run = Run(goal="integration", session_id=session.session_id, agent_spec_id="test")
     state_store.create_session(session)
-    start_run(
+    await start_run(
         session,
         run,
         ScriptedModel([_secret_wait_turn()]),
@@ -107,7 +108,8 @@ def test_available_secret_is_reissued_after_process_restart(tmp_path: Path) -> N
     assert loaded_again.secret_handles[1].status is SecretHandleStatus.REQUESTED
 
 
-def test_lost_secret_and_existing_text_wait_can_both_be_resolved(
+@run_async
+async def test_lost_secret_and_existing_text_wait_can_both_be_resolved(
     tmp_path: Path,
 ) -> None:
     state_store = SQLiteStateStore(tmp_path / "state.db")
@@ -115,7 +117,7 @@ def test_lost_secret_and_existing_text_wait_can_both_be_resolved(
     session = Session(workspace=tmp_path)
     run = Run(goal="integration", session_id=session.session_id, agent_spec_id="test")
     state_store.create_session(session)
-    start_run(
+    await start_run(
         session,
         run,
         ScriptedModel([_secret_wait_turn()]),

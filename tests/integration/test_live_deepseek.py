@@ -10,7 +10,7 @@ from handshake.runtime.agents import AgentSpec
 from handshake.runtime.loop import start_run
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import create_default_registry, runtime_tool_definitions
-from tests.history_support import fresh_store
+from tests.history_support import fresh_store, run_async
 
 
 @pytest.mark.live
@@ -18,7 +18,8 @@ from tests.history_support import fresh_store
     os.environ.get("HANDSHAKE_LIVE_TEST") != "1" or not os.environ.get("DEEPSEEK_API_KEY"),
     reason="set HANDSHAKE_LIVE_TEST=1 and DEEPSEEK_API_KEY to run",
 )
-def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
+@run_async
+async def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
     fixture = Path(__file__).resolve().parents[2] / "examples" / "minimal_task"
     workspace = tmp_path / "workspace"
     shutil.copytree(fixture, workspace)
@@ -48,7 +49,7 @@ def test_deepseek_completes_isolated_fixture(tmp_path: Path) -> None:
         ),
     )
 
-    start_run(
+    await start_run(
         session,
         run,
         model,

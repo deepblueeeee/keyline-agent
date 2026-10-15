@@ -29,7 +29,7 @@ from handshake.storage.errors import StorageError
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry
 from handshake.tools.secret_command import SecretCommandRunner
-from tests.history_support import TEST_AGENT_SPEC, fresh_store, history
+from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, run_async
 
 
 def tool_turn(*calls: ToolCall) -> ModelTurn:
@@ -144,7 +144,8 @@ def test_checkpoint_clears_committed_pending_before_view_ingress(tmp_path: Path)
     assert store.message_count(run.context_scope_id) == 1
 
 
-def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: Path) -> None:
+@run_async
+async def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("needle", encoding="utf-8")
     model = ScriptedModel(
         [
@@ -157,7 +158,7 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
     )
     session, run, store = _session_run(tmp_path, "copy knowledge")
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -176,13 +177,14 @@ def test_multiple_tools_execute_in_order_and_results_return_to_model(tmp_path: P
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new"
 
 
-def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) -> None:
+@run_async
+async def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) -> None:
     model = ScriptedModel(
         [tool_turn(ToolCall("missing", "not_registered", {})), final_turn()]
     )
     session, run, store = _session_run(tmp_path, "recover")
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -197,7 +199,8 @@ def test_unknown_tool_is_structured_failure_and_loop_can_finish(tmp_path: Path) 
     assert "Unknown tool" in run.tool_runs[0].result.stderr
 
 
-def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
+@run_async
+async def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
     bad_turn = ModelTurn(
         content=({"type": "tool_use", "id": "a", "name": "read_file", "input": {}},),
         tool_calls=(ToolCall("b", "read_file", {}),),
@@ -206,7 +209,7 @@ def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
     session, run, store = _session_run(tmp_path, "bad")
 
     with pytest.raises(ModelProtocolError):
-        start_run(
+        await start_run(
             session,
             run,
             ScriptedModel([bad_turn]),
@@ -218,11 +221,12 @@ def test_mismatched_tool_blocks_fail_run(tmp_path: Path) -> None:
     assert run.status is RunStatus.FAILED
 
 
-def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
+@run_async
+async def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
     session, run, store = _session_run(tmp_path, "bad")
 
     with pytest.raises(ModelProviderError):
-        start_run(
+        await start_run(
             session,
             run,
             ScriptedModel([]),
@@ -234,7 +238,8 @@ def test_script_exhaustion_fails_run(tmp_path: Path) -> None:
     assert run.status is RunStatus.FAILED
 
 
-def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
+@run_async
+async def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
     session, run, store = _session_run(tmp_path, "too long", max_steps=1)
     model = ScriptedModel(
         [
@@ -249,7 +254,7 @@ def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
     )
 
     with pytest.raises(StepLimitExceededError):
-        start_run(
+        await start_run(
             session,
             run,
             model,
@@ -261,7 +266,8 @@ def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
     assert run.status is RunStatus.FAILED
 
 
-def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None:
+@run_async
+async def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None:
     (tmp_path / "value.txt").write_text("old", encoding="utf-8")
     session, run, store = _session_run(tmp_path, "replace one value")
     model = ScriptedModel(
@@ -291,7 +297,7 @@ def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None
         ]
     )
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -307,11 +313,12 @@ def test_simple_run_can_edit_and_validate_without_a_plan(tmp_path: Path) -> None
     assert run.tool_runs[-1].result.ok
 
 
-def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
+@run_async
+async def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
     session, run, store = _session_run(tmp_path, "small request")
     model = ScriptedModel([final_turn()])
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -325,7 +332,8 @@ def test_plan_tool_describes_adaptive_planning(tmp_path: Path) -> None:
     assert "Do not call this tool for simple work" in plan_tool.description
 
 
-def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) -> None:
+@run_async
+async def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) -> None:
     def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
         raise UserCancelledError("cancelled")
 
@@ -335,7 +343,7 @@ def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) ->
     )
 
     with pytest.raises(UserCancelledError):
-        start_run(
+        await start_run(
             session, run, model, create_default_registry(cancel),
             store=store, agent_spec=TEST_AGENT_SPEC,
         )
@@ -347,7 +355,8 @@ def test_cancelled_tool_closes_protocol_before_run_terminates(tmp_path: Path) ->
     assert result["is_error"] is True
 
 
-def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
+@run_async
+async def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
     def cancel(_cwd: Path, _argv: tuple[str, ...]) -> bool:
         raise UserCancelledError("cancelled")
 
@@ -359,7 +368,7 @@ def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
     )
 
     with pytest.raises(UserCancelledError):
-        start_run(
+        await start_run(
             session,
             run,
             ScriptedModel([tool_turn(*calls)]),
@@ -381,7 +390,8 @@ def test_interrupted_multi_tool_turn_closes_every_call(tmp_path: Path) -> None:
     assert not (tmp_path / "b.txt").exists()
 
 
-def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -> None:
+@run_async
+async def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("value", encoding="utf-8")
     session, first, store = _session_run(tmp_path, "inspect")
     first_model = ScriptedModel(
@@ -403,11 +413,15 @@ def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -
         ]
     )
     registry = create_default_registry(lambda _cwd, _argv: True)
-    start_run(session, first, first_model, registry, store=store, agent_spec=TEST_AGENT_SPEC)
+    await start_run(
+        session, first, first_model, registry, store=store, agent_spec=TEST_AGENT_SPEC
+    )
     second = create_followup_run(session, [first], "continue")
     second_model = ScriptedModel([final_turn("second complete")])
 
-    start_run(session, second, second_model, registry, store=store, agent_spec=TEST_AGENT_SPEC)
+    await start_run(
+        session, second, second_model, registry, store=store, agent_spec=TEST_AGENT_SPEC
+    )
 
     messages = second_model.contexts[0].messages
     assert [message.run_id for message in messages] == [
@@ -423,7 +437,8 @@ def test_followup_run_receives_complete_prior_protocol_history(tmp_path: Path) -
     assert messages[3].content[0]["text"] == "first complete"
 
 
-def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) -> None:
+@run_async
+async def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) -> None:
     wait_turn = ModelTurn(
         content=(
             {"type": "thinking", "thinking": "The repository cannot answer this."},
@@ -446,7 +461,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
     session, run, store = _session_run(tmp_path, "style the button")
     first_model = ScriptedModel([wait_turn])
 
-    start_run(
+    await start_run(
         session,
         run,
         first_model,
@@ -475,7 +490,7 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
         "navy",
     )
     second_model = ScriptedModel([final_turn("used navy")])
-    continue_run(
+    await continue_run(
         resumed_session,
         resumed_run,
         second_model,
@@ -503,7 +518,8 @@ def test_text_dependency_closes_tool_call_before_continuation(tmp_path: Path) ->
     assert store.load_run(run.run_id).final_summary == "used navy"
 
 
-def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
+@run_async
+async def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
     tmp_path: Path,
 ) -> None:
     calls = (
@@ -524,7 +540,7 @@ def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
     runner = SecretCommandRunner(
         secret_store.consumer(), lambda _cwd, _argv: True
     )
-    start_run(
+    await start_run(
         session,
         run,
         ScriptedModel([tool_turn(*calls)]),
@@ -550,7 +566,7 @@ def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
         loaded_session, loaded_run, loaded_run.dependencies[0].dependency_id, "navy"
     )
     assert loaded_run.status is RunStatus.WAITING
-    continue_run(
+    await continue_run(
         loaded_session,
         loaded_run,
         ScriptedModel([]),
@@ -572,7 +588,7 @@ def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
         secret_store.writer(),
     )
     assert loaded_run.status is RunStatus.WAITING
-    continue_run(
+    await continue_run(
         loaded_session,
         loaded_run,
         ScriptedModel([]),
@@ -591,7 +607,7 @@ def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
     )
     assert loaded_run.status is RunStatus.RUNNING
     final_model = ScriptedModel([final_turn("configured")])
-    continue_run(
+    await continue_run(
         loaded_session,
         loaded_run,
         final_model,
@@ -614,7 +630,8 @@ def test_multiple_waits_resume_only_after_every_dependency_is_resolved(
     assert key_value not in repr(final_model.contexts[0].messages)
 
 
-def test_invalid_wait_rejects_entire_wait_batch(tmp_path: Path) -> None:
+@run_async
+async def test_invalid_wait_rejects_entire_wait_batch(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             tool_turn(
@@ -626,7 +643,7 @@ def test_invalid_wait_rejects_entire_wait_batch(tmp_path: Path) -> None:
     )
     session, run, store = _session_run(tmp_path, "choose color")
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -642,7 +659,8 @@ def test_invalid_wait_rejects_entire_wait_batch(tmp_path: Path) -> None:
     assert all(block["is_error"] for block in rejected)
 
 
-def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
+@run_async
+async def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
@@ -653,7 +671,7 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
     )
 
-    start_run(
+    await start_run(
         session,
         run,
         wait_model,
@@ -669,7 +687,7 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     continuation = resolve_text_dependency(
         session, run, run.dependencies[0].dependency_id, "navy"
     )
-    continue_run(
+    await continue_run(
         session,
         run,
         ScriptedModel([final_turn("used navy")]),
@@ -691,7 +709,8 @@ def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     assert events.index("checkpoint:completed") < events.index("Run completed")
 
 
-def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -> None:
+@run_async
+async def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -> None:
     events: list[str] = []
     session, run, _unused_store = _session_run(tmp_path, "choose a color")
     store = _RecordingStore(
@@ -703,7 +722,7 @@ def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -
     )
 
     with pytest.raises(StorageError, match="checkpoint unavailable"):
-        start_run(
+        await start_run(
             session,
             run,
             model,
@@ -718,7 +737,8 @@ def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -
     assert "Waiting for text: Which color?" not in events
 
 
-def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) -> None:
+@run_async
+async def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) -> None:
     mixed = tool_turn(
         ToolCall("write", "write_file", {"path": "created.txt", "content": "bad"}),
         ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}),
@@ -726,7 +746,7 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
     model = ScriptedModel([mixed, final_turn("corrected")])
     session, run, store = _session_run(tmp_path, "safe")
 
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -742,12 +762,13 @@ def test_mixed_wait_turn_rejects_every_call_without_side_effect(tmp_path: Path) 
     assert all(block["is_error"] for block in errors)
 
 
-def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
+@run_async
+async def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
     session, run, store = _session_run(tmp_path, "ask once", max_steps=1)
     model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Choose?"}))]
     )
-    start_run(
+    await start_run(
         session,
         run,
         model,
@@ -765,7 +786,7 @@ def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> None:
     )
 
     with pytest.raises(StepLimitExceededError):
-        continue_run(
+        await continue_run(
             resumed_session,
             resumed_run,
             ScriptedModel([final_turn()]),

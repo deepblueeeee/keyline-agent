@@ -24,6 +24,7 @@ from handshake.runtime.errors import (
     UserCancelledError,
 )
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.scheduler import CooperativeScheduler
 from handshake.runtime.secret_dependencies import reissue_lost_secret_dependencies
 from handshake.runtime.state import (
     Dependency,
@@ -36,6 +37,7 @@ from handshake.runtime.state import (
     ToolRunStatus,
 )
 from handshake.runtime.tool_execution import execute_tool_call
+from handshake.storage.errors import StorageError
 from handshake.tools import (
     DELEGATE_TOOL,
     PLAN_TOOL,
@@ -119,7 +121,7 @@ def _append_tool_results(
     )
 
 
-def _execute_tool_calls(
+async def _execute_tool_calls(
     session: Session,
     run: Run,
     calls: tuple[ToolCall, ...],
@@ -128,6 +130,7 @@ def _execute_tool_calls(
     emit: EmitCallback,
     store: RunStore,
     pending_messages: list[ModelMessage],
+    scheduler: CooperativeScheduler,
 ) -> tuple[ToolResult, ...]:
     results: list[ToolResult] = []
     for index, call in enumerate(calls):
@@ -136,8 +139,8 @@ def _execute_tool_calls(
                 result = handle_plan(run, call)
                 store.checkpoint_run(session, run)
             else:
-                result = execute_tool_call(
-                    session, run, call, registry, secret_command_runner, emit, store
+                result = await execute_tool_call(
+                    session, run, call, registry, secret_command_runner, emit, store, scheduler
                 )
             results.append(result)
         except Exception as exc:
@@ -185,7 +188,7 @@ def _sync_context(
     context_manager.ingest_messages(scope, store.read_messages(run.context_scope_id, start, end))
 
 
-def _prepare_model_context(
+async def _prepare_model_context(
     session: Session,
     run: Run,
     tools: tuple[ToolDefinition, ...],
@@ -198,7 +201,7 @@ def _prepare_model_context(
     if not scope.is_tail(run):
         raise AgentLoopError("Only the context scope tail run can make model requests")
     try:
-        return context_manager.prepare(
+        return await context_manager.prepare(
             session,
             run,
             tools,
@@ -309,7 +312,7 @@ def _create_wait_dependencies(
     return tuple(dependencies)
 
 
-def _run_turns(
+async def _run_turns(
     session: Session,
     run: Run,
     model: ModelAdapter,
@@ -320,7 +323,10 @@ def _run_turns(
     context_manager: AgentContextManager,
     agent_spec: AgentSpec,
     delegation: DelegationRuntime | None = None,
+    scheduler: CooperativeScheduler | None = None,
 ) -> Run:
+    scheduler = scheduler or (delegation.scheduler if delegation else CooperativeScheduler())
+    model = scheduler.model(model)
     definitions = tuple(
         definition
         for definition in (*runtime_tool_definitions(), *registry.definitions())
@@ -332,17 +338,16 @@ def _run_turns(
         pending_messages: list[ModelMessage] = []
         messages_after_checkpoint: list[str] = []
         return_after_checkpoint = False
-        joined_parent = False
         try:
             if run.model_turns >= run.max_steps:
                 raise StepLimitExceededError(
                     f"Agent exceeded the maximum of {run.max_steps} model turns"
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
-            context = _prepare_model_context(
+            context = await _prepare_model_context(
                 session, run, definitions, agent_spec.instructions, store, context_manager
             )
-            turn = model.complete(context, definitions)
+            turn = await model.complete(context, definitions)
             run.model_turns += 1
             if not turn.content:
                 raise ModelProtocolError("Model returned an empty turn")
@@ -404,7 +409,7 @@ def _run_turns(
                         assert delegation is not None
                         run.transition(RunStatus.WAITING)
                         _checkpoint(session, run, store, context_manager, pending_messages)
-                        children = delegation.run_batch(
+                        children = await delegation.run_batch(
                             session,
                             run,
                             delegate_calls,
@@ -417,7 +422,6 @@ def _run_turns(
                         if delegation.scheduler.ready_to_join(children):
                             delegation.append_results(pending_messages, run, children)
                             run.transition(RunStatus.RUNNING)
-                            joined_parent = True
                             messages_after_checkpoint.append(
                                 f"Joined {len(children)} child runs"
                             )
@@ -462,7 +466,7 @@ def _run_turns(
                         return_after_checkpoint = True
                 else:
                     _checkpoint(session, run, store, context_manager, pending_messages)
-                    results = _execute_tool_calls(
+                    results = await _execute_tool_calls(
                         session,
                         run,
                         turn.tool_calls,
@@ -471,6 +475,7 @@ def _run_turns(
                         emit,
                         store,
                         pending_messages,
+                        scheduler,
                     )
                     _append_tool_results(pending_messages, run, turn.tool_calls, results)
                     for call, result in zip(turn.tool_calls, results, strict=True):
@@ -495,6 +500,8 @@ def _run_turns(
                 raise ModelProtocolError(
                     "Model stopped without tool calls or a non-empty final end_turn response"
                 )
+        except StorageError:
+            raise
         except UserCancelledError as exc:
             _terminate_run(run, RunStatus.CANCELLED, str(exc))
             _checkpoint(session, run, store, context_manager, pending_messages)
@@ -514,15 +521,6 @@ def _run_turns(
             emit(message)
         if return_after_checkpoint:
             return run
-        if joined_parent:
-            assert delegation is not None
-            return delegation.scheduler.advance_runnable(
-                run,
-                lambda parent: _run_turns(
-                    session, parent, model, registry, secret_command_runner,
-                    emit, store, context_manager, agent_spec, delegation,
-                ),
-            )
 
 
 def _terminate_run(run: Run, status: RunStatus, error: str) -> None:
@@ -531,7 +529,7 @@ def _terminate_run(run: Run, status: RunStatus, error: str) -> None:
         run.transition(status)
 
 
-def start_run(
+async def start_run(
     session: Session,
     run: Run,
     model: ModelAdapter,
@@ -543,55 +541,64 @@ def start_run(
     context_manager: AgentContextManager | None = None,
     agent_spec: AgentSpec,
     delegation: DelegationRuntime | None = None,
+    scheduler: CooperativeScheduler | None = None,
 ) -> Run:
     """Start one user-request run and execute until terminal state or a wait."""
-    if run.max_steps < 1:
-        raise ValueError("max_steps must be >= 1")
-    if run.status is not RunStatus.CREATED:
-        raise AgentLoopError("Only a newly created run can be started")
-    if run.session_id != session.session_id:
-        raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if store.has_run_messages(run.run_id):
-        raise AgentLoopError(f"Run {run.run_id} already has model messages")
-    run.model_name = model_name_for_run(run, agent_spec)
+    scheduler = scheduler or (delegation.scheduler if delegation else CooperativeScheduler())
+    with scheduler.run_scope(run):
+        if run.max_steps < 1:
+            raise ValueError("max_steps must be >= 1")
+        if run.status is not RunStatus.CREATED:
+            raise AgentLoopError("Only a newly created run can be started")
+        if run.session_id != session.session_id:
+            raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
+        if store.has_run_messages(run.run_id):
+            raise AgentLoopError(f"Run {run.run_id} already has model messages")
+        run.model_name = model_name_for_run(run, agent_spec)
 
-    output = emit or (lambda _message: None)
-    current_context_manager = context_manager or AgentContextManager(
-        policy=agent_spec.default_budget,
-        condenser=LLMHistoryCondenser(model),
-        scope_id=run.context_scope_id,
-    )
-    current_context_manager.bind_scope(run.context_scope_id)
-    session.workspace = session.workspace.resolve()
-    run.transition(RunStatus.RUNNING)
-    pending_messages = [
-        ModelMessage(
-            role="user",
-            content=({"type": "text", "text": run.goal},),
-            run_id=run.run_id,
+        output = emit or (lambda _message: None)
+        model = scheduler.model(model)
+        current_context_manager = context_manager or AgentContextManager(
+            policy=agent_spec.default_budget,
+            condenser=LLMHistoryCondenser(model),
+            scope_id=run.context_scope_id,
         )
-    ]
-    _checkpoint(
-        session,
-        run,
-        store,
-        current_context_manager,
-        pending_messages,
-        create=True,
-    )
-    output(f"Run started: {run.run_id}")
-    return _run_turns(
-        session,
-        run,
-        model,
-        registry,
-        secret_command_runner,
-        output,
-        store,
-        current_context_manager,
-        agent_spec,
-        delegation,
-    )
+        if isinstance(current_context_manager.condenser, LLMHistoryCondenser):
+            current_context_manager.condenser.model = scheduler.model(
+                current_context_manager.condenser.model
+            )
+        current_context_manager.bind_scope(run.context_scope_id)
+        session.workspace = session.workspace.resolve()
+        run.transition(RunStatus.RUNNING)
+        pending_messages = [
+            ModelMessage(
+                role="user",
+                content=({"type": "text", "text": run.goal},),
+                run_id=run.run_id,
+            )
+        ]
+        _checkpoint(
+            session,
+            run,
+            store,
+            current_context_manager,
+            pending_messages,
+            create=True,
+        )
+        output(f"Run started: {run.run_id}")
+        return await _run_turns(
+            session,
+            run,
+            model,
+            registry,
+            secret_command_runner,
+            output,
+            store,
+            current_context_manager,
+            agent_spec,
+            delegation,
+            scheduler,
+        )
 
 
 def prepare_run_for_resume(
@@ -614,7 +621,7 @@ def prepare_run_for_resume(
     return changed
 
 
-def continue_run(
+async def continue_run(
     session: Session,
     run: Run,
     model: ModelAdapter,
@@ -627,42 +634,51 @@ def continue_run(
     context_manager: AgentContextManager | None = None,
     agent_spec: AgentSpec,
     delegation: DelegationRuntime | None = None,
+    scheduler: CooperativeScheduler | None = None,
 ) -> Run:
     """Persist a resolved dependency, then continue its durable run."""
-    if run.status not in {RunStatus.RUNNING, RunStatus.WAITING}:
-        raise AgentLoopError("Only a run resolving dependencies can continue")
-    if run.status is RunStatus.RUNNING and run.open_dependencies():
-        raise AgentLoopError("Run cannot resume while dependencies remain open")
-    if run.status is RunStatus.WAITING and not run.open_dependencies():
-        raise AgentLoopError("Waiting run has no open dependencies")
-    if run.session_id != session.session_id:
-        raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if not store.has_run_messages(run.run_id):
-        raise AgentLoopError("A resumed run must have model protocol history")
-    run.model_name = model_name_for_run(run, agent_spec)
-    output = emit or (lambda _message: None)
-    current_context_manager = context_manager or AgentContextManager(
-        policy=agent_spec.default_budget,
-        condenser=LLMHistoryCondenser(model),
-        scope_id=run.context_scope_id,
-    )
-    current_context_manager.bind_scope(run.context_scope_id)
-    _sync_context(run, store, current_context_manager)
-    pending = list(pending_messages)
-    _checkpoint(session, run, store, current_context_manager, pending)
-    if run.status is RunStatus.WAITING:
-        output(f"Input received; {len(run.open_dependencies())} dependencies remain")
-        return run
-    output("Input received; resuming run")
-    return _run_turns(
-        session,
-        run,
-        model,
-        registry,
-        secret_command_runner,
-        output,
-        store,
-        current_context_manager,
-        agent_spec,
-        delegation,
-    )
+    scheduler = scheduler or (delegation.scheduler if delegation else CooperativeScheduler())
+    with scheduler.run_scope(run):
+        if run.status not in {RunStatus.RUNNING, RunStatus.WAITING}:
+            raise AgentLoopError("Only a run resolving dependencies can continue")
+        if run.status is RunStatus.RUNNING and run.open_dependencies():
+            raise AgentLoopError("Run cannot resume while dependencies remain open")
+        if run.status is RunStatus.WAITING and not run.open_dependencies():
+            raise AgentLoopError("Waiting run has no open dependencies")
+        if run.session_id != session.session_id:
+            raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
+        if not store.has_run_messages(run.run_id):
+            raise AgentLoopError("A resumed run must have model protocol history")
+        run.model_name = model_name_for_run(run, agent_spec)
+        output = emit or (lambda _message: None)
+        model = scheduler.model(model)
+        current_context_manager = context_manager or AgentContextManager(
+            policy=agent_spec.default_budget,
+            condenser=LLMHistoryCondenser(model),
+            scope_id=run.context_scope_id,
+        )
+        if isinstance(current_context_manager.condenser, LLMHistoryCondenser):
+            current_context_manager.condenser.model = scheduler.model(
+                current_context_manager.condenser.model
+            )
+        current_context_manager.bind_scope(run.context_scope_id)
+        _sync_context(run, store, current_context_manager)
+        pending = list(pending_messages)
+        _checkpoint(session, run, store, current_context_manager, pending)
+        if run.status is RunStatus.WAITING:
+            output(f"Input received; {len(run.open_dependencies())} dependencies remain")
+            return run
+        output("Input received; resuming run")
+        return await _run_turns(
+            session,
+            run,
+            model,
+            registry,
+            secret_command_runner,
+            output,
+            store,
+            current_context_manager,
+            agent_spec,
+            delegation,
+            scheduler,
+        )
