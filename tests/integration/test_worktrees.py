@@ -1037,3 +1037,46 @@ async def test_abandon_after_interruption_and_main_advance(
     assert git(case.repo, "rev-parse", "HEAD") == user_head
     assert git(case.repo, "status", "--porcelain") == ""
     assert git(case.repo, "for-each-ref", "refs/handshake/integrations/") == ""
+
+
+@pytest.mark.parametrize("abandon", [True, False], ids=["abandon", "integrate"])
+@run_async
+async def test_cleanup_allows_test_artifacts_and_preserves_other_ignored_files(
+    tmp_path: Path, abandon: bool,
+) -> None:
+    case = Scenario(tmp_path)
+    (case.repo / ".git" / "info" / "exclude").write_text(".venv/\n.pytest_cache/\n.env\n")
+    await case.start(
+        ScriptedModel([turn(delegate("impl", "implementer", "create and test code")), done()]),
+        lambda _: ScriptedModel([
+            turn(
+                ToolCall("write", "write_file", {"path": "source.txt", "content": "saved code"}),
+                ToolCall("test", "run_tests", {"argv": [sys.executable, "-c", (
+                    "from pathlib import Path; "
+                    "Path('.venv').mkdir(); Path('.venv/pyvenv.cfg').write_text('environment'); "
+                    "Path('.pytest_cache').mkdir(); Path('.pytest_cache/CACHEDIR.TAG').touch()"
+                )]}),
+            ),
+            done(),
+        ]),
+    )
+    (child,) = case.children()
+    tree = case.store.load_worktree(child.run_id)
+    assert tree is not None and tree.status is WorktreeStatus.SAVED
+    if not abandon:
+        tree = case.manager.integrate(tree, case.store)
+
+    protected = tree.path / ".env"
+    protected.write_text("private local file")
+    with pytest.raises(WorktreeError, match=r"Protected ignored path in Worktree: '\.env'"):
+        case.manager.cleanup(tree, case.store, abandon=abandon)
+    assert protected.read_text() == "private local file"
+    assert case.store.load_worktree(child.run_id) == tree
+    assert (tree.path / ".venv" / "pyvenv.cfg").exists()
+    assert (tree.path / ".pytest_cache" / "CACHEDIR.TAG").exists()
+
+    protected.unlink()
+    cleaned = case.manager.cleanup(tree, case.store, abandon=abandon)
+    assert cleaned.status is (WorktreeStatus.ABANDONED if abandon else WorktreeStatus.INTEGRATED)
+    assert cleaned.cleaned and not cleaned.path.exists()
+    assert git(case.repo, "show", f"{cleaned.branch}:source.txt") == "saved code"

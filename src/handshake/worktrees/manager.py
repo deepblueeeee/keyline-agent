@@ -72,11 +72,16 @@ def _check_idle(path: Path) -> None:
             raise WorktreeError(f"Git operation already in progress in {path} ({name})")
 
 
-def _check_clean(path: Path, *, include_ignored: bool = False) -> None:
-    args = ("--ignored=matching",) if include_ignored else ()
+def _check_clean(path: Path, *, protect_ignored: bool = False) -> None:
+    args = ("--ignored=matching",) if protect_ignored else ()
     status = _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all",
                   "--ignore-submodules=none", *args)
-    if status.stdout:
+    for entry in status.stdout.split(b"\0")[:-1]:
+        if entry.startswith(b"!! "):
+            name = entry[3:]
+            if name.startswith((b".venv/", b".pytest_cache/")):
+                continue
+            raise WorktreeError(f"Protected ignored path in Worktree: {os.fsdecode(name)!r}")
         raise WorktreeError(f"Workspace has uncommitted or untracked changes: {path}")
 
 
@@ -494,7 +499,7 @@ class WorktreeManager:
                     tree = self._snapshot(tree, store)
                 elif tree.status is not WorktreeStatus.ABANDONED:
                     raise WorktreeError("Integrate the worktree or explicitly abandon its changes")
-                _check_clean(tree.path, include_ignored=True)
+                _check_clean(tree.path, protect_ignored=True)
                 tree = self._update(
                     store, tree, cleanup_pending=True,
                     status=(WorktreeStatus.INTEGRATED if tree.status is WorktreeStatus.INTEGRATED
@@ -504,7 +509,7 @@ class WorktreeManager:
             if registered is not None or os.path.lexists(tree.path):
                 active = replace(tree, cleanup_pending=False)
                 self._check_snapshot(active)
-                _check_clean(tree.path, include_ignored=True)
+                _check_clean(tree.path, protect_ignored=True)
                 _git(tree.repository, "worktree", "remove", "--", str(tree.path))
             # Keep the branch as an explicit backup, including for abandoned changes.
             return self._update(store, tree, cleanup_pending=False, cleaned=True)
