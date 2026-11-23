@@ -6,7 +6,14 @@ import sqlite3
 
 from handshake.storage.errors import StorageError
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
+
+_WORKTREES = """
+CREATE TABLE worktrees (
+    owner_run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+    record_json TEXT NOT NULL
+);
+"""
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -32,6 +39,7 @@ CREATE TABLE runs (
     delegation_tool_call_id TEXT,
     agent_spec_id TEXT NOT NULL CHECK (length(trim(agent_spec_id)) > 0),
     context_scope_id TEXT NOT NULL,
+    workspace_owner_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
     goal TEXT NOT NULL,
     status TEXT NOT NULL,
     plan_json TEXT NOT NULL,
@@ -108,7 +116,7 @@ CREATE INDEX runs_session_sequence ON runs(session_id, sequence);
 CREATE INDEX tool_runs_run_position ON tool_runs(run_id, position);
 CREATE INDEX dependencies_run_status ON dependencies(run_id, status);
 CREATE INDEX secret_handles_run_status ON secret_handles(run_id, status);
-"""
+""" + _WORKTREES
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
@@ -117,6 +125,16 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     if version == 0:
         connection.executescript(_SCHEMA)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    if version == 15:
+        connection.executescript(f"""
+            BEGIN IMMEDIATE;
+            ALTER TABLE runs ADD COLUMN workspace_owner_id TEXT
+                REFERENCES runs(run_id) ON DELETE RESTRICT;
+            {_WORKTREES}
+            PRAGMA user_version = {SCHEMA_VERSION};
+            COMMIT;
+        """)
         return
     if version != SCHEMA_VERSION:
         raise StorageError(

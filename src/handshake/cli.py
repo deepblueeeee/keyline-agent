@@ -670,12 +670,25 @@ def _inspect_run(args: argparse.Namespace) -> int:
     run = store.load_run(args.run_id)
     session = store.load_session(run.session_id)
     message_count = store.message_count(run.context_scope_id)
+    owner_id = run.workspace_binding.worktree_owner_id
+    worktree = store.load_worktree(owner_id) if owner_id is not None else None
     print(f"Run:         {run.run_id}")
     print(f"Session:     {run.session_id}")
     print(f"Sequence:    {run.sequence}")
     print(f"Status:      {run.status.value}")
     print(f"Goal:        {run.goal}")
-    print(f"Workspace:   {session.workspace}")
+    workspace = worktree.path if worktree else (session.workspace if owner_id is None else None)
+    print(f"Workspace:   {workspace or '(unavailable)'}")
+    if worktree is not None:
+        status = worktree.status.value
+        if worktree.cleaned:
+            status += ", removed"
+        elif worktree.cleanup_pending:
+            status += ", cleanup pending"
+        print(f"Worktree:    {worktree.branch} [{status}]")
+        print(f"Owner run:   {worktree.owner_run_id}")
+        if worktree.saved_commit is not None:
+            print(f"Snapshot:    {worktree.saved_commit}")
     print(f"Agent:       {run.agent_spec_id}")
     print(f"Parent run:  {run.parent_run_id or '(root)'}")
     print(f"Model:       {run.model_name or '(not recorded)'}")

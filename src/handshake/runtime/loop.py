@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from handshake.context import (
@@ -24,7 +25,7 @@ from handshake.runtime.errors import (
     UserCancelledError,
 )
 from handshake.runtime.persistence import RunStore
-from handshake.runtime.scheduler import CooperativeScheduler
+from handshake.runtime.scheduler import CooperativeScheduler, run_blocking
 from handshake.runtime.secret_dependencies import reissue_lost_secret_dependencies
 from handshake.runtime.state import (
     Dependency,
@@ -36,6 +37,7 @@ from handshake.runtime.state import (
     ToolResult,
 )
 from handshake.runtime.tool_execution import execute_tool_call
+from handshake.runtime.workspaces import bound_worktree
 from handshake.storage.errors import StorageError
 from handshake.tools import (
     DELEGATE_TOOL,
@@ -49,6 +51,8 @@ from handshake.tools import (
 )
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
+from handshake.tools.worktree import WORKTREE_TOOL_NAMES
+from handshake.worktrees.manager import WorktreeManager
 
 if TYPE_CHECKING:
     from handshake.runtime.delegation import DelegationRuntime
@@ -130,16 +134,23 @@ async def _execute_tool_calls(
     store: RunStore,
     pending_messages: list[ModelMessage],
     scheduler: CooperativeScheduler,
+    worktrees: WorktreeManager | None = None,
+    allowed_tools: frozenset[str] | None = None,
 ) -> tuple[ToolResult, ...]:
     results: list[ToolResult] = []
     for index, call in enumerate(calls):
         try:
+            allowed = allowed_tools is None or call.name in allowed_tools
             if call.name == PLAN_TOOL.name:
-                result = handle_plan(run, call)
-                store.checkpoint_run(session, run)
+                if allowed:
+                    result = handle_plan(run, call)
+                    store.checkpoint_run(session, run)
+                else:
+                    result = ToolResult(False, stderr="Tool is no longer allowed for this agent")
             else:
                 result = await execute_tool_call(
-                    session, run, call, registry, secret_command_runner, emit, store, scheduler
+                    session, run, call, registry, secret_command_runner, emit, store, scheduler,
+                    worktrees=worktrees, allowed=allowed,
                 )
             results.append(result)
         except Exception as exc:
@@ -194,6 +205,7 @@ async def _prepare_model_context(
     instructions: str,
     store: RunStore,
     context_manager: AgentContextManager,
+    workspace: Path,
 ) -> ModelContext:
     """Prepare a view and durably save only newly reduced projection state."""
     scope = store.load_context_scope(run.context_scope_id)
@@ -205,6 +217,7 @@ async def _prepare_model_context(
             run,
             tools,
             instructions=instructions,
+            workspace=workspace,
             raw_message_reader=lambda scope_id, sequence: _read_raw_message(
                 store, scope_id, sequence
             ),
@@ -326,12 +339,20 @@ async def _run_turns(
 ) -> Run:
     scheduler = scheduler or (delegation.scheduler if delegation else CooperativeScheduler())
     model = scheduler.model(model)
+    worktrees = delegation.worktrees if delegation is not None else WorktreeManager()
+    tree = bound_worktree(session, run, store)
+    if tree is not None:
+        await run_blocking(lambda: worktrees.validate(tree))
+    workspace = run.workspace(session, tree)
     definitions = tuple(
         definition
         for definition in (*runtime_tool_definitions(), *registry.definitions())
         if definition.name in agent_spec.allowed_tools
         and (delegation is not None or definition.name != DELEGATE_TOOL.name)
-        and (run.parent_run_id is None or definition.name != DELEGATE_TOOL.name)
+        and (run.parent_run_id is None or (
+            definition.name != DELEGATE_TOOL.name and definition.name not in WORKTREE_TOOL_NAMES
+        ))
+        and (delegation is not None or definition.name not in WORKTREE_TOOL_NAMES)
     )
     while True:
         pending_messages: list[ModelMessage] = []
@@ -344,7 +365,8 @@ async def _run_turns(
                 )
             emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
             context = await _prepare_model_context(
-                session, run, definitions, agent_spec.instructions, store, context_manager
+                session, run, definitions, agent_spec.instructions, store, context_manager,
+                workspace,
             )
             turn = await model.complete(context, definitions)
             run.model_turns += 1
@@ -419,7 +441,7 @@ async def _run_turns(
                             store,
                         )
                         if delegation.scheduler.ready_to_join(children):
-                            delegation.append_results(pending_messages, run, children)
+                            await delegation.append_results(pending_messages, run, children, store)
                             run.transition(RunStatus.RUNNING)
                             messages_after_checkpoint.append(
                                 f"Joined {len(children)} child runs"
@@ -475,6 +497,7 @@ async def _run_turns(
                         store,
                         pending_messages,
                         scheduler,
+                        worktrees,
                     )
                     _append_tool_results(pending_messages, run, turn.tool_calls, results)
                     for call, result in zip(turn.tool_calls, results, strict=True):

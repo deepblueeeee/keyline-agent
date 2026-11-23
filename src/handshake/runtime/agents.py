@@ -50,7 +50,9 @@ _CODING_INSTRUCTIONS = """You are Handshake, a local coding agent operating on o
 
 _DELEGATION_INSTRUCTIONS = """
 - You may delegate bounded exploration to explorer or independent review to reviewer.
-  Give the child a self-contained goal, then integrate its result into your own work."""
+  Delegate independent code changes to up to three implementers per batch. Give each a
+  self-contained goal and acceptance criteria. Their changes remain on separate Git branches.
+  Use target_run_id to send an explorer or reviewer to a finished implementer's worktree."""
 
 _DEMO_INSTRUCTIONS = "Complete the isolated coding demo and verify the result."
 _EXPLORER_INSTRUCTIONS = (
@@ -63,6 +65,16 @@ _REVIEWER_INSTRUCTIONS = (
 )
 
 
+_IMPLEMENTER_INSTRUCTIONS = (
+    _CODING_INSTRUCTIONS
+    + "\nYour workspace is your own Git worktree. Keep changes within the delegated scope. "
+    "Use relative paths, keep the assigned branch checked out, and use a worktree-local "
+    "environment when tests need project dependencies. "
+    "Leave your changes for the runtime to save. Report the files changed, checks run, "
+    "and remaining issues."
+)
+
+
 def main_agent_spec(
     model_name: str,
     allowed_tools: Iterable[str],
@@ -70,13 +82,20 @@ def main_agent_spec(
 ) -> AgentSpec:
     """Build the configured main coding agent."""
     tools = frozenset(allowed_tools)
+    instructions = _CODING_INSTRUCTIONS
+    if "delegate" in tools:
+        instructions += _DELEGATION_INSTRUCTIONS
+    if "inspect_changes" in tools:
+        instructions += "\n- Use inspect_changes to inspect an implementer's saved diff and tests."
+    if "integrate_changes" in tools:
+        instructions += (
+            "\n- Use integrate_changes to accept changes in the order you choose. "
+            "Handle any merge conflicts."
+        )
     return AgentSpec(
         spec_id="main",
         model_name=model_name,
-        instructions=(
-            _CODING_INSTRUCTIONS
-            + (_DELEGATION_INSTRUCTIONS if "delegate" in tools else "")
-        ),
+        instructions=instructions,
         allowed_tools=tools,
         default_budget=budget,
     )
@@ -108,6 +127,16 @@ def child_agent_specs(model_name: str, budget: ContextBudgetPolicy) -> tuple[Age
             model_name,
             _REVIEWER_INSTRUCTIONS,
             allowed_tools=read_tools,
+            default_budget=budget,
+        ),
+        AgentSpec(
+            "implementer",
+            model_name,
+            _IMPLEMENTER_INSTRUCTIONS,
+            allowed_tools=read_tools | {
+                "list_files", "edit_file", "write_file", "run_shell", "run_tests",
+                "wait_for_secret", "run_command_with_secret",
+            },
             default_budget=budget,
         ),
     )

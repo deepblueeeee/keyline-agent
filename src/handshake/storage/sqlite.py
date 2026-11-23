@@ -33,6 +33,9 @@ from handshake.runtime.state import (
     ToolResult,
     ToolRun,
     ToolRunStatus,
+    WorkspaceBinding,
+    Worktree,
+    WorktreeStatus,
     utc_now,
 )
 from handshake.storage.errors import RunNotFoundError, SessionNotFoundError, StorageError
@@ -139,6 +142,8 @@ class SQLiteStateStore(RunStore):
         session: Session,
         run: Run,
         messages: tuple[ModelMessage, ...] = (),
+        *,
+        worktree: Worktree | None = None,
     ) -> tuple[SequencedMessage, ...]:
         """Atomically create a run and append its prompt to its context scope."""
         try:
@@ -190,7 +195,29 @@ class SQLiteStateStore(RunStore):
                     raise StorageError(str(exc)) from exc
                 if any(message.run_id != run.run_id for message in messages):
                     raise StorageError("Run messages must originate from the checkpointed run")
+                owner_id = run.workspace_binding.worktree_owner_id
+                if owner_id is not None:
+                    if run.parent_run_id is None:
+                        raise StorageError("Only a child run can bind to a worktree")
+                    if owner_id == run.run_id:
+                        if worktree is None or worktree.owner_run_id != owner_id:
+                            raise StorageError("Owned worktree requires a durable creation record")
+                    elif connection.execute(
+                        """
+                        SELECT 1 FROM worktrees JOIN runs ON owner_run_id = runs.run_id
+                        WHERE owner_run_id = ? AND session_id = ?
+                        """,
+                        (owner_id, session.session_id),
+                    ).fetchone() is None:
+                        raise StorageError("Bound worktree must belong to the same session")
+                if worktree is not None and owner_id != run.run_id:
+                    raise StorageError("Worktree creation must belong to its bound run")
                 self._insert_run(connection, run, updated_at)
+                if worktree is not None:
+                    connection.execute(
+                        "INSERT INTO worktrees VALUES (?, ?)",
+                        (worktree.owner_run_id, _dump_worktree(worktree)),
+                    )
                 connection.execute(
                     "UPDATE context_scopes SET tail_run_id = ? WHERE scope_id = ?",
                     (advanced_scope.tail_run_id, advanced_scope.scope_id),
@@ -238,6 +265,45 @@ class SQLiteStateStore(RunStore):
             with self._connect() as connection:
                 return self._load_run(connection, run_id)
         except (OSError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def load_worktree(self, owner_run_id: str) -> Worktree | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT record_json FROM worktrees WHERE owner_run_id = ?", (owner_run_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            record = _load_json(row["record_json"], "worktree")
+            return Worktree(
+                **{
+                    **record, "owner_run_id": owner_run_id,
+                    "repository": Path(record["repository"]), "path": Path(record["path"]),
+                    "status": WorktreeStatus(record["status"]),
+                }
+            )
+        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def save_worktree(self, expected: Worktree, updated: Worktree) -> None:
+        if replace(
+            updated, status=expected.status, saved_commit=expected.saved_commit,
+            integration_head=expected.integration_head,
+            integration_commit=expected.integration_commit,
+            cleanup_pending=expected.cleanup_pending, cleaned=expected.cleaned,
+        ) != expected:
+            raise StorageError("Worktree binding metadata is immutable")
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "UPDATE worktrees SET record_json = ? "
+                    "WHERE owner_run_id = ? AND record_json = ?",
+                    (_dump_worktree(updated), expected.owner_run_id, _dump_worktree(expected)),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageError("Worktree state changed since it was loaded")
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
     def list_runs(self, session_id: str | None = None) -> tuple[Run, ...]:
@@ -356,6 +422,7 @@ class SQLiteStateStore(RunStore):
                 delegation_tool_call_id=row["delegation_tool_call_id"],
                 agent_spec_id=row["agent_spec_id"],
                 context_scope_id=str(row["context_scope_id"]),
+                workspace_binding=WorkspaceBinding(row["workspace_owner_id"]),
                 goal=str(row["goal"]),
                 status=RunStatus(row["status"]),
                 plan=plan,
@@ -395,7 +462,7 @@ class SQLiteStateStore(RunStore):
             """
             SELECT session_id, sequence, previous_run_id, parent_run_id,
                    delegation_tool_call_id,
-                   agent_spec_id, context_scope_id, goal
+                   agent_spec_id, context_scope_id, goal, workspace_owner_id
             FROM runs WHERE run_id = ?
             """,
             (run.run_id,),
@@ -411,11 +478,13 @@ class SQLiteStateStore(RunStore):
             row["agent_spec_id"],
             str(row["context_scope_id"]),
             str(row["goal"]),
+            row["workspace_owner_id"],
         )
         expected = (
             run.session_id, run.sequence, run.previous_run_id, run.parent_run_id,
             run.delegation_tool_call_id,
             run.agent_spec_id, run.context_scope_id, run.goal,
+            run.workspace_binding.worktree_owner_id,
         )
         if membership != expected or run.session_id != session.session_id:
             raise StorageError(f"Run {run.run_id} has invalid session membership")
@@ -430,8 +499,8 @@ class SQLiteStateStore(RunStore):
                 delegation_tool_call_id,
                 agent_spec_id, context_scope_id, goal, status,
                 plan_json, final_summary, error, model_name, model_turns,
-                max_steps, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_steps, created_at, updated_at, workspace_owner_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
@@ -452,6 +521,7 @@ class SQLiteStateStore(RunStore):
                 run.max_steps,
                 run.created_at,
                 updated_at,
+                run.workspace_binding.worktree_owner_id,
             ),
         )
 
@@ -736,6 +806,12 @@ class SQLiteStateStore(RunStore):
                 for index, handle in enumerate(run.secret_handles)
             ),
         )
+
+
+def _dump_worktree(tree: Worktree) -> str:
+    return _dump_json({
+        **asdict(tree), "repository": str(tree.repository), "path": str(tree.path),
+    })
 
 
 def _dump_json(value: Any) -> str:

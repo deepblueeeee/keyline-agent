@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +36,7 @@ _ALLOWED_ENVIRONMENT_VARIABLES = {
     "TMPDIR",
     "VIRTUAL_ENV",
 }
+_ORIGINAL_WORKSPACE: ContextVar[Path | None] = ContextVar("original_workspace", default=None)
 
 
 def safe_process_environment() -> dict[str, str]:
@@ -42,6 +46,50 @@ def safe_process_environment() -> dict[str, str]:
         for name, value in os.environ.items()
         if name in _ALLOWED_ENVIRONMENT_VARIABLES
     }
+
+
+@contextmanager
+def worktree_process_scope(original_workspace: Path | None) -> Iterator[None]:
+    """Carry the original checkout through a tool's preparation and execution."""
+    token = _ORIGINAL_WORKSPACE.set(original_workspace)
+    try:
+        yield
+    finally:
+        _ORIGINAL_WORKSPACE.reset(token)
+
+
+def _inside_checkout(cwd: Path, path: str, original: Path) -> bool:
+    candidate = Path(os.path.abspath(cwd / path))
+    return candidate.is_relative_to(original) or candidate.resolve().is_relative_to(original)
+
+
+def prepare_process_environment(cwd: Path, argv: tuple[str, ...]) -> dict[str, str]:
+    env = safe_process_environment()
+    original = _ORIGINAL_WORKSPACE.get()
+    if original is None:
+        return env
+    for name in ("PATH", "PYTHONPATH"):
+        if name in env:
+            env[name] = os.pathsep.join(
+                path for path in env[name].split(os.pathsep)
+                if not _inside_checkout(cwd, path, original)
+            )
+    for name in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+        if name in env and _inside_checkout(cwd, env[name], original):
+            del env[name]
+            if name == "CONDA_PREFIX":
+                env.pop("CONDA_DEFAULT_ENV", None)
+    executable = argv[0]
+    if not os.path.dirname(executable):
+        search_path = env.get("PATH", os.defpath).split(os.pathsep)
+        executable = shutil.which(executable, path=os.pathsep.join(
+            str(cwd / entry) for entry in search_path
+        )) or executable
+    if _inside_checkout(cwd, executable, original):
+        raise ToolExecutionError(
+            "Executable belongs to the original workspace. Use an environment in this worktree."
+        )
+    return env
 
 
 def parse_process_arguments(arguments: Mapping[str, Any]) -> tuple[tuple[str, ...], float]:
@@ -75,6 +123,7 @@ def prepare_process_tool(
 ) -> PreparedTool:
     argv, timeout = parse_process_arguments(arguments)
     cwd = workspace.resolve()
+    env = prepare_process_environment(cwd, argv)
     if not approval(cwd, argv):
         return ToolResult(ok=False, stderr="Execution denied by user")
     check_cancelled()
@@ -90,7 +139,7 @@ def prepare_process_tool(
                 timeout=timeout,
                 check=False,
                 shell=False,
-                env=safe_process_environment(),
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             return ToolResult(

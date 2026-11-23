@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,12 +35,14 @@ def _final() -> ModelTurn:
         (ReplayPolicy.MANUAL, RunStatus.FAILED, 1),
     ],
 )
+@pytest.mark.parametrize("revoke_tool", [False, True])
 @run_async
 async def test_recovery_replays_only_safe_unknown_tool(
     tmp_path: Path,
     policy: ReplayPolicy,
     expected_status: RunStatus,
     expected_calls: int,
+    revoke_tool: bool,
 ) -> None:
     session = Session(workspace=tmp_path)
     store = SQLiteStateStore(tmp_path / "state.db")
@@ -74,6 +77,8 @@ async def test_recovery_replays_only_safe_unknown_tool(
     assert len(tuple(store.read_messages(run.context_scope_id))) == 2
 
     restored_session = store.load_session(session.session_id)
+    if revoke_tool:
+        spec = replace(spec, allowed_tools=frozenset())
     if policy is ReplayPolicy.MANUAL:
         with pytest.raises(ToolOutcomeUnknownError):
             await resume_run(
@@ -87,8 +92,13 @@ async def test_recovery_replays_only_safe_unknown_tool(
             restored_session, persisted, ScriptedModel([_final()]), registry,
             store=store, agent_spec=spec,
         )
-        assert persisted.tool_runs[0].status is ToolRunStatus.SUCCEEDED
-    assert count == expected_calls
+        assert persisted.tool_runs[0].status is (
+            ToolRunStatus.UNKNOWN if revoke_tool else ToolRunStatus.SUCCEEDED
+        )
+        if revoke_tool:
+            history = tuple(store.read_messages(persisted.context_scope_id))
+            assert "no longer allowed" in history[-2].message.content[0]["content"]
+    assert count == (1 if revoke_tool else expected_calls)
     assert persisted.status is expected_status
     assert store.load_run(run.run_id).status is expected_status
 

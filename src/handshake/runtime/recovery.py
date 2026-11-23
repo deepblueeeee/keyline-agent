@@ -89,7 +89,7 @@ async def resume_run(
             ):
                 raise AgentLoopError("Running run has no resumable workspace tool turn")
             if secret_command_runner is not None and request_pending_tool_secrets(
-                run, calls, secret_command_runner,
+                run, calls, secret_command_runner, allowed_tools=agent_spec.allowed_tools,
             ):
                 store.checkpoint_run(session, run)
                 output("Secret was lost before tool execution; waiting for re-entry")
@@ -99,6 +99,8 @@ async def resume_run(
                 results = await _execute_tool_calls(
                     session, run, tuple(calls), registry, secret_command_runner,
                     output, store, pending, scheduler,
+                    delegation.worktrees if delegation is not None else None,
+                    agent_spec.allowed_tools,
                 )
                 _append_tool_results(pending, run, tuple(calls), results)
             except UserCancelledError as exc:

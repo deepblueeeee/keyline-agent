@@ -30,6 +30,38 @@ class ToolRunStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class WorktreeStatus(StrEnum):
+    PLANNED = "planned"
+    ACTIVE = "active"
+    SAVED = "saved"
+    INTEGRATING = "integrating"
+    INTEGRATED = "integrated"
+    ABANDONED = "abandoned"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceBinding:
+    """A Run uses the session workspace, or the worktree owned by another Run."""
+
+    worktree_owner_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Worktree:
+    owner_run_id: str
+    repository: Path
+    path: Path
+    base_commit: str
+    branch: str
+    main_ref: str
+    status: WorktreeStatus = WorktreeStatus.PLANNED
+    saved_commit: str | None = None
+    integration_head: str | None = None
+    integration_commit: str | None = None
+    cleanup_pending: bool = False
+    cleaned: bool = False
+
+
 class ReplayPolicy(StrEnum):
     AUTO = "auto"
     MANUAL = "manual"
@@ -259,6 +291,14 @@ class Run:
     max_steps: int = 50
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
+    workspace_binding: WorkspaceBinding = field(default_factory=WorkspaceBinding)
+
+    def workspace(self, session: Session, worktree: Worktree | None = None) -> Path:
+        if not self.workspace_binding.worktree_owner_id:
+            return session.workspace
+        if worktree is None or worktree.owner_run_id != self.workspace_binding.worktree_owner_id:
+            raise InvalidStateTransitionError("Run has no matching worktree")
+        return worktree.path
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_spec_id, str) or not self.agent_spec_id.strip():

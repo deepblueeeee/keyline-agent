@@ -7,7 +7,7 @@ from typing import Protocol
 
 from handshake.context.state import ContextCheckpoint, SequencedMessage
 from handshake.models.protocol import ModelMessage
-from handshake.runtime.state import ContextScope, Run, Session
+from handshake.runtime.state import ContextScope, Run, Session, Worktree
 
 
 class RunStore(Protocol):
@@ -62,8 +62,18 @@ class RunStore(Protocol):
         session: Session,
         run: Run,
         messages: tuple[ModelMessage, ...] = (),
+        *,
+        worktree: Worktree | None = None,
     ) -> tuple[SequencedMessage, ...]:
         """Persist a run and append messages to its context scope."""
+        ...
+
+    def load_worktree(self, owner_run_id: str) -> Worktree | None:
+        """Load a worktree's durable creation and integration state."""
+        ...
+
+    def save_worktree(self, expected: Worktree, updated: Worktree) -> None:
+        """Update lifecycle state only if the recorded state still matches."""
         ...
 
     def checkpoint_run(

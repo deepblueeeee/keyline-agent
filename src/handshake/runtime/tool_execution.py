@@ -15,8 +15,12 @@ from handshake.runtime.persistence import RunStore
 from handshake.runtime.progress import emit_wait
 from handshake.runtime.scheduler import CooperativeScheduler, run_blocking
 from handshake.runtime.state import ReplayPolicy, Run, Session, ToolResult, ToolRun, ToolRunStatus
+from handshake.runtime.workspaces import bound_worktree, execute_worktree_operation
 from handshake.tools.registry import PreparedTool, ToolPreparation, ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
+from handshake.tools.shell import worktree_process_scope
+from handshake.tools.worktree import WORKTREE_TOOL_NAMES
+from handshake.worktrees.manager import WorktreeManager
 
 
 def _pending_tool(
@@ -25,11 +29,16 @@ def _pending_tool(
     tool = next((item for item in run.tool_runs
                  if item.model_turn == run.model_turns and item.tool_call_id == call.id), None)
     if tool is None:
+        policy = registry.replay_policy(call.name)
+        if call.name == "run_command_with_secret":
+            policy = ReplayPolicy.MANUAL
+        elif call.name in WORKTREE_TOOL_NAMES:
+            # These operations reconcile their own Git intents before issuing any mutation.
+            policy = ReplayPolicy.AUTO
         tool = ToolRun(
             tool_call_id=call.id, tool_name=call.name, arguments=dict(call.arguments),
             model_turn=run.model_turns,
-            replay_policy=(ReplayPolicy.MANUAL if call.name == "run_command_with_secret"
-                           else registry.replay_policy(call.name)),
+            replay_policy=policy,
         )
         run.add_tool_run(tool)
         store.checkpoint_run(session, run)
@@ -64,20 +73,40 @@ async def execute_tool_call(
     emit: Callable[[str], None],
     store: RunStore,
     scheduler: CooperativeScheduler,
+    *,
+    worktrees: WorktreeManager | None = None,
+    allowed: bool = True,
 ) -> ToolResult:
     tool = _pending_tool(session, run, call, registry, store)
     if tool.status in {ToolRunStatus.SUCCEEDED, ToolRunStatus.FAILED}:
         if tool.result is None:
             raise AgentLoopError("Completed tool has no durable result")
         return tool.result
+    if not allowed:
+        result = ToolResult(False, stderr="Tool is no longer allowed for this agent")
+        if tool.status is ToolRunStatus.PENDING:
+            tool.transition(ToolRunStatus.RUNNING)
+            return _save_result(session, run, tool, result, store)
+        return result
 
+    worktrees = worktrees or WorktreeManager()
+    tree = bound_worktree(session, run, store)
+    if tree is not None:
+        await run_blocking(lambda: worktrees.validate(tree))
+    workspace = run.workspace(session, tree)
     cancellation = Event()
     secret_run = (replace(run, secret_handles=[replace(h) for h in run.secret_handles])
                   if call.name == "run_command_with_secret" else None)
-    with cancellation_scope(cancellation):
+    original_workspace = session.workspace if tree is not None else None
+    with cancellation_scope(cancellation), worktree_process_scope(original_workspace):
         emit(f"Preparing tool: {call.name}")
         preparation: ToolPreparation
-        if secret_run is not None:
+        if call.name in WORKTREE_TOOL_NAMES:
+            def operation() -> ToolResult:
+                return execute_worktree_operation(session, run, call, store, worktrees)
+
+            preparation = operation
+        elif secret_run is not None:
             if secret_command_runner is None:
                 preparation = ToolResult(ok=False, stderr=(
                     "Secret command capability is unavailable; no shell fallback was used"
@@ -85,13 +114,13 @@ async def execute_tool_call(
             else:
                 preparation = await run_blocking(
                     lambda: secret_command_runner.prepare(
-                        secret_run, session.workspace, call.arguments
+                        secret_run, workspace, call.arguments
                     ),
                     on_cancel=cancellation.set,
                 )
         else:
             preparation = await run_blocking(
-                lambda: registry.prepare(call.name, session.workspace, call.arguments),
+                lambda: registry.prepare(call.name, workspace, call.arguments),
                 on_cancel=cancellation.set,
             )
         prepared: PreparedTool = (
@@ -103,6 +132,8 @@ async def execute_tool_call(
         emit_wait(emit, f"Waiting for tool slot: {call.name}", "tool_slot")
         async with scheduler.tool_slot():
             check_cancelled()
+            if tree is not None:
+                await run_blocking(lambda: worktrees.validate(tree))
             tool.transition(ToolRunStatus.RUNNING)
             store.checkpoint_run(session, run)
             emit(f"Running tool: {call.name}")

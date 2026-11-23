@@ -54,7 +54,9 @@ def _reissue_request(run: Run, handle: SecretHandle, *, keep_handle: bool) -> No
 
 
 def request_pending_tool_secrets(
-    run: Run, calls: Sequence[ToolCall], availability: SecretAvailability
+    run: Run, calls: Sequence[ToolCall], availability: SecretAvailability,
+    *,
+    allowed_tools: frozenset[str] | None = None,
 ) -> bool:
     """Ask again for Secrets used by commands that have never started."""
     changed = False
@@ -71,7 +73,9 @@ def request_pending_tool_secrets(
                 break
             if tool.status is not ToolRunStatus.PENDING:
                 continue
-        if call.name != "run_command_with_secret":
+        if call.name != "run_command_with_secret" or (
+            allowed_tools is not None and call.name not in allowed_tools
+        ):
             continue
         handle_id = call.arguments.get("secret_handle")
         if not isinstance(handle_id, str):

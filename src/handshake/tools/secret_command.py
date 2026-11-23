@@ -20,7 +20,7 @@ from handshake.tools.shell import (
     ApprovalCallback,
     AsyncApprovalCallback,
     parse_process_arguments,
-    safe_process_environment,
+    prepare_process_environment,
     timeout_stream,
 )
 
@@ -101,18 +101,17 @@ class SecretCommandRunner:
             )
         try:
             argv, timeout = parse_process_arguments(arguments)
+            cwd = workspace.resolve()
+            environment = prepare_process_environment(cwd, argv)
         except Exception as exc:
             return ToolResult(ok=False, stderr=str(exc))
         if not self._consumer.contains(handle.secret_handle):
             return ToolResult(ok=False, stderr="Secret value is unavailable; request it again")
-        cwd = workspace.resolve()
-
         def execute() -> ToolResult:
             check_cancelled()
             raw_value = self._consumer.consume(handle.secret_handle)
             try:
-                environment = safe_process_environment()
-                environment[handle.environment_variable] = raw_value
+                env = {**environment, handle.environment_variable: raw_value}
                 try:
                     completed = subprocess.run(
                         argv,
@@ -122,7 +121,7 @@ class SecretCommandRunner:
                         timeout=timeout,
                         check=False,
                         shell=False,
-                        env=environment,
+                        env=env,
                     )
                 except subprocess.TimeoutExpired as exc:
                     result = ToolResult(

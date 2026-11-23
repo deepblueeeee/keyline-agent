@@ -9,6 +9,7 @@ from handshake.tools.secret_command import SECRET_COMMAND_TOOL
 from handshake.tools.secret_wait import SECRET_WAIT_TOOL, prepare_secret_dependency
 from handshake.tools.shell import ApprovalCallback, AsyncApprovalCallback, process_tool_bindings
 from handshake.tools.text_wait import TEXT_WAIT_TOOL, prepare_text_dependency
+from handshake.tools.worktree import WORKTREE_TOOLS
 
 
 def create_default_registry(
@@ -24,7 +25,8 @@ def create_default_registry(
 
 def runtime_tool_definitions() -> tuple[ToolDefinition, ...]:
     """Return tools whose lifecycle is coordinated directly by the runtime."""
-    return (PLAN_TOOL, TEXT_WAIT_TOOL, SECRET_WAIT_TOOL, SECRET_COMMAND_TOOL, DELEGATE_TOOL)
+    return (PLAN_TOOL, TEXT_WAIT_TOOL, SECRET_WAIT_TOOL, SECRET_COMMAND_TOOL, DELEGATE_TOOL,
+            *WORKTREE_TOOLS)
 
 
 __all__ = [

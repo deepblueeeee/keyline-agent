@@ -25,12 +25,28 @@ from handshake.runtime.persistence import RunStore
 from handshake.runtime.progress import bind_reporter
 from handshake.runtime.recovery import resume_run
 from handshake.runtime.runs import TERMINAL_RUN_STATUSES, ChildRunResult, create_child_run
-from handshake.runtime.scheduler import CooperativeScheduler
-from handshake.runtime.state import Run, RunStatus, Session, ToolResult
+from handshake.runtime.scheduler import CooperativeScheduler, run_blocking
+from handshake.runtime.state import (
+    Run,
+    RunStatus,
+    Session,
+    ToolResult,
+    WorkspaceBinding,
+    WorktreeStatus,
+)
+from handshake.runtime.workspaces import bound_worktree, owned_worktree, test_outcomes
 from handshake.storage.errors import StorageError
 from handshake.tools import DELEGATE_TOOL
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
+from handshake.worktrees.manager import WorktreeError, WorktreeManager
+
+
+@dataclass(frozen=True, slots=True)
+class DelegatedTask:
+    spec: AgentSpec
+    goal: str
+    target_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -42,28 +58,37 @@ class DelegationRuntime:
     context_managers: ActiveContextManagers
     scheduler: CooperativeScheduler = field(default_factory=CooperativeScheduler)
     resolve_input: Callable[[Run], Awaitable[ModelMessage | None]] | None = None
+    worktrees: WorktreeManager = field(default_factory=WorktreeManager)
 
     def prepare_batch(
         self, calls: tuple[ToolCall, ...]
-    ) -> tuple[tuple[AgentSpec, str], ...] | ToolResult:
+    ) -> tuple[DelegatedTask, ...] | ToolResult:
         prepared = tuple(_delegation_arguments(call, self) for call in calls)
         error = next((item for item in prepared if isinstance(item, ToolResult)), None)
         if error is not None:
             return error
-        return tuple(item for item in prepared if not isinstance(item, ToolResult))
+        tasks = tuple(item for item in prepared if not isinstance(item, ToolResult))
+        if sum(task.spec.spec_id == "implementer" for task in tasks) > 3:
+            return ToolResult(False, stderr="A delegation batch allows at most 3 implementers")
+        return tasks
 
     async def run_batch(
         self,
         session: Session,
         parent: Run,
         calls: tuple[ToolCall, ...],
-        prepared: tuple[tuple[AgentSpec, str], ...],
+        prepared: tuple[DelegatedTask, ...],
         registry: ToolRegistry,
         secret_command_runner: SecretCommandRunner | None,
         emit: EmitCallback,
         store: RunStore,
     ) -> tuple[Run, ...]:
-        children = _ensure_children(session, parent, calls, prepared, store)
+        children = await run_blocking(
+            lambda: _ensure_children(session, parent, calls, prepared, store, self.worktrees)
+        )
+        for child in children:
+            if child.status is RunStatus.COMPLETED:
+                await _save_child_changes(child, store, self.worktrees, bind_reporter(emit, child))
         return await self.scheduler.advance(
             children,
             lambda child: _run_child(
@@ -72,15 +97,18 @@ class DelegationRuntime:
             include_waiting=self.resolve_input is not None,
         )
 
-    def append_results(
-        self, pending_messages: list[ModelMessage], parent: Run, children: tuple[Run, ...]
+    async def append_results(
+        self, pending_messages: list[ModelMessage], parent: Run, children: tuple[Run, ...],
+        store: RunStore,
     ) -> None:
         if not self.scheduler.ready_to_join(children):
             raise AgentLoopError("Cannot join a delegation batch with active children")
         pending_messages.append(
             ModelMessage(
                 role="user",
-                content=tuple(_child_result_block(child) for child in children),
+                content=await run_blocking(lambda: tuple(
+                    _child_result_block(child, store, self.worktrees) for child in children
+                )),
                 run_id=parent.run_id,
             )
         )
@@ -88,7 +116,7 @@ class DelegationRuntime:
 
 def _delegation_arguments(
     call: ToolCall, delegation: DelegationRuntime
-) -> tuple[AgentSpec, str] | ToolResult:
+) -> DelegatedTask | ToolResult:
     spec_id = call.arguments.get("agent_spec_id")
     goal = call.arguments.get("goal")
     if not isinstance(spec_id, str) or not spec_id.strip():
@@ -100,17 +128,41 @@ def _delegation_arguments(
         return ToolResult(ok=False, stderr=f"Agent spec {spec_id} is unavailable")
     if DELEGATE_TOOL.name in spec.allowed_tools:
         return ToolResult(ok=False, stderr=f"Agent spec {spec_id} cannot be used as a child")
-    return spec, goal.strip()
+    target = call.arguments.get("target_run_id")
+    if "target_run_id" in call.arguments:
+        if spec_id not in {"explorer", "reviewer"}:
+            return ToolResult(False, stderr="Only explorer and reviewer can set target_run_id")
+        if not isinstance(target, str) or not target.strip():
+            return ToolResult(False, stderr="target_run_id must be a non-empty Run ID")
+        return DelegatedTask(spec, goal.strip(), target.strip())
+    return DelegatedTask(spec, goal.strip())
 
 
-def _child_result_block(child: Run) -> dict[str, object]:
-    result = ChildRunResult.from_run(child)
+def _child_result_block(
+    child: Run, store: RunStore, manager: WorktreeManager,
+) -> dict[str, object]:
+    result = asdict(ChildRunResult.from_run(child))
+    if child.workspace_binding.worktree_owner_id == child.run_id:
+        tree = store.load_worktree(child.run_id)
+        if tree is not None:
+            result["worktree"] = {
+                "path": str(tree.path), "branch": tree.branch,
+                "status": tree.status.value, "commit": tree.saved_commit,
+            }
+            result["tests"] = test_outcomes(child)
+            if tree.saved_commit is not None:
+                try:
+                    result["changes"] = manager.changes(tree)
+                except WorktreeError as exc:
+                    result["change_error"] = str(exc)
+            elif child.status is RunStatus.COMPLETED:
+                result["change_error"] = "Changes could not be saved; the Worktree is retained"
     if child.delegation_tool_call_id is None:
         raise AgentLoopError("Child has no delegation tool call")
     return {
         "type": "tool_result",
         "tool_use_id": child.delegation_tool_call_id,
-        "content": json.dumps(asdict(result), ensure_ascii=False),
+        "content": json.dumps(result, ensure_ascii=False),
         "is_error": child.status is not RunStatus.COMPLETED,
     }
 
@@ -119,44 +171,87 @@ def _ensure_children(
     session: Session,
     parent: Run,
     calls: tuple[ToolCall, ...],
-    prepared: tuple[tuple[AgentSpec, str], ...],
+    prepared: tuple[DelegatedTask, ...],
     store: RunStore,
+    manager: WorktreeManager,
 ) -> tuple[Run, ...]:
     if len(calls) != len(prepared) or not calls:
         raise AgentLoopError("Delegation batch must contain prepared tool calls")
+    runs = list(store.list_runs(session.session_id))
+    existing = {
+        run.delegation_tool_call_id: run for run in runs if run.parent_run_id == parent.run_id
+    }
     children: list[Run] = []
-    for call, (spec, goal) in zip(calls, prepared, strict=True):
-        runs = store.list_runs(session.session_id)
-        existing = tuple(
-            run for run in runs
-            if run.parent_run_id == parent.run_id and run.delegation_tool_call_id == call.id
-        )
-        if len(existing) > 1:
-            raise AgentLoopError("Delegation tool call has multiple child runs")
-        if existing:
-            child = existing[0]
-            if child.agent_spec_id != spec.spec_id or child.goal != goal:
+    base = None
+    # Pin remaining children to the original batch base after partial creation.
+    for call in calls:
+        child = existing.get(call.id)
+        if child is not None and child.workspace_binding.worktree_owner_id == child.run_id:
+            record = store.load_worktree(child.run_id)
+            if record is not None:
+                base = (record.repository, record.base_commit, record.main_ref)
+                break
+
+    for call, task in zip(calls, prepared, strict=True):
+        child = existing.get(call.id)
+        if child is not None:
+            expected_owner = (
+                child.run_id if task.spec.spec_id == "implementer" else task.target_run_id
+            )
+            if (
+                child.agent_spec_id != task.spec.spec_id or child.goal != task.goal
+                or (child.status is not RunStatus.FAILED
+                    and child.workspace_binding.worktree_owner_id != expected_owner)
+            ):
                 raise AgentLoopError("Stored child does not match its delegation tool call")
         else:
             child = create_child_run(
-                session, runs, parent, goal,
-                agent_spec_id=spec.spec_id,
-                model_name=spec.model_name,
-                max_steps=spec.default_max_steps,
+                session, runs, parent, task.goal, agent_spec_id=task.spec.spec_id,
+                model_name=task.spec.model_name, max_steps=task.spec.default_max_steps,
                 tool_call_id=call.id,
             )
+            record = None
             child.transition(RunStatus.RUNNING)
-            store.create_run(
-                session,
-                child,
-                (
-                    ModelMessage(
-                        "user", ({"type": "text", "text": child.goal},), run_id=child.run_id
-                    ),
-                ),
+            try:
+                if task.spec.spec_id == "implementer":
+                    base = base or manager.creation_base(session.workspace)
+                    record = manager.plan(child.run_id, base)
+                    child.workspace_binding = WorkspaceBinding(child.run_id)
+                elif task.target_run_id is not None:
+                    owner, target = owned_worktree(session, task.target_run_id, store)
+                    if owner.status not in TERMINAL_RUN_STATUSES:
+                        raise WorktreeError("Target implementer is still active")
+                    manager.validate(target)
+                    child.workspace_binding = WorkspaceBinding(task.target_run_id)
+            except WorktreeError as exc:
+                child.error = str(exc)
+                child.transition(RunStatus.FAILED)
+
+            messages = (
+                ModelMessage("user", ({"type": "text", "text": child.goal},), run_id=child.run_id),
             )
+            if record is None:
+                store.create_run(session, child, messages)
+            else:
+                store.create_run(session, child, messages, worktree=record)
+            runs.append(child)
         children.append(child)
     return tuple(children)
+
+
+async def _save_child_changes(
+    child: Run, store: RunStore, manager: WorktreeManager, emit: EmitCallback,
+) -> None:
+    if child.workspace_binding.worktree_owner_id != child.run_id:
+        return
+    tree = store.load_worktree(child.run_id)
+    if tree is not None and tree.status is WorktreeStatus.ACTIVE:
+        try:
+            await run_blocking(lambda: manager.snapshot(tree, store))
+        except WorktreeError as exc:
+            emit(f"Could not save changes. Worktree retained: {exc}")
+        else:
+            emit("Saved changes in Worktree")
 
 
 async def _run_child(
@@ -178,6 +273,12 @@ async def _run_child(
         return child
     model: ModelAdapter | None = None
     try:
+        tree = bound_worktree(session, child, store)
+        if tree is not None:
+            if tree.owner_run_id == child.run_id:
+                await run_blocking(lambda: delegation.worktrees.provision(tree, store))
+            else:
+                await run_blocking(lambda: delegation.worktrees.validate(tree))
         model = delegation.scheduler.model(delegation.model_for_spec(spec))
         manager = context_manager_for_run(delegation.context_managers, child, spec, model)
         if child.status is RunStatus.RUNNING:
@@ -185,7 +286,7 @@ async def _run_child(
                 session, child, model, registry,
                 store=store, agent_spec=spec, emit=emit,
                 secret_command_runner=secret_command_runner,
-                context_manager=manager, scheduler=delegation.scheduler,
+                context_manager=manager, scheduler=delegation.scheduler, delegation=delegation,
             )
         while (child.status is RunStatus.WAITING and child.open_dependencies()
                and delegation.resolve_input is not None):
@@ -196,7 +297,10 @@ async def _run_child(
                 session, child, model, registry, store=store, agent_spec=spec, emit=emit,
                 secret_command_runner=secret_command_runner, context_manager=manager,
                 scheduler=delegation.scheduler, pending_messages=(continuation,),
+                delegation=delegation,
             )
+        if child.status is RunStatus.COMPLETED:
+            await _save_child_changes(child, store, delegation.worktrees, emit)
         return child
 
     except (UserCancelledError, StorageError):
@@ -312,7 +416,7 @@ async def continue_delegation(
         if not delegation.scheduler.ready_to_join(children):
             return parent
         pending: list[ModelMessage] = []
-        delegation.append_results(pending, parent, children)
+        await delegation.append_results(pending, parent, children, store)
         parent.transition(RunStatus.RUNNING)
         _checkpoint(session, parent, store, manager, pending)
         output(f"Joined {len(children)} child runs; resuming parent")

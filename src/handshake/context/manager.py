@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 
 from handshake.context.budget import (
     ContextBudgetPolicy,
@@ -48,7 +49,7 @@ ContextMessageReader = Callable[[int, int | None], Iterable[SequencedMessage]]
 
 
 class AgentContextManager:
-    """Expose one ContextScope's model-visible view in its Session workspace."""
+    """Expose one ContextScope's model-visible view."""
 
     def __init__(
         self,
@@ -84,9 +85,12 @@ class AgentContextManager:
         tools: tuple[ToolDefinition, ...] = (),
         *,
         instructions: str = "",
+        workspace: Path | None = None,
     ) -> ModelContext:
         """Render the already-maintained state without triggering compaction."""
-        return self.render(self.capture(session, run), tools, instructions=instructions)
+        return self.render(
+            self.capture(session, run, workspace=workspace), tools, instructions=instructions,
+        )
 
     def message_count(self, scope: ContextScope) -> int:
         """Return the durable history prefix already represented by this view."""
@@ -104,10 +108,13 @@ class AgentContextManager:
         tools: tuple[ToolDefinition, ...],
         *,
         instructions: str,
+        workspace: Path | None = None,
         raw_message_reader: RawMessageReader | None = None,
     ) -> ModelContext:
         """Apply context pressure policy and return the next model-visible context."""
-        pressure = self.measure_pressure(session, run, tools, instructions=instructions)
+        pressure = self.measure_pressure(
+            session, run, tools, instructions=instructions, workspace=workspace,
+        )
         state = self._synchronized_state(run.context_scope_id)
         if (
             pressure >= self.policy.pressure_trigger_tokens
@@ -117,7 +124,7 @@ class AgentContextManager:
                 if not mask_oldest_stale_result(state):
                     break
                 pressure = self.measure_pressure(
-                    session, run, tools, instructions=instructions
+                    session, run, tools, instructions=instructions, workspace=workspace,
                 )
             if pressure > self.policy.pressure_target_tokens and self.condenser is not None:
                 await compact_semantic_context(
@@ -129,18 +136,18 @@ class AgentContextManager:
                     tools=tools,
                     instructions=instructions,
                     measure_pressure=lambda: self.measure_pressure(
-                        session, run, tools, instructions=instructions
+                        session, run, tools, instructions=instructions, workspace=workspace,
                     ),
-                    capture_view=lambda: self.capture(session, run),
+                    capture_view=lambda: self.capture(session, run, workspace=workspace),
                     raw_message_reader=raw_message_reader,
                 )
                 pressure = self.measure_pressure(
-                    session, run, tools, instructions=instructions
+                    session, run, tools, instructions=instructions, workspace=workspace,
                 )
             state.reduced_message_count = state.message_count
             state.reduction_dirty = True
         self.ensure_below_hard_limit(pressure)
-        return self.build(session, run, tools, instructions=instructions)
+        return self.build(session, run, tools, instructions=instructions, workspace=workspace)
 
     def restore(
         self,
@@ -293,12 +300,13 @@ class AgentContextManager:
         run: Run,
         *,
         constraints: tuple[str, ...] = (),
+        workspace: Path | None = None,
     ) -> ContextView:
         """Snapshot the incrementally maintained bounded model view."""
         state = self._synchronized_state(run.context_scope_id)
         exact = ExactContext(
             goal=run.goal,
-            workspace=str(session.workspace),
+            workspace=str(workspace if workspace is not None else run.workspace(session)),
             plan=tuple(run.plan),
             constraints=constraints,
             dependencies=tuple(
@@ -341,10 +349,11 @@ class AgentContextManager:
         tools: tuple[ToolDefinition, ...],
         *,
         instructions: str = "",
+        workspace: Path | None = None,
     ) -> int:
         """Measure the current view without changing its compaction state."""
         return measure_model_context(
-            self.build(session, run, tools, instructions=instructions),
+            self.build(session, run, tools, instructions=instructions, workspace=workspace),
             tools,
             self.estimator,
             self._synchronized_state(run.context_scope_id).token_measurement,
