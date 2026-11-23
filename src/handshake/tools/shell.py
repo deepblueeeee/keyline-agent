@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from handshake.inputs.cancellation import check_cancelled
 from handshake.models.base import ToolDefinition
 from handshake.runtime.errors import ToolExecutionError
 from handshake.runtime.state import ToolResult
-from handshake.tools.cancellation import check_tool_cancellation
-from handshake.tools.registry import ToolBinding
+from handshake.tools.registry import PreparedTool, ToolBinding, ToolHandler, ToolPreparation
 
 ApprovalCallback = Callable[[Path, tuple[str, ...]], bool]
+AsyncApprovalCallback = Callable[[Path, tuple[str, ...]], Awaitable[bool]]
 
 _ALLOWED_ENVIRONMENT_VARIABLES = {
     "CONDA_DEFAULT_ENV",
@@ -69,15 +70,17 @@ def timeout_stream(value: str | bytes | None) -> str:
     return value
 
 
-def process_tool_handler(
-    approval: ApprovalCallback,
-) -> Callable[[Path, Mapping[str, Any]], ToolResult]:
-    def execute(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
-        argv, timeout = parse_process_arguments(arguments)
-        cwd = workspace.resolve()
-        if not approval(cwd, argv):
-            return ToolResult(ok=False, stderr="Execution denied by user")
-        check_tool_cancellation()
+def prepare_process_tool(
+    approval: ApprovalCallback, workspace: Path, arguments: Mapping[str, Any]
+) -> PreparedTool:
+    argv, timeout = parse_process_arguments(arguments)
+    cwd = workspace.resolve()
+    if not approval(cwd, argv):
+        return ToolResult(ok=False, stderr="Execution denied by user")
+    check_cancelled()
+
+    def execute() -> ToolResult:
+        check_cancelled()
         try:
             completed = subprocess.run(
                 argv,
@@ -107,7 +110,17 @@ def process_tool_handler(
     return execute
 
 
-def process_tool_bindings(approval: ApprovalCallback) -> tuple[ToolBinding, ...]:
+def process_tool_handler(approval: ApprovalCallback) -> ToolHandler:
+    def execute(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
+        prepared = prepare_process_tool(approval, workspace, arguments)
+        return prepared if isinstance(prepared, ToolResult) else prepared()
+
+    return execute
+
+
+def process_tool_bindings(
+    approval: ApprovalCallback, async_approval: AsyncApprovalCallback | None = None
+) -> tuple[ToolBinding, ...]:
     """Return process tool definitions already paired with an approved handler."""
     schema: dict[str, Any] = {
         "type": "object",
@@ -126,6 +139,19 @@ def process_tool_bindings(approval: ApprovalCallback) -> tuple[ToolBinding, ...]
         "required": ["argv"],
         "additionalProperties": False,
     }
+
+    def prepare(workspace: Path, arguments: Mapping[str, Any]) -> ToolPreparation:
+        if async_approval is None:
+            return prepare_process_tool(approval, workspace, arguments)
+        argv, _timeout = parse_process_arguments(arguments)
+        cwd = workspace.resolve()
+
+        async def request() -> PreparedTool:
+            approved = await async_approval(cwd, argv)
+            return prepare_process_tool(lambda _cwd, _argv: approved, workspace, arguments)
+
+        return request()
+
     handler = process_tool_handler(approval)
     return (
         ToolBinding(
@@ -138,6 +164,7 @@ def process_tool_bindings(approval: ApprovalCallback) -> tuple[ToolBinding, ...]
                 input_schema=schema,
             ),
             handler=handler,
+            prepare=prepare,
         ),
         ToolBinding(
             definition=ToolDefinition(
@@ -146,5 +173,6 @@ def process_tool_bindings(approval: ApprovalCallback) -> tuple[ToolBinding, ...]
                 input_schema=schema,
             ),
             handler=handler,
+            prepare=prepare,
         ),
     )

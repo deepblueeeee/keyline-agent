@@ -121,7 +121,7 @@ def test_cancelled_approval_cannot_start_command(tmp_path: Path) -> None:
 
     import pytest
 
-    from handshake.tools.cancellation import tool_cancellation
+    from handshake.inputs.cancellation import cancellation_scope
 
     cancelled = Event()
 
@@ -130,7 +130,7 @@ def test_cancelled_approval_cannot_start_command(tmp_path: Path) -> None:
         return True
 
     handler = process_tool_handler(late_approval)
-    with tool_cancellation(cancelled), pytest.raises(UserCancelledError):
+    with cancellation_scope(cancelled), pytest.raises(UserCancelledError):
         handler(tmp_path, {
             "argv": [sys.executable, "-c", "open('started', 'w').write('started')"],
         })

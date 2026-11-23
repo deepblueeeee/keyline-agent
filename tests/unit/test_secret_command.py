@@ -180,8 +180,8 @@ def test_cancelled_approval_does_not_consume_secret_or_start_process(tmp_path: P
 
     import pytest
 
+    from handshake.inputs.cancellation import cancellation_scope
     from handshake.runtime.errors import UserCancelledError
-    from handshake.tools.cancellation import tool_cancellation
 
     run, handle, consumer, _runner = _available_secret("secret-cancellation-canary")
     cancelled = Event()
@@ -191,7 +191,7 @@ def test_cancelled_approval_does_not_consume_secret_or_start_process(tmp_path: P
         return True
 
     runner = SecretCommandRunner(consumer, late_approval)
-    with tool_cancellation(cancelled), pytest.raises(UserCancelledError):
+    with cancellation_scope(cancelled), pytest.raises(UserCancelledError):
         runner.execute(run, tmp_path, {
             "secret_handle": handle.secret_handle,
             "argv": [sys.executable, "-c", "open('started', 'w').write('started')"],

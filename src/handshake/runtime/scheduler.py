@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
+from typing import TypeVar
 from weakref import WeakKeyDictionary
 
 from handshake.models.base import ModelAdapter, ToolDefinition, close_model
 from handshake.models.protocol import ModelContext, ModelTurn
-from handshake.runtime.errors import AgentLoopError
+from handshake.runtime.errors import AgentLoopError, UserCancelledError
+from handshake.runtime.progress import run_identity
 from handshake.runtime.runs import TERMINAL_RUN_STATUSES
-from handshake.runtime.state import Run, RunStatus, ToolResult
+from handshake.runtime.state import Run, RunStatus
+
+_T = TypeVar("_T")
 
 _SCOPE_OWNERS: WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Task[object]]
@@ -42,19 +46,26 @@ class CooperativeScheduler:
         self,
         children: Sequence[Run],
         resume: Callable[[Run], Awaitable[Run]],
+        *, include_waiting: bool = False,
     ) -> tuple[Run, ...]:
         outcomes = {child.run_id: child for child in children}
 
         async def advance_child(child: Run) -> Run | BaseException:
             # Return global interruptions to the coordinator so it can stop and drain siblings.
             try:
+                if child.status is RunStatus.WAITING:
+                    with self.run_scope(child):
+                        return await resume(child)
                 return await self.advance_runnable(child, resume)
             except BaseException as exc:
                 return exc
 
         tasks = {
             asyncio.create_task(advance_child(child), name=f"run:{child.run_id}"): child
-            for child in self.runnable(children)
+            for child in children
+            if child.status is RunStatus.RUNNING or (
+                include_waiting and child.status is RunStatus.WAITING and child.open_dependencies()
+            )
         }
         pending = set(tasks)
         try:
@@ -97,11 +108,13 @@ class CooperativeScheduler:
         if owner is not None:
             if owner is not task:
                 raise AgentLoopError("Context scope already has an active run")
-            yield
+            with run_identity(run):
+                yield
             return
         owners[scope_id] = task
         try:
-            yield
+            with run_identity(run):
+                yield
         finally:
             del owners[scope_id]
 
@@ -111,30 +124,6 @@ class CooperativeScheduler:
         async with self._tools:
             yield
 
-    async def run_tool(self, execute: Callable[[], ToolResult]) -> ToolResult:
-        """Keep blocking execution off the loop and drain it before releasing its tool slot."""
-        def invoke() -> ToolResult | BaseException:
-            try:
-                return execute()
-            except BaseException as exc:
-                return exc
-
-        task = asyncio.create_task(asyncio.to_thread(invoke))
-        try:
-            outcome = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # Cancelling an await does not stop its thread or external side effects.
-            # Keep the workspace exclusive until execution has actually stopped.
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-            raise
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
     def waiting_child(self, children: Sequence[Run]) -> Run | None:
         return next(
             (
@@ -143,6 +132,38 @@ class CooperativeScheduler:
             ),
             None,
         )
+
+
+async def run_blocking(
+    execute: Callable[[], _T], *, on_cancel: Callable[[], None] | None = None
+) -> _T:
+    """Run blocking I/O without abandoning a worker when its await is cancelled."""
+    def invoke() -> _T | BaseException:
+        try:
+            return execute()
+        except BaseException as exc:
+            return exc
+
+    task = asyncio.create_task(asyncio.to_thread(invoke))
+    try:
+        outcome = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if on_cancel is not None:
+            on_cancel()
+        # Cancelling an await does not stop its thread or external side effects.
+        # Let the worker finish before its caller releases the resources it owns.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        cancelled_outcome = task.result()
+        if isinstance(cancelled_outcome, UserCancelledError):
+            raise cancelled_outcome from None
+        raise
+    if isinstance(outcome, BaseException):
+        raise outcome
+    return outcome
 
 
 class _ScheduledModel:

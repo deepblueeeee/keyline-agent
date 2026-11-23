@@ -7,7 +7,7 @@ import pytest
 from handshake.context.condenser import LLMHistoryCondenser
 from handshake.models.protocol import ModelContext, ModelTurn
 from handshake.runtime.errors import AgentLoopError
-from handshake.runtime.scheduler import CooperativeScheduler
+from handshake.runtime.scheduler import CooperativeScheduler, run_blocking
 from handshake.runtime.state import Run, RunStatus, Session, ToolResult
 from handshake.tools.registry import ToolRegistry
 from tests.history_support import run_async
@@ -134,7 +134,7 @@ async def test_blocking_tools_are_serial_and_do_not_block_model_requests() -> No
 
     async def execute(tool) -> ToolResult:
         async with scheduler.tool_slot():
-            return await scheduler.run_tool(tool)
+            return await run_blocking(tool)
 
     first = asyncio.create_task(execute(first_tool))
     second = None
@@ -176,7 +176,7 @@ async def test_cancelling_tool_keeps_slot_until_thread_finishes() -> None:
 
     async def execute(handler) -> ToolResult:
         async with scheduler.tool_slot():
-            return await scheduler.run_tool(handler)
+            return await run_blocking(handler)
 
     first = asyncio.create_task(execute(tool))
     second = None

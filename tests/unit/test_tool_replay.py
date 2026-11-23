@@ -230,7 +230,7 @@ async def test_cancelled_tool_saves_its_outcome_before_recovery(
 
 
 @run_async
-async def test_cancelling_queued_tool_does_not_persist_an_execution_intent(tmp_path: Path) -> None:
+async def test_cancelling_queued_tool_keeps_it_pending_without_execution(tmp_path: Path) -> None:
     import asyncio
 
     from handshake.runtime.scheduler import CooperativeScheduler
@@ -262,7 +262,7 @@ async def test_cancelling_queued_tool_does_not_persist_an_execution_intent(tmp_p
         with pytest.raises(asyncio.CancelledError):
             await task
     restored = store.load_run(run.run_id)
-    assert not restored.tool_runs
+    assert [tool.status for tool in restored.tool_runs] == [ToolRunStatus.PENDING]
     assert calls == 0
     await resume_run(
         store.load_session(session.session_id), restored, ScriptedModel([_final()]),
@@ -270,3 +270,61 @@ async def test_cancelling_queued_tool_does_not_persist_an_execution_intent(tmp_p
     )
     assert calls == 1
     assert restored.status is RunStatus.COMPLETED
+
+
+@run_async
+async def test_pending_approval_can_be_requested_again_after_recovery(tmp_path: Path) -> None:
+    import asyncio
+
+    session = Session(workspace=tmp_path)
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.create_session(session)
+    run = Run("pending approval", session.session_id, "test")
+    spec = AgentSpec("test", "scripted", "Test pending approval.", allowed_tools={"custom"})
+    started = asyncio.Event()
+    preparation_cancelled = asyncio.Event()
+    approvals = 0
+    executions = 0
+
+    def execute() -> ToolResult:
+        nonlocal executions
+        executions += 1
+        return ToolResult(ok=True)
+
+    async def prepare(_workspace, _arguments):
+        nonlocal approvals
+        approvals += 1
+        if approvals == 1:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                preparation_cancelled.set()
+        return execute
+
+    registry = ToolRegistry()
+    registry.register(ToolBinding(
+        ToolDefinition("custom", "Test approval", {"type": "object"}),
+        lambda _workspace, _arguments: execute(), prepare=prepare,
+    ))
+    task = asyncio.create_task(start_run(
+        session, run, ScriptedModel([_turn(ToolCall("call", "custom", {}))]), registry,
+        store=store, agent_spec=spec,
+    ))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert preparation_cancelled.is_set()
+    restored = store.load_run(run.run_id)
+    assert restored.tool_runs[0].status is ToolRunStatus.PENDING
+    assert restored.tool_runs[0].replay_policy is ReplayPolicy.MANUAL
+    assert executions == 0
+    await resume_run(
+        store.load_session(session.session_id), restored, ScriptedModel([_final()]), registry,
+        store=store, agent_spec=spec,
+    )
+    assert approvals == 2
+    assert executions == 1
+    assert restored.status is RunStatus.COMPLETED
+    assert restored.tool_runs[0].status is ToolRunStatus.SUCCEEDED

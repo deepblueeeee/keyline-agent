@@ -83,6 +83,7 @@ _SECRET_HANDLE_TRANSITIONS = {
         SecretHandleStatus.LOST,
     },
     SecretHandleStatus.AVAILABLE: {
+        SecretHandleStatus.REQUESTED,
         SecretHandleStatus.CONSUMED,
         SecretHandleStatus.LOST,
     },

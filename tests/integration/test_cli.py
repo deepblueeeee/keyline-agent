@@ -934,3 +934,343 @@ def test_cli_cleanup_failure_does_not_replace_success(
     assert _store(tmp_path / "state").list_runs()[0].status is RunStatus.COMPLETED
     assert "cleanup-sensitive-canary" not in caplog.text
     assert "Model resource cleanup failed (RuntimeError)" in caplog.text
+
+
+def test_child_answer_resumes_while_sibling_keeps_working(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    import asyncio
+
+    prompting = threading.Event()
+    sibling_worked = threading.Event()
+    resumed = threading.Event()
+    (tmp_path / "evidence.txt").write_text("evidence", encoding="utf-8")
+
+    class Model:
+        async def complete(self, context, _tools) -> ModelTurn:
+            if context.goal == "Explore":
+                if any("User response:" in str(b.get("text", ""))
+                       for m in context.messages for b in m.content):
+                    resumed.set()
+                    return _finish("Explorer finished")
+                return cli._tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which file?"}))
+            if context.goal == "Review":
+                if any(b.get("type") == "tool_result"
+                       for m in context.messages for b in m.content):
+                    sibling_worked.set()
+                    assert await asyncio.to_thread(resumed.wait, 2)
+                    return _finish("Reviewer finished")
+                assert await asyncio.to_thread(prompting.wait, 2)
+                return cli._tool_turn(ToolCall("read", "read_file", {"path": "evidence.txt"}))
+            if any(b.get("type") == "tool_result"
+                   for m in context.messages for b in m.content):
+                return _finish("Joined both")
+            return cli._tool_turn(
+                ToolCall("explore", "delegate", {"agent_spec_id": "explorer", "goal": "Explore"}),
+                ToolCall("review", "delegate", {"agent_spec_id": "reviewer", "goal": "Review"}),
+            )
+
+    def answer(prompt: str) -> str:
+        if prompt != "Response: ":
+            return "/exit"
+        prompting.set()
+        assert sibling_worked.wait(2), "Sibling tools must run while input is pending"
+        return "evidence.txt"
+
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: Model())
+    monkeypatch.setattr(sys, "stdin", _TTY(True))
+    monkeypatch.setattr("builtins.input", answer)
+    assert cli.main(["run", str(tmp_path), "Investigate"]) == 0
+    store = _store(tmp_path / "state")
+    parent = next(run for run in store.list_runs() if run.parent_run_id is None)
+    parent, explorer, reviewer = store.list_runs(parent.session_id)
+    assert all(run.status is RunStatus.COMPLETED for run in (parent, explorer, reviewer))
+    assert resumed.is_set()
+    output = capsys.readouterr().out
+    for run in (parent, explorer, reviewer):
+        assert f"agent={run.agent_spec_id} run={run.run_id}" in output
+    assert "status=waiting wait=text" in output
+    assert (
+        f"[agent=reviewer run={reviewer.run_id} status=running] Running tool: read_file"
+    ) in output
+    assert f"[agent=explorer run={explorer.run_id} status=running] Model turn 2" in output
+
+
+def _finish(text: str) -> ModelTurn:
+    return ModelTurn(content=({"type": "text", "text": text},), stop_reason="end_turn")
+
+
+@pytest.mark.parametrize("decision", ("y", "n"))
+def test_child_approval_wait_allows_sibling_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], decision: str,
+) -> None:
+    import asyncio
+    from dataclasses import replace
+
+    approval_pending = threading.Event()
+    sibling_worked = threading.Event()
+    marker = tmp_path / "approved-command"
+    (tmp_path / "evidence.txt").write_text("evidence", encoding="utf-8")
+    original_specs = cli._agent_specs
+
+    def specs(settings, registry):
+        result = original_specs(settings, registry)
+        spec = result["explorer"]
+        result["explorer"] = replace(spec, allowed_tools=spec.allowed_tools | {"run_shell"})
+        return result
+
+    class Model:
+        async def complete(self, context, _tools) -> ModelTurn:
+            tool_results = [b for m in context.messages for b in m.content
+                            if b.get("type") == "tool_result"]
+            if context.goal == "Explore":
+                if tool_results:
+                    assert bool(tool_results[-1].get("is_error")) == (decision == "n")
+                    return _finish("Explorer finished")
+                return cli._tool_turn(ToolCall("shell", "run_shell", {"argv": [
+                    sys.executable, "-c",
+                    "from pathlib import Path; Path('approved-command').write_text('ok')",
+                ]}))
+            if context.goal == "Review":
+                if tool_results:
+                    assert not marker.exists(), "Command must still be waiting for approval"
+                    sibling_worked.set()
+                    return _finish("Reviewer finished")
+                assert await asyncio.to_thread(approval_pending.wait, 2)
+                return cli._tool_turn(ToolCall("read", "read_file", {"path": "evidence.txt"}))
+            if tool_results:
+                return _finish("Joined both")
+            return cli._tool_turn(
+                ToolCall("explore", "delegate", {"agent_spec_id": "explorer", "goal": "Explore"}),
+                ToolCall("review", "delegate", {"agent_spec_id": "reviewer", "goal": "Review"}),
+            )
+
+    def answer(_prompt: str) -> str:
+        approval_pending.set()
+        assert sibling_worked.wait(2), "Approval must not occupy the workspace execution slot"
+        return decision
+
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: Model())
+    monkeypatch.setattr(cli, "_agent_specs", specs)
+    monkeypatch.setattr(cli, "_read_approval_answer", answer)
+    monkeypatch.setattr(sys, "stdin", _TTY(True))
+    monkeypatch.setattr("builtins.input", lambda _prompt: "/exit")
+    assert cli.main(["run", str(tmp_path), "Investigate"]) == 0
+    assert marker.exists() == (decision == "y")
+    store = _store(tmp_path / "state")
+    parent = next(run for run in store.list_runs() if run.parent_run_id is None)
+    parent, explorer, reviewer = store.list_runs(parent.session_id)
+    assert all(run.status is RunStatus.COMPLETED for run in (parent, explorer, reviewer))
+    output = capsys.readouterr().out
+    assert f"[agent=explorer run={explorer.run_id} status=waiting wait=approval]" in output
+    assert (
+        f"[agent=reviewer run={reviewer.run_id} status=running] Running tool: read_file"
+    ) in output
+
+
+def test_text_and_approval_prompts_share_one_input_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from dataclasses import replace
+
+    text_open = threading.Event()
+    approval_queued = threading.Event()
+    text_finished = threading.Event()
+    original_specs = cli._agent_specs
+    requires_approval = cli.requires_approval
+
+    def specs(settings, registry):
+        result = original_specs(settings, registry)
+        spec = result["reviewer"]
+        result["reviewer"] = replace(spec, allowed_tools=spec.allowed_tools | {"run_shell"})
+        return result
+
+    def approval_policy(*args, **kwargs):
+        approval_queued.set()
+        return requires_approval(*args, **kwargs)
+
+    class Model:
+        async def complete(self, context, _tools) -> ModelTurn:
+            if context.goal == "Explore":
+                if any("User response:" in str(b.get("text", ""))
+                       for m in context.messages for b in m.content):
+                    return _finish("Explorer finished")
+                return cli._tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))
+            if context.goal == "Review":
+                if any(b.get("type") == "tool_result"
+                       for m in context.messages for b in m.content):
+                    return _finish("Reviewer finished")
+                assert await asyncio.to_thread(text_open.wait, 2)
+                return cli._tool_turn(ToolCall("shell", "run_shell", {
+                    "argv": [sys.executable, "-c", "print('approved')"],
+                }))
+            if any(b.get("type") == "tool_result"
+                   for m in context.messages for b in m.content):
+                return _finish("Joined both")
+            return cli._tool_turn(
+                ToolCall("explore", "delegate", {"agent_spec_id": "explorer", "goal": "Explore"}),
+                ToolCall("review", "delegate", {"agent_spec_id": "reviewer", "goal": "Review"}),
+            )
+
+    def text_answer(prompt: str) -> str:
+        if prompt != "Response: ":
+            return "/exit"
+        text_open.set()
+        assert approval_queued.wait(2)
+        text_finished.set()
+        return "navy"
+
+    def approval_answer(_prompt: str) -> str:
+        assert text_finished.is_set(), "Approval must not read the text answer"
+        return "y"
+
+    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_agent_specs", specs)
+    monkeypatch.setattr(cli, "requires_approval", approval_policy)
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: Model())
+    monkeypatch.setattr(cli, "_read_approval_answer", approval_answer)
+    monkeypatch.setattr(sys, "stdin", _TTY(True))
+    monkeypatch.setattr("builtins.input", text_answer)
+    assert cli.main(["run", str(tmp_path), "Investigate"]) == 0
+    store = _store(tmp_path / "state")
+    explorer = next(run for run in store.list_runs() if run.agent_spec_id == "explorer")
+    messages = [
+        str(item.message.content) for item in store.read_messages(explorer.context_scope_id)
+    ]
+    assert any("User response: navy" in message for message in messages)
+    assert not any("User response: y" in message for message in messages)
+
+
+@pytest.mark.parametrize("before_tool_record", (False, True))
+def test_resume_secret_command_waiting_for_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    before_tool_record: bool,
+) -> None:
+    import asyncio
+
+    from handshake.inputs import EphemeralSecretStore
+    from handshake.models.scripted import ScriptedModel
+    from handshake.runtime.loop import continue_run, start_run
+    from handshake.runtime.secret_dependencies import resolve_secret_dependency
+    from handshake.runtime.state import Run, Session, ToolRunStatus
+    from handshake.tools.secret_command import SecretCommandRunner
+    from tests.history_support import TEST_AGENT_SPEC
+
+    home = tmp_path / "state"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    store = _store(home)
+    session = Session(workspace=tmp_path)
+    store.create_session(session)
+    run = Run("Verify an authenticated command", session.session_id, "main")
+    spec = cli.main_agent_spec(
+        "scripted", TEST_AGENT_SPEC.allowed_tools, TEST_AGENT_SPEC.default_budget
+    )
+    marker = tmp_path / "executions.txt"
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    secret = "replacement-secret-canary"
+    approval_seen = asyncio.Event()
+
+    async def wait_for_approval(_cwd: Path, _argv: tuple[str, ...]) -> bool:
+        approval_seen.set()
+        await asyncio.Event().wait()
+        return False
+
+    async def interrupt_before_approval() -> None:
+        memory = EphemeralSecretStore()
+        runner = SecretCommandRunner(memory.consumer(), lambda *_: False, wait_for_approval)
+        await start_run(
+            session, run, ScriptedModel([cli._tool_turn(ToolCall("ask", "wait_for_secret", {
+                "prompt": "Enter the test key", "purpose": "authenticate command",
+                "environment_variable": "TEST_API_KEY",
+            }))]), registry, store=store, agent_spec=spec, secret_command_runner=runner,
+        )
+        receipt = resolve_secret_dependency(
+            session, run, run.open_dependencies()[0].dependency_id,
+            "original-secret", memory.writer(),
+        )
+        call = ToolCall("authenticated", "run_command_with_secret", {
+            "secret_handle": run.secret_handles[0].secret_handle,
+            "argv": [sys.executable, "-c", (
+                "import os; from pathlib import Path; "
+                "assert os.environ['TEST_API_KEY']; "
+                "Path('executions.txt').open('a').write('executed\\n'); "
+                "print(os.environ['TEST_API_KEY'])"
+            )],
+        })
+        operation = continue_run(
+            session, run, ScriptedModel([cli._tool_turn(call)]), registry, store=store,
+            agent_spec=spec, pending_messages=(receipt,), secret_command_runner=runner,
+        )
+        if before_tool_record:
+            async def interrupt(*_args: object) -> None:
+                raise asyncio.CancelledError()
+
+            with monkeypatch.context() as patch:
+                patch.setattr(runtime_loop, "_execute_tool_calls", interrupt)
+                with pytest.raises(asyncio.CancelledError):
+                    await operation
+            return
+
+        task = asyncio.create_task(operation)
+        await asyncio.wait_for(approval_seen.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(interrupt_before_approval())
+    before = store.load_run(run.run_id)
+    assert [tool.status for tool in before.tool_runs] == (
+        [] if before_tool_record else [ToolRunStatus.PENDING]
+    )
+    assert not marker.exists()
+    message_count = store.message_count(run.context_scope_id)
+
+    model = ScriptedModel([_finish("Verified original command")])
+    monkeypatch.setattr(cli, "_create_real_model", lambda _name: model)
+    monkeypatch.setattr(sys, "stdin", _TTY(False))
+    assert cli.main(["resume", session.session_id]) == 2
+    waiting = store.load_run(run.run_id)
+    assert waiting.status is RunStatus.WAITING
+    assert waiting.dependencies[0].status is DependencyStatus.LOST
+    assert waiting.open_dependencies()[0].dependency_id != waiting.dependencies[0].dependency_id
+    assert waiting.secret_handles[0].status is SecretHandleStatus.REQUESTED
+    assert waiting.secret_handles[0].secret_handle == before.secret_handles[0].secret_handle
+    assert waiting.tool_runs == before.tool_runs
+    assert store.message_count(run.context_scope_id) == message_count
+    assert not model.contexts
+
+    def approve(_prompt: str) -> str:
+        snapshot = store.load_run(run.run_id)
+        assert not snapshot.open_dependencies()
+        assert snapshot.tool_runs[0].status is ToolRunStatus.PENDING
+        assert not marker.exists()
+        return "y"
+
+    monkeypatch.setattr(sys, "stdin", _TTY(True))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: secret)
+    monkeypatch.setattr(cli, "_read_approval_answer", approve)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "/exit")
+    assert cli.main(["resume", session.session_id]) == 0
+    completed = store.load_run(run.run_id)
+    assert completed.status is RunStatus.COMPLETED
+    assert completed.secret_handles[0].status is SecretHandleStatus.CONSUMED
+    assert len(completed.tool_runs) == 1
+    result = completed.tool_runs[0]
+    assert result.tool_call_id == "authenticated"
+    if before.tool_runs:
+        assert result.tool_run_id == before.tool_runs[0].tool_run_id
+        assert result.arguments == before.tool_runs[0].arguments
+    assert result.status is ToolRunStatus.SUCCEEDED
+    assert marker.read_text() == "executed\n"
+    transcript = history(store, session)
+    assert transcript[-3].role == "assistant"
+    assert transcript[-3].content[0]["id"] == "authenticated"
+    assert transcript[-2].content[0]["tool_use_id"] == "authenticated"
+    assert "[REDACTED]" in transcript[-2].content[0]["content"]
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err + repr(model.contexts)
+    assert secret.encode() not in store.database_path.read_bytes()

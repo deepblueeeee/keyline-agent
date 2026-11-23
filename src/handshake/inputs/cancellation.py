@@ -1,4 +1,4 @@
-"""Cooperative cancellation before a blocking tool starts external work."""
+"""Cooperative cancellation while waiting for local input or preparing an action."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -8,12 +8,12 @@ from threading import Event
 from handshake.runtime.errors import UserCancelledError
 
 _CURRENT_CANCELLATION: ContextVar[Event | None] = ContextVar(
-    "tool_cancellation", default=None
+    "cancellation_scope", default=None
 )
 
 
 @contextmanager
-def tool_cancellation(signal: Event) -> Iterator[None]:
+def cancellation_scope(signal: Event) -> Iterator[None]:
     token = _CURRENT_CANCELLATION.set(signal)
     try:
         yield
@@ -21,11 +21,8 @@ def tool_cancellation(signal: Event) -> Iterator[None]:
         _CURRENT_CANCELLATION.reset(token)
 
 
-def check_tool_cancellation() -> None:
+def check_cancelled() -> None:
     signal = _CURRENT_CANCELLATION.get()
     if signal is not None and signal.is_set():
-        raise UserCancelledError("User cancelled tool before execution")
+        raise UserCancelledError("User cancelled input before execution")
 
-
-def has_tool_cancellation() -> bool:
-    return _CURRENT_CANCELLATION.get() is not None

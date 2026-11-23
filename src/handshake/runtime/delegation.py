@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, field
 
 from handshake.context import ActiveContextManagers
@@ -19,8 +19,10 @@ from handshake.runtime.loop import (
     _run_turns,
     _sync_context,
     context_manager_for_run,
+    continue_run,
 )
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.progress import bind_reporter
 from handshake.runtime.recovery import resume_run
 from handshake.runtime.runs import TERMINAL_RUN_STATUSES, ChildRunResult, create_child_run
 from handshake.runtime.scheduler import CooperativeScheduler
@@ -39,6 +41,7 @@ class DelegationRuntime:
     model_for_spec: Callable[[AgentSpec], ModelAdapter]
     context_managers: ActiveContextManagers
     scheduler: CooperativeScheduler = field(default_factory=CooperativeScheduler)
+    resolve_input: Callable[[Run], Awaitable[ModelMessage | None]] | None = None
 
     def prepare_batch(
         self, calls: tuple[ToolCall, ...]
@@ -66,6 +69,7 @@ class DelegationRuntime:
             lambda child: _run_child(
                 session, child, registry, secret_command_runner, emit, store, self
             ),
+            include_waiting=self.resolve_input is not None,
         )
 
     def append_results(
@@ -164,27 +168,43 @@ async def _run_child(
     store: RunStore,
     delegation: DelegationRuntime,
 ) -> Run:
+    emit = bind_reporter(emit, child)
     spec = delegation.agent_specs.get(child.agent_spec_id)
     if spec is None:
         child.error = f"Agent spec {child.agent_spec_id} is unavailable"
         child.transition(RunStatus.FAILED)
         store.checkpoint_run(session, child)
+        bind_reporter(emit, child)(f"Run failed: {child.error}")
         return child
     model: ModelAdapter | None = None
     try:
         model = delegation.scheduler.model(delegation.model_for_spec(spec))
         manager = context_manager_for_run(delegation.context_managers, child, spec, model)
-        return await resume_run(
-            session, child, model, registry,
-            store=store, agent_spec=spec, emit=emit,
-            secret_command_runner=secret_command_runner,
-            context_manager=manager, scheduler=delegation.scheduler,
-        )
+        if child.status is RunStatus.RUNNING:
+            child = await resume_run(
+                session, child, model, registry,
+                store=store, agent_spec=spec, emit=emit,
+                secret_command_runner=secret_command_runner,
+                context_manager=manager, scheduler=delegation.scheduler,
+            )
+        while (child.status is RunStatus.WAITING and child.open_dependencies()
+               and delegation.resolve_input is not None):
+            continuation = await delegation.resolve_input(child)
+            if continuation is None:
+                break
+            child = await continue_run(
+                session, child, model, registry, store=store, agent_spec=spec, emit=emit,
+                secret_command_runner=secret_command_runner, context_manager=manager,
+                scheduler=delegation.scheduler, pending_messages=(continuation,),
+            )
+        return child
+
     except (UserCancelledError, StorageError):
         raise
     except Exception as exc:
         persisted = store.load_run(child.run_id)
         if persisted.status in TERMINAL_RUN_STATUSES:
+            bind_reporter(emit, persisted)(f"Run {persisted.status.value}: {persisted.error or ''}")
             return persisted
         persisted.error = (
             str(exc)
@@ -193,6 +213,7 @@ async def _run_child(
         )
         persisted.transition(RunStatus.FAILED)
         store.checkpoint_run(session, persisted)
+        bind_reporter(emit, persisted)(f"Run failed: {persisted.error}")
         return persisted
     finally:
         if model is not None:

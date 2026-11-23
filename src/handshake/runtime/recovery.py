@@ -15,13 +15,17 @@ from handshake.runtime.loop import (
     _append_tool_results,
     _checkpoint,
     _execute_tool_calls,
+    _run_tail_message,
     _run_turns,
     _sync_context,
     _terminate_run,
 )
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.scheduler import CooperativeScheduler
-from handshake.runtime.secret_dependencies import reissue_lost_secret_dependencies
+from handshake.runtime.secret_dependencies import (
+    reissue_lost_secret_dependencies,
+    request_pending_tool_secrets,
+)
 from handshake.runtime.state import Run, RunStatus, Session
 from handshake.tools import DELEGATE_TOOL, SECRET_WAIT_TOOL, TEXT_WAIT_TOOL
 from handshake.tools.registry import ToolRegistry
@@ -61,13 +65,9 @@ async def resume_run(
             manager.condenser.model = scheduler.model(manager.condenser.model)
         manager.bind_scope(run.context_scope_id)
         _sync_context(run, store, manager)
-        count = store.message_count(run.context_scope_id)
-        if count == 0:
-            raise AgentLoopError("Running run has no durable model history")
-        latest = tuple(store.read_messages(run.context_scope_id, count - 1, count))
-        if len(latest) != 1 or latest[0].message.run_id != run.run_id:
+        message = _run_tail_message(run, store)
+        if message is None:
             raise AgentLoopError("Running run does not own the context tail")
-        message = latest[0].message
         if message.role == "assistant":
             calls: list[ToolCall] = []
             for block in message.content:
@@ -88,6 +88,12 @@ async def resume_run(
                 for call in calls
             ):
                 raise AgentLoopError("Running run has no resumable workspace tool turn")
+            if secret_command_runner is not None and request_pending_tool_secrets(
+                run, calls, secret_command_runner,
+            ):
+                store.checkpoint_run(session, run)
+                output("Secret was lost before tool execution; waiting for re-entry")
+                return run
             pending: list[ModelMessage] = []
             try:
                 results = await _execute_tool_calls(

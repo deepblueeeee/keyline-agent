@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +12,9 @@ from handshake.runtime.errors import ToolExecutionError, UserCancelledError
 from handshake.runtime.state import ReplayPolicy, ToolResult
 
 ToolHandler = Callable[[Path, Mapping[str, Any]], ToolResult]
+PreparedTool = Callable[[], ToolResult] | ToolResult
+ToolPreparation = PreparedTool | Awaitable[PreparedTool]
+ToolPreparer = Callable[[Path, Mapping[str, Any]], ToolPreparation]
 
 
 @dataclass(slots=True, frozen=True)
@@ -21,6 +24,7 @@ class ToolBinding:
     definition: ToolDefinition
     handler: ToolHandler
     replay_policy: ReplayPolicy = ReplayPolicy.MANUAL
+    prepare: ToolPreparer | None = None
 
 
 class ToolRegistry:
@@ -39,6 +43,20 @@ class ToolRegistry:
     def replay_policy(self, name: str) -> ReplayPolicy:
         binding = self._bindings.get(name)
         return ReplayPolicy.AUTO if binding is None else binding.replay_policy
+
+    def prepare(
+        self, name: str, workspace: Path, arguments: Mapping[str, Any]
+    ) -> ToolPreparation:
+        """Resolve validation and approval before acquiring the workspace execution slot."""
+        binding = self._bindings.get(name)
+        if binding is None or binding.prepare is None:
+            return lambda: self.execute(name, workspace, arguments)
+        try:
+            return binding.prepare(workspace, arguments)
+        except UserCancelledError:
+            raise
+        except (ToolExecutionError, OSError, UnicodeError) as exc:
+            return ToolResult(ok=False, stderr=str(exc))
 
     def execute(
         self, name: str, workspace: Path, arguments: Mapping[str, Any]

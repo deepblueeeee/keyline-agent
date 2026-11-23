@@ -8,15 +8,16 @@ import getpass
 import inspect
 import os
 import readline  # noqa: F401  # Enable line editing for interactive input().
-import select
 import shlex
 import shutil
 import sys
 import tempfile
 import warnings
 from collections.abc import Awaitable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 
+from handshake.cli_input import TerminalInput, read_terminal_line
 from handshake.config import (
     ApprovalMode,
     handshake_home,
@@ -32,7 +33,7 @@ from handshake.errors import HandshakeError
 from handshake.inputs import EphemeralSecretStore, SecretWriter
 from handshake.models.base import ModelAdapter, close_model
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
-from handshake.models.protocol import ModelTurn, ToolCall
+from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.agents import (
     AgentSpec,
@@ -51,6 +52,7 @@ from handshake.runtime.loop import (
     start_run,
 )
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.progress import RunReporter, current_run, format_run_message
 from handshake.runtime.recovery import resume_run
 from handshake.runtime.runs import (
     create_followup_run,
@@ -68,10 +70,9 @@ from handshake.runtime.state import (
 )
 from handshake.storage import SQLiteStateStore, StorageError
 from handshake.tools import create_default_registry, runtime_tool_definitions
-from handshake.tools.cancellation import check_tool_cancellation, has_tool_cancellation
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
-from handshake.tools.shell import ApprovalCallback
+from handshake.tools.shell import ApprovalCallback, AsyncApprovalCallback
 
 _WAITING_EXIT_CODE = 2
 
@@ -96,11 +97,11 @@ def _spec_for_run(run: Run, specs: Mapping[str, AgentSpec]) -> AgentSpec:
 
 
 def _interactive_approval(cwd: Path, argv: tuple[str, ...], *, with_secret: bool = False) -> bool:
-    print("\nApproval required")
-    print(f"  cwd:  {cwd}")
-    print(f"  argv: {shlex.join(argv)}")
+    details = f"Approval required\n  cwd: {cwd}\n  argv: {shlex.join(argv)}"
     if with_secret:
-        print("  A one-time Secret will be supplied to this command.")
+        details += "\n  A one-time Secret will be supplied to this command."
+    run = current_run()
+    print(format_run_message(run, details, waiting="approval") if run else details, flush=True)
     if not sys.stdin.isatty():
         print("Denied: stdin is not interactive")
         return False
@@ -113,35 +114,42 @@ def _interactive_approval(cwd: Path, argv: tuple[str, ...], *, with_secret: bool
 
 
 def _read_approval_answer(prompt: str) -> str:
-    """Wait for a complete stdin line while a worker's approval remains cancellable."""
-    check_tool_cancellation()
-    if not has_tool_cancellation():
-        return input(prompt)
-    try:
-        descriptor = sys.stdin.fileno()
-    except (AttributeError, OSError, ValueError):
-        raise HandshakeError("Approval input does not support cancellable reading") from None
-    print(prompt, end="", flush=True)
-    answer_bytes = bytearray()
-    while True:
-        check_tool_cancellation()
-        readable, _, _ = select.select([descriptor], [], [], 0.05)
-        if readable:
-            check_tool_cancellation()
-            character = os.read(descriptor, 1)
-            if not character:
-                raise EOFError
-            if character == b"\n":
-                check_tool_cancellation()
-                return answer_bytes.decode(sys.stdin.encoding or "utf-8").strip()
-            answer_bytes.extend(character)
+    return read_terminal_line(prompt)
 
 
-def _approval_callback(mode: ApprovalMode, *, with_secret: bool = False) -> ApprovalCallback:
+def _approval_callback(
+    mode: ApprovalMode, *, with_secret: bool = False, terminal: TerminalInput | None = None
+) -> ApprovalCallback:
     def approve(cwd: Path, argv: tuple[str, ...]) -> bool:
         if requires_approval(mode, cwd, argv, with_secret=with_secret):
+            run = current_run()
+            if run is not None:
+                print(format_run_message(
+                    run, "Waiting for command approval", waiting="approval"
+                ), flush=True)
+            if terminal is not None:
+                with terminal.slot():
+                    return _interactive_approval(cwd, argv, with_secret=with_secret)
             return _interactive_approval(cwd, argv, with_secret=with_secret)
         return True
+
+    return approve
+
+
+def _async_approval_callback(
+    mode: ApprovalMode, terminal: TerminalInput, *, with_secret: bool = False
+) -> AsyncApprovalCallback:
+    async def approve(cwd: Path, argv: tuple[str, ...]) -> bool:
+        if not requires_approval(mode, cwd, argv, with_secret=with_secret):
+            return True
+        run = current_run()
+        if run is not None:
+            print(format_run_message(
+                run, "Waiting for command approval", waiting="approval"
+            ), flush=True)
+        return await terminal.read(
+            lambda: _interactive_approval(cwd, argv, with_secret=with_secret)
+        )
 
     return approve
 
@@ -179,10 +187,10 @@ def _create_real_model(model_name: str) -> ModelAdapter:
 
 
 def _create_secret_capabilities(
-    approval: ApprovalCallback,
+    approval: ApprovalCallback, async_approval: AsyncApprovalCallback | None = None,
 ) -> tuple[SecretWriter, SecretCommandRunner]:
     store = EphemeralSecretStore()
-    return store.writer(), SecretCommandRunner(store.consumer(), approval)
+    return store.writer(), SecretCommandRunner(store.consumer(), approval, async_approval)
 
 
 def _next_open_dependency(run: Run) -> Dependency:
@@ -197,17 +205,17 @@ def _resume_command(session: Session) -> str:
 
 
 def _read_dependency_response(session: Session, run: Run, dependency: Dependency) -> str | None:
-    print("\nInput required")
-    print(f"  session:  {session.session_id}")
-    print(f"  run:      {run.run_id}")
-    print(f"  dependency: {dependency.dependency_id}")
-    print(f"  question:   {dependency.prompt}")
+    details = (
+        f"Input required\n  session: {session.session_id}\n"
+        f"  dependency: {dependency.dependency_id}\n  question: {dependency.prompt}"
+    )
+    print(format_run_message(run, details, waiting="text"), flush=True)
     if not sys.stdin.isatty():
         print("Run remains waiting because stdin is not interactive.")
         print(f"Resume with: {_resume_command(session)}")
         return None
     try:
-        return input("Response: ")
+        return read_terminal_line("Response: ")
     except EOFError:
         print("\nRun remains waiting; no response was recorded.")
         print(f"Resume with: {_resume_command(session)}")
@@ -222,19 +230,18 @@ def _read_secret_value(session: Session, run: Run, dependency: Dependency) -> st
     handle = run.secret_handle_for(dependency)
     if handle is None:
         raise HandshakeError(f"Secret dependency {dependency.dependency_id} has no handle metadata")
-    print("\nSecret input required")
-    print(f"  session:    {session.session_id}")
-    print(f"  run:        {run.run_id}")
-    print(f"  dependency: {dependency.dependency_id}")
-    print(f"  request:    {dependency.prompt}")
-    print(f"  purpose:    {handle.purpose}")
-    print(f"  target:     {handle.environment_variable}")
+    details = (
+        f"Secret input required\n  session: {session.session_id}\n"
+        f"  dependency: {dependency.dependency_id}\n  request: {dependency.prompt}\n"
+        f"  purpose: {handle.purpose}\n  target: {handle.environment_variable}"
+    )
+    print(format_run_message(run, details, waiting="secret"), flush=True)
     if not sys.stdin.isatty():
         print("Run remains waiting because stdin is not interactive.")
         print(f"Resume with: {_resume_command(session)}")
         return None
     try:
-        return getpass.getpass("Secret (input hidden): ")
+        return read_terminal_line("Secret (input hidden): ", hidden=True)
     except EOFError:
         print("\nRun remains waiting; no Secret was recorded.")
         print(f"Resume with: {_resume_command(session)}")
@@ -246,38 +253,30 @@ def _read_secret_value(session: Session, run: Run, dependency: Dependency) -> st
 
 
 def _print_final_summary(run: Run) -> None:
-    print("\nFinal summary")
-    print(run.final_summary or "(none)")
+    print(format_run_message(run, "Final summary\n" + (run.final_summary or "(none)")), flush=True)
 
 
-async def _drive_run(
-    session: Session,
-    run: Run,
-    model: ModelAdapter,
-    registry: ToolRegistry,
-    store: RunStore,
-    secret_writer: SecretWriter,
-    secret_command_runner: SecretCommandRunner,
-    agent_spec: AgentSpec,
-    context_manager: AgentContextManager | None = None,
-    delegation: DelegationRuntime | None = None,
-) -> tuple[int, Run]:
-    while run.status is RunStatus.WAITING:
-        if not run.open_dependencies():
-            return _WAITING_EXIT_CODE, run
+async def _resolve_run_input(
+    session: Session, run: Run, secret_writer: SecretWriter, terminal: TerminalInput
+) -> ModelMessage | None:
+    while True:
         dependency = _next_open_dependency(run)
         if dependency.kind is DependencyKind.TEXT:
-            response = _read_dependency_response(session, run, dependency)
+            response = await terminal.read(
+                partial(_read_dependency_response, session, run, dependency)
+            )
             if response is None:
-                return _WAITING_EXIT_CODE, run
+                return None
             if not response.strip():
                 print("Response must not be empty; the run is still waiting.")
                 continue
             continuation = resolve_text_dependency(session, run, dependency.dependency_id, response)
         elif dependency.kind is DependencyKind.SECRET:
-            secret_value = _read_secret_value(session, run, dependency)
+            secret_value = await terminal.read(
+                partial(_read_secret_value, session, run, dependency)
+            )
             if secret_value is None:
-                return _WAITING_EXIT_CODE, run
+                return None
             if secret_value == "":
                 print("Secret must not be empty; the run is still waiting.")
                 continue
@@ -291,12 +290,35 @@ async def _drive_run(
             del secret_value
         else:
             raise HandshakeError(f"Unsupported dependency kind: {dependency.kind.value}")
+        return continuation
+
+
+async def _drive_run(
+    session: Session,
+    run: Run,
+    model: ModelAdapter,
+    registry: ToolRegistry,
+    store: RunStore,
+    secret_writer: SecretWriter,
+    secret_command_runner: SecretCommandRunner,
+    agent_spec: AgentSpec,
+    context_manager: AgentContextManager | None = None,
+    delegation: DelegationRuntime | None = None,
+    terminal: TerminalInput | None = None,
+) -> tuple[int, Run]:
+    terminal = terminal or TerminalInput()
+    while run.status is RunStatus.WAITING:
+        if not run.open_dependencies():
+            return _WAITING_EXIT_CODE, run
+        continuation = await _resolve_run_input(session, run, secret_writer, terminal)
+        if continuation is None:
+            return _WAITING_EXIT_CODE, run
         run = await continue_run(
             session,
             run,
             model,
             registry,
-            emit=print,
+            emit=RunReporter(run, print),
             store=store,
             secret_command_runner=secret_command_runner,
             context_manager=context_manager,
@@ -315,8 +337,9 @@ def _print_terminal_run(run: Run) -> int:
         _print_final_summary(run)
         return 0
     if run.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
-        print(f"\nRun {run.status.value}")
-        print(run.error or "(no error recorded)")
+        print(format_run_message(
+            run, f"Run {run.status.value}\n" + (run.error or "(no error recorded)")
+        ), flush=True)
         return 1
     raise HandshakeError(
         f"Run {run.run_id} cannot be restored from {run.status.value}; "
@@ -355,17 +378,21 @@ async def _process_current_run(
     context_managers: ActiveContextManagers,
     model: ModelAdapter | None = None,
     scheduler: CooperativeScheduler | None = None,
+    terminal: TerminalInput | None = None,
 ) -> tuple[int, Run]:
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         return _print_terminal_run(run), run
     if run.status not in {RunStatus.CREATED, RunStatus.WAITING, RunStatus.RUNNING}:
         return _print_terminal_run(run), run
 
+    terminal = terminal or TerminalInput()
+    reporter = RunReporter(run, print)
     agent_spec = _spec_for_run(run, agent_specs)
     current_model = model or _create_real_model(model_name_for_run(run, agent_spec))
     delegation = DelegationRuntime(
         agent_specs, lambda spec: _create_real_model(spec.model_name), context_managers,
         scheduler=scheduler or CooperativeScheduler(),
+        resolve_input=lambda child: _resolve_run_input(session, child, secret_writer, terminal),
     )
     current_model = delegation.scheduler.model(current_model)
     current_context = context_manager_for_run(context_managers, run, agent_spec, current_model)
@@ -376,7 +403,7 @@ async def _process_current_run(
                 run,
                 current_model,
                 registry,
-                emit=print,
+                emit=reporter,
                 store=store,
                 secret_command_runner=secret_command_runner,
                 context_manager=current_context,
@@ -390,7 +417,7 @@ async def _process_current_run(
                 run,
                 lambda runnable: resume_run(
                     session, runnable, current_model, registry, store=store,
-                    agent_spec=agent_spec, delegation=delegation, emit=print,
+                    agent_spec=agent_spec, delegation=delegation, emit=reporter,
                     secret_command_runner=secret_command_runner,
                     context_manager=current_context,
                 ),
@@ -404,7 +431,7 @@ async def _process_current_run(
                 store=store,
                 agent_spec=agent_spec,
                 delegation=delegation,
-                emit=print,
+                emit=reporter,
                 secret_command_runner=secret_command_runner,
             )
             if run.status is RunStatus.WAITING and not run.open_dependencies():
@@ -420,6 +447,7 @@ async def _process_current_run(
             agent_spec,
             current_context,
             delegation,
+            terminal,
         )
     except UserCancelledError:
         raise
@@ -445,7 +473,9 @@ async def _drive_session(
     agent_specs: Mapping[str, AgentSpec],
     initial_model: ModelAdapter | None = None,
     max_model_requests: int = 4,
+    terminal: TerminalInput | None = None,
 ) -> int:
+    terminal = terminal or TerminalInput()
     context_managers = ActiveContextManagers()
     scheduler = CooperativeScheduler(max_model_requests)
     result_code, run = await _settle_run(
@@ -459,6 +489,7 @@ async def _drive_session(
         context_managers,
         initial_model,
         scheduler,
+        terminal,
     )
     if result_code == _WAITING_EXIT_CODE or not sys.stdin.isatty():
         return result_code
@@ -479,6 +510,7 @@ async def _drive_session(
             agent_specs,
             context_managers,
             scheduler=scheduler,
+            terminal=terminal,
         )
         if result_code == _WAITING_EXIT_CODE:
             return result_code
@@ -495,45 +527,15 @@ async def _settle_run(
     context_managers: ActiveContextManagers,
     initial_model: ModelAdapter | None = None,
     scheduler: CooperativeScheduler | None = None,
+    terminal: TerminalInput | None = None,
 ) -> tuple[int, Run]:
-    """Advance runnable children, route a wait, then join through the parent."""
+    """Advance the parent while its child tasks route and resume their own waits."""
     if run.parent_run_id is not None:
         run = store.load_run(run.parent_run_id)
-    model = initial_model
-    scheduler = scheduler or CooperativeScheduler()
-    while True:
-        result_code, run = await _process_current_run(
-            session,
-            run,
-            registry,
-            store,
-            secret_writer,
-            secret_command_runner,
-            agent_specs,
-            context_managers,
-            model,
-            scheduler,
-        )
-        model = None
-        if run.status is RunStatus.WAITING and not run.open_dependencies():
-            children = tuple(
-                child
-                for child in store.list_runs(session.session_id)
-                if child.parent_run_id == run.run_id
-            )
-            if not children:
-                raise AgentLoopError("Delegating run has no child after resume")
-            child = CooperativeScheduler().waiting_child(children)
-            if child is None:
-                raise AgentLoopError("Delegation batch has no waiting child to route")
-            run = child
-            continue
-        if run.parent_run_id is not None:
-            if result_code == _WAITING_EXIT_CODE:
-                return result_code, run
-            run = store.load_run(run.parent_run_id)
-            continue
-        return result_code, run
+    return await _process_current_run(
+        session, run, registry, store, secret_writer, secret_command_runner, agent_specs,
+        context_managers, initial_model, scheduler, terminal,
+    )
 
 
 async def _run_real(args: argparse.Namespace) -> int:
@@ -544,8 +546,11 @@ async def _run_real(args: argparse.Namespace) -> int:
     _announce_approval_mode(settings.approval_mode)
     store = _state_store()
     session = Session(workspace=workspace)
-    approval = _approval_callback(settings.approval_mode)
-    registry = create_default_registry(approval)
+    terminal = TerminalInput()
+    approval = _approval_callback(settings.approval_mode, terminal=terminal)
+    registry = create_default_registry(
+        approval, async_approval=_async_approval_callback(settings.approval_mode, terminal)
+    )
     agent_specs = _agent_specs(settings, registry)
     main_spec = agent_specs["main"]
     model = _create_real_model(main_spec.model_name)
@@ -559,7 +564,8 @@ async def _run_real(args: argparse.Namespace) -> int:
     store.create_session(session)
     print(f"Session created: {session.session_id}")
     secret_writer, secret_command_runner = _create_secret_capabilities(
-        _approval_callback(settings.approval_mode, with_secret=True)
+        _approval_callback(settings.approval_mode, with_secret=True, terminal=terminal),
+        _async_approval_callback(settings.approval_mode, terminal, with_secret=True),
     )
     return await _drive_session(
         session,
@@ -571,6 +577,7 @@ async def _run_real(args: argparse.Namespace) -> int:
         agent_specs,
         model,
         max_model_requests=settings.max_model_requests,
+        terminal=terminal,
     )
 
 
@@ -579,13 +586,16 @@ async def _resume_session(args: argparse.Namespace) -> int:
     session = store.load_session(args.session_id)
     if not session.workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
-    run = latest_run(session, store.list_runs(session.session_id))
     settings = load_runtime_settings()
     _announce_approval_mode(settings.approval_mode)
-    approval = _approval_callback(settings.approval_mode)
-    registry = create_default_registry(approval)
+    terminal = TerminalInput()
+    approval = _approval_callback(settings.approval_mode, terminal=terminal)
+    registry = create_default_registry(
+        approval, async_approval=_async_approval_callback(settings.approval_mode, terminal)
+    )
     secret_writer, secret_command_runner = _create_secret_capabilities(
-        _approval_callback(settings.approval_mode, with_secret=True)
+        _approval_callback(settings.approval_mode, with_secret=True, terminal=terminal),
+        _async_approval_callback(settings.approval_mode, terminal, with_secret=True),
     )
     secrets_reissued = False
     for active in store.list_runs(session.session_id):
@@ -596,6 +606,7 @@ async def _resume_session(args: argparse.Namespace) -> int:
             )
     if secrets_reissued:
         print("A process-local Secret was lost and must be entered again.")
+    run = latest_run(session, store.list_runs(session.session_id))
     return await _drive_session(
         session,
         run,
@@ -605,6 +616,7 @@ async def _resume_session(args: argparse.Namespace) -> int:
         secret_command_runner,
         _agent_specs(settings, registry),
         max_model_requests=settings.max_model_requests,
+        terminal=terminal,
     )
 
 
@@ -642,7 +654,7 @@ def _inspect_session(args: argparse.Namespace) -> int:
     for run in runs:
         goal = run.goal.replace("\n", " ")
         print(
-            f"  - #{run.sequence} {run.run_id} [{run.status.value}] "
+            f"  - #{run.sequence} {run.run_id} agent={run.agent_spec_id} [{run.status.value}] "
             f"{run.model_turns}/{run.max_steps} {goal}"
         )
         for dependency in run.open_dependencies():
@@ -664,6 +676,8 @@ def _inspect_run(args: argparse.Namespace) -> int:
     print(f"Status:      {run.status.value}")
     print(f"Goal:        {run.goal}")
     print(f"Workspace:   {session.workspace}")
+    print(f"Agent:       {run.agent_spec_id}")
+    print(f"Parent run:  {run.parent_run_id or '(root)'}")
     print(f"Model:       {run.model_name or '(not recorded)'}")
     print(f"Model turns: {run.model_turns}/{run.max_steps}")
     print(f"Messages:    {message_count}")

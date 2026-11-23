@@ -34,7 +34,6 @@ from handshake.runtime.state import (
     SecretHandle,
     Session,
     ToolResult,
-    ToolRunStatus,
 )
 from handshake.runtime.tool_execution import execute_tool_call
 from handshake.storage.errors import StorageError
@@ -601,6 +600,14 @@ async def start_run(
         )
 
 
+def _run_tail_message(run: Run, store: RunStore) -> ModelMessage | None:
+    count = store.message_count(run.context_scope_id)
+    if not count:
+        return None
+    tail = next(store.read_messages(run.context_scope_id, count - 1, count), None)
+    return tail.message if tail is not None and tail.message.run_id == run.run_id else None
+
+
 def prepare_run_for_resume(
     session: Session,
     run: Run,
@@ -611,9 +618,9 @@ def prepare_run_for_resume(
     """Recover process-local Secret state and persist it before CLI presentation."""
     if run.session_id != session.session_id:
         raise AgentLoopError(f"Run {run.run_id} does not belong to the session")
-    if run.status is RunStatus.RUNNING and any(
-        tool_run.status is ToolRunStatus.RUNNING for tool_run in run.tool_runs
-    ):
+    tail = _run_tail_message(run, store)
+    if tail is not None and tail.role == "assistant":
+        # Recovery owns prerequisites for an unfinished tool turn, even before a ToolRun exists.
         return False
     changed = reissue_lost_secret_dependencies(run, secret_command_runner)
     if changed:
@@ -663,12 +670,24 @@ async def continue_run(
             )
         current_context_manager.bind_scope(run.context_scope_id)
         _sync_context(run, store, current_context_manager)
-        pending = list(pending_messages)
+        tail = _run_tail_message(run, store)
+        recovering_tools = tail is not None and tail.role == "assistant"
+        # A Secret re-entry only changes runtime state. The next protocol message must
+        # contain the results for the assistant's outstanding tool calls.
+        pending = [] if recovering_tools else list(pending_messages)
         _checkpoint(session, run, store, current_context_manager, pending)
         if run.status is RunStatus.WAITING:
             output(f"Input received; {len(run.open_dependencies())} dependencies remain")
             return run
         output("Input received; resuming run")
+        if recovering_tools:
+            from handshake.runtime.recovery import resume_run
+
+            return await resume_run(
+                session, run, model, registry, store=store, agent_spec=agent_spec,
+                emit=output, secret_command_runner=secret_command_runner,
+                context_manager=current_context_manager, delegation=delegation, scheduler=scheduler,
+            )
         return await _run_turns(
             session,
             run,
