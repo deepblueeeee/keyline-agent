@@ -60,6 +60,15 @@ class Worktree:
     integration_commit: str | None = None
     cleanup_pending: bool = False
     cleaned: bool = False
+    directory_identity: tuple[int, int] | None = None
+
+    @property
+    def ready_for_cleanup(self) -> bool:
+        return self.status in {WorktreeStatus.INTEGRATED, WorktreeStatus.ABANDONED}
+
+    @property
+    def accepts_bindings(self) -> bool:
+        return not (self.ready_for_cleanup or self.cleanup_pending or self.cleaned)
 
 
 class ReplayPolicy(StrEnum):

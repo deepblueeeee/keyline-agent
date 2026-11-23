@@ -103,7 +103,7 @@ async def execute_tool_call(
         preparation: ToolPreparation
         if call.name in WORKTREE_TOOL_NAMES:
             def operation() -> ToolResult:
-                return execute_worktree_operation(session, run, call, store, worktrees)
+                return execute_worktree_operation(session, run, call, store, worktrees, emit)
 
             preparation = operation
         elif secret_run is not None:

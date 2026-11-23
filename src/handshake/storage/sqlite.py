@@ -19,6 +19,7 @@ from handshake.context.state import (
 from handshake.models.protocol import ModelMessage
 from handshake.runtime.errors import InvalidStateTransitionError
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.runs import TERMINAL_RUN_STATUSES
 from handshake.runtime.state import (
     ContextScope,
     Dependency,
@@ -38,7 +39,12 @@ from handshake.runtime.state import (
     WorktreeStatus,
     utc_now,
 )
-from handshake.storage.errors import RunNotFoundError, SessionNotFoundError, StorageError
+from handshake.storage.errors import (
+    RunNotFoundError,
+    SessionNotFoundError,
+    StorageError,
+    WorktreeUnavailableError,
+)
 from handshake.storage.schema import initialize_schema
 
 _CONTEXT_CHECKPOINT_FORMAT = {
@@ -202,14 +208,19 @@ class SQLiteStateStore(RunStore):
                     if owner_id == run.run_id:
                         if worktree is None or worktree.owner_run_id != owner_id:
                             raise StorageError("Owned worktree requires a durable creation record")
-                    elif connection.execute(
-                        """
-                        SELECT 1 FROM worktrees JOIN runs ON owner_run_id = runs.run_id
-                        WHERE owner_run_id = ? AND session_id = ?
-                        """,
-                        (owner_id, session.session_id),
-                    ).fetchone() is None:
-                        raise StorageError("Bound worktree must belong to the same session")
+                    else:
+                        bound = connection.execute(
+                            """
+                            SELECT record_json FROM worktrees
+                            JOIN runs ON owner_run_id = runs.run_id
+                            WHERE owner_run_id = ? AND session_id = ?
+                            """,
+                            (owner_id, session.session_id),
+                        ).fetchone()
+                        if bound is None:
+                            raise StorageError("Bound worktree must belong to the same session")
+                        if not _restore_worktree(owner_id, bound["record_json"]).accepts_bindings:
+                            raise WorktreeUnavailableError("Worktree is closed to new bindings")
                 if worktree is not None and owner_id != run.run_id:
                     raise StorageError("Worktree creation must belong to its bound run")
                 self._insert_run(connection, run, updated_at)
@@ -275,23 +286,22 @@ class SQLiteStateStore(RunStore):
                 ).fetchone()
             if row is None:
                 return None
-            record = _load_json(row["record_json"], "worktree")
-            return Worktree(
-                **{
-                    **record, "owner_run_id": owner_run_id,
-                    "repository": Path(record["repository"]), "path": Path(record["path"]),
-                    "status": WorktreeStatus(record["status"]),
-                }
-            )
+            return _restore_worktree(owner_run_id, row["record_json"])
         except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
     def save_worktree(self, expected: Worktree, updated: Worktree) -> None:
+        if expected.directory_identity != updated.directory_identity and not (
+            expected.directory_identity is None and expected.status is WorktreeStatus.PLANNED
+            and updated.status is WorktreeStatus.ACTIVE
+        ):
+            raise StorageError("Worktree directory identity is immutable after provisioning")
         if replace(
             updated, status=expected.status, saved_commit=expected.saved_commit,
             integration_head=expected.integration_head,
             integration_commit=expected.integration_commit,
             cleanup_pending=expected.cleanup_pending, cleaned=expected.cleaned,
+            directory_identity=expected.directory_identity,
         ) != expected:
             raise StorageError("Worktree binding metadata is immutable")
         try:
@@ -304,6 +314,19 @@ class SQLiteStateStore(RunStore):
                 if cursor.rowcount != 1:
                     raise StorageError("Worktree state changed since it was loaded")
         except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise _storage_error(exc) from None
+
+    def has_active_worktree_bindings(self, owner_run_id: str) -> bool:
+        try:
+            with self._connect() as connection:
+                return connection.execute(
+                    """
+                    SELECT 1 FROM runs WHERE workspace_owner_id = ?
+                    AND status NOT IN (?, ?, ?) LIMIT 1
+                    """,
+                    (owner_run_id, *TERMINAL_RUN_STATUSES),
+                ).fetchone() is not None
+        except (OSError, sqlite3.Error) as exc:
             raise _storage_error(exc) from None
 
     def list_runs(self, session_id: str | None = None) -> tuple[Run, ...]:
@@ -809,9 +832,30 @@ class SQLiteStateStore(RunStore):
 
 
 def _dump_worktree(tree: Worktree) -> str:
-    return _dump_json({
+    record = {
         **asdict(tree), "repository": str(tree.repository), "path": str(tree.path),
-    })
+    }
+    if tree.directory_identity is None:
+        record.pop("directory_identity")
+    return _dump_json(record)
+
+
+def _restore_worktree(owner_run_id: str, data: str) -> Worktree:
+    record = _load_json(data, "worktree")
+    identity = record.get("directory_identity")
+    if identity is not None and (
+        not isinstance(identity, list) or len(identity) != 2
+        or any(type(value) is not int for value in identity)
+    ):
+        raise StorageError("Worktree directory identity is invalid")
+    return Worktree(
+        **{
+            **record, "owner_run_id": owner_run_id,
+            "repository": Path(record["repository"]), "path": Path(record["path"]),
+            "status": WorktreeStatus(record["status"]),
+            "directory_identity": tuple(identity) if identity is not None else None,
+        }
+    )
 
 
 def _dump_json(value: Any) -> str:

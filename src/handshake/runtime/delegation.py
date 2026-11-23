@@ -34,8 +34,14 @@ from handshake.runtime.state import (
     WorkspaceBinding,
     WorktreeStatus,
 )
-from handshake.runtime.workspaces import bound_worktree, owned_worktree, test_outcomes
-from handshake.storage.errors import StorageError
+from handshake.runtime.workspaces import (
+    WORKTREE_LIFETIME_NOTICE,
+    bound_worktree,
+    owned_worktree,
+    reclaim_worktree,
+    test_outcomes,
+)
+from handshake.storage.errors import StorageError, WorktreeUnavailableError
 from handshake.tools import DELEGATE_TOOL
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
@@ -222,6 +228,8 @@ def _ensure_children(
                     if owner.status not in TERMINAL_RUN_STATUSES:
                         raise WorktreeError("Target implementer is still active")
                     manager.validate(target)
+                    if not target.accepts_bindings:
+                        raise WorktreeError("Target Worktree is closed to new bindings")
                     child.workspace_binding = WorkspaceBinding(task.target_run_id)
             except WorktreeError as exc:
                 child.error = str(exc)
@@ -231,7 +239,13 @@ def _ensure_children(
                 ModelMessage("user", ({"type": "text", "text": child.goal},), run_id=child.run_id),
             )
             if record is None:
-                store.create_run(session, child, messages)
+                try:
+                    store.create_run(session, child, messages)
+                except WorktreeUnavailableError as exc:
+                    child.workspace_binding = WorkspaceBinding()
+                    child.error = str(exc)
+                    child.transition(RunStatus.FAILED)
+                    store.create_run(session, child, messages)
             else:
                 store.create_run(session, child, messages, worktree=record)
             runs.append(child)
@@ -264,19 +278,17 @@ async def _run_child(
     delegation: DelegationRuntime,
 ) -> Run:
     emit = bind_reporter(emit, child)
-    spec = delegation.agent_specs.get(child.agent_spec_id)
-    if spec is None:
-        child.error = f"Agent spec {child.agent_spec_id} is unavailable"
-        child.transition(RunStatus.FAILED)
-        store.checkpoint_run(session, child)
-        bind_reporter(emit, child)(f"Run failed: {child.error}")
-        return child
     model: ModelAdapter | None = None
     try:
+        spec = delegation.agent_specs.get(child.agent_spec_id)
+        if spec is None:
+            raise AgentLoopError(f"Agent spec {child.agent_spec_id} is unavailable")
         tree = bound_worktree(session, child, store)
         if tree is not None:
             if tree.owner_run_id == child.run_id:
                 await run_blocking(lambda: delegation.worktrees.provision(tree, store))
+                if tree.status is WorktreeStatus.PLANNED:
+                    emit(WORKTREE_LIFETIME_NOTICE)
             else:
                 await run_blocking(lambda: delegation.worktrees.validate(tree))
         model = delegation.scheduler.model(delegation.model_for_spec(spec))
@@ -322,6 +334,16 @@ async def _run_child(
     finally:
         if model is not None:
             await close_model(model)
+        owner_id = child.workspace_binding.worktree_owner_id
+        if (
+            owner_id is not None and owner_id != child.run_id
+            and store.load_run(child.run_id).status in TERMINAL_RUN_STATUSES
+        ):
+            target = store.load_worktree(owner_id)
+            if target is not None:
+                await run_blocking(lambda: reclaim_worktree(
+                    target, store, delegation.worktrees, emit,
+                ))
 
 
 def _pending_calls(parent: Run, store: RunStore) -> tuple[ToolCall, ...]:

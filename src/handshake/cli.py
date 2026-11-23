@@ -59,7 +59,7 @@ from handshake.runtime.runs import (
     create_initial_run,
     latest_run,
 )
-from handshake.runtime.scheduler import CooperativeScheduler
+from handshake.runtime.scheduler import CooperativeScheduler, run_blocking
 from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
     Dependency,
@@ -68,11 +68,13 @@ from handshake.runtime.state import (
     RunStatus,
     Session,
 )
+from handshake.runtime.workspaces import reclaim_session_worktrees
 from handshake.storage import SQLiteStateStore, StorageError
 from handshake.tools import create_default_registry, runtime_tool_definitions
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.secret_command import SecretCommandRunner
 from handshake.tools.shell import ApprovalCallback, AsyncApprovalCallback
+from handshake.worktrees.manager import WorktreeManager
 
 _WAITING_EXIT_CODE = 2
 
@@ -586,6 +588,7 @@ async def _resume_session(args: argparse.Namespace) -> int:
     session = store.load_session(args.session_id)
     if not session.workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
+    await run_blocking(lambda: reclaim_session_worktrees(session, store, WorktreeManager(), print))
     settings = load_runtime_settings()
     _announce_approval_mode(settings.approval_mode)
     terminal = TerminalInput()
@@ -685,6 +688,8 @@ def _inspect_run(args: argparse.Namespace) -> int:
             status += ", removed"
         elif worktree.cleanup_pending:
             status += ", cleanup pending"
+        elif worktree.ready_for_cleanup:
+            status += ", checkout retained"
         print(f"Worktree:    {worktree.branch} [{status}]")
         print(f"Owner run:   {worktree.owner_run_id}")
         if worktree.saved_commit is not None:

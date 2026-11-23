@@ -21,6 +21,7 @@ INSPECT_CHANGES = ToolDefinition(
 INTEGRATE_CHANGES = ToolDefinition(
     "integrate_changes",
     "Integrate one completed implementer's saved changes into the clean main workspace. "
+    "Successful integration schedules automatic cleanup of the temporary worktree. "
     "Git reports conflicts without changing the main workspace. Choose the order explicitly.",
     {
         "type": "object", "properties": {"child_run_id": _CHILD},
@@ -30,8 +31,8 @@ INTEGRATE_CHANGES = ToolDefinition(
 
 CLEANUP_WORKTREE = ToolDefinition(
     "cleanup_worktree",
-    "Remove an integrated child worktree, or explicitly abandon it with abandon=true. "
-    "The branch is retained as a backup.",
+    "Retry cleanup of a temporary worktree, or explicitly abandon its changes with abandon=true. "
+    "The saved branch is retained. Ignored files and other data outside Git are discarded.",
     {
         "type": "object", "properties": {
             "child_run_id": _CHILD, "abandon": {"type": "boolean", "default": False},

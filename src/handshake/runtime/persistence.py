@@ -76,6 +76,10 @@ class RunStore(Protocol):
         """Update lifecycle state only if the recorded state still matches."""
         ...
 
+    def has_active_worktree_bindings(self, owner_run_id: str) -> bool:
+        """Return whether a nonterminal Run still holds this checkout."""
+        ...
+
     def checkpoint_run(
         self,
         session: Session,

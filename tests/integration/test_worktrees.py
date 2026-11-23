@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from handshake import cli
 from handshake.context import ActiveContextManagers
 from handshake.context.budget import ContextBudgetPolicy
 from handshake.inputs import EphemeralSecretStore
@@ -24,14 +27,18 @@ from handshake.runtime.delegation import DelegationRuntime, continue_delegation
 from handshake.runtime.errors import UserCancelledError
 from handshake.runtime.loop import start_run
 from handshake.runtime.recovery import resume_run
+from handshake.runtime.runs import create_child_run
 from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
     Run,
     RunStatus,
     Session,
     ToolRunStatus,
+    WorkspaceBinding,
     WorktreeStatus,
 )
+from handshake.runtime.workspaces import execute_worktree_operation
+from handshake.storage.errors import WorktreeUnavailableError
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools import create_default_registry, runtime_tool_definitions
 from handshake.tools.registry import ToolBinding
@@ -354,7 +361,7 @@ async def test_integrate_and_reconcile_interruption(
     assert git(case.repo, "for-each-ref", "refs/handshake/integrations/") == ""
     assert not (case.repo / ".git" / "MERGE_HEAD").exists()
     second_tree = store.load_worktree(second.run_id)
-    assert second_tree is not None and second_tree.path.exists()
+    assert second_tree is not None
     if conflict:
         assert "merge conflict" in case.results()["accept-two"]["content"]
         assert git(case.repo, "rev-parse", "HEAD") == first_tree.integration_commit
@@ -365,6 +372,7 @@ async def test_integrate_and_reconcile_interruption(
         assert (case.repo / "one.txt").read_text() == "one\n"
         assert (case.repo / "two.txt").read_text() == "two\n"
         assert second_tree.status is WorktreeStatus.INTEGRATED
+        assert second_tree.cleaned and not second_tree.path.exists()
     if interrupt_at == "main_advanced":
         assert (case.repo / "user.txt").read_text() == "committed after interruption"
         restored = store.load_worktree(first.run_id)
@@ -1041,11 +1049,11 @@ async def test_abandon_after_interruption_and_main_advance(
 
 @pytest.mark.parametrize("abandon", [True, False], ids=["abandon", "integrate"])
 @run_async
-async def test_cleanup_allows_test_artifacts_and_preserves_other_ignored_files(
+async def test_finalized_worktree_reclaims_arbitrary_ignored_data(
     tmp_path: Path, abandon: bool,
 ) -> None:
     case = Scenario(tmp_path)
-    (case.repo / ".git" / "info" / "exclude").write_text(".venv/\n.pytest_cache/\n.env\n")
+    (case.repo / ".git" / "info" / "exclude").write_text("local-output/\n.env\n")
     await case.start(
         ScriptedModel([turn(delegate("impl", "implementer", "create and test code")), done()]),
         lambda _: ScriptedModel([
@@ -1053,8 +1061,8 @@ async def test_cleanup_allows_test_artifacts_and_preserves_other_ignored_files(
                 ToolCall("write", "write_file", {"path": "source.txt", "content": "saved code"}),
                 ToolCall("test", "run_tests", {"argv": [sys.executable, "-c", (
                     "from pathlib import Path; "
-                    "Path('.venv').mkdir(); Path('.venv/pyvenv.cfg').write_text('environment'); "
-                    "Path('.pytest_cache').mkdir(); Path('.pytest_cache/CACHEDIR.TAG').touch()"
+                    "Path('local-output').mkdir(); Path('local-output/result').touch(); "
+                    "Path('.env').write_text('discarded test data')"
                 )]}),
             ),
             done(),
@@ -1062,21 +1070,220 @@ async def test_cleanup_allows_test_artifacts_and_preserves_other_ignored_files(
     )
     (child,) = case.children()
     tree = case.store.load_worktree(child.run_id)
-    assert tree is not None and tree.status is WorktreeStatus.SAVED
-    if not abandon:
-        tree = case.manager.integrate(tree, case.store)
+    assert tree is not None and tree.status is WorktreeStatus.SAVED and tree.path.is_dir()
+    assert (tree.path / ".env").exists()
+    link = tree.path / "local-output" / "link-to-original"
+    link.symlink_to(case.repo, target_is_directory=True)
+    arguments = {"child_run_id": child.run_id}
+    operation = "integrate_changes"
+    if abandon:
+        arguments["abandon"] = True
+        operation = "cleanup_worktree"
 
-    protected = tree.path / ".env"
-    protected.write_text("private local file")
-    with pytest.raises(WorktreeError, match=r"Protected ignored path in Worktree: '\.env'"):
-        case.manager.cleanup(tree, case.store, abandon=abandon)
-    assert protected.read_text() == "private local file"
-    assert case.store.load_worktree(child.run_id) == tree
-    assert (tree.path / ".venv" / "pyvenv.cfg").exists()
-    assert (tree.path / ".pytest_cache" / "CACHEDIR.TAG").exists()
-
-    protected.unlink()
-    cleaned = case.manager.cleanup(tree, case.store, abandon=abandon)
+    notices: list[str] = []
+    result = execute_worktree_operation(
+        case.session, case.parent, ToolCall("finalize", operation, arguments),
+        case.store, case.manager, notices.append,
+    )
+    assert result.ok, result.stderr
+    assert json.loads(result.stdout)["cleanup_status"] == "cleaned"
+    assert any("including ignored files" in notice for notice in notices)
+    cleaned = case.store.load_worktree(child.run_id)
+    assert cleaned is not None
     assert cleaned.status is (WorktreeStatus.ABANDONED if abandon else WorktreeStatus.INTEGRATED)
     assert cleaned.cleaned and not cleaned.path.exists()
     assert git(case.repo, "show", f"{cleaned.branch}:source.txt") == "saved code"
+    inspected = execute_worktree_operation(
+        case.session, case.parent,
+        ToolCall("inspect", "inspect_changes", {"child_run_id": child.run_id}),
+        case.store, case.manager,
+    )
+    assert inspected.ok and "+saved code" in json.loads(inspected.stdout)["diff"]
+    assert (case.repo / "source.txt").exists() is not abandon
+    assert (case.repo / "shared.txt").read_text() == "base\n"
+
+
+@pytest.mark.parametrize("abandon", [False, True], ids=["integrate", "abandon"])
+@run_async
+async def test_cleanup_waits_for_bound_reviewer_then_runs_automatically(
+    tmp_path: Path, abandon: bool,
+) -> None:
+    case = Scenario(tmp_path)
+
+    class Main:
+        step = 0
+
+        async def complete(self, _context, _tools):
+            self.step += 1
+            if self.step == 1:
+                return turn(delegate("impl", "implementer", "write"))
+            (owner,) = case.children()
+            return turn(delegate("review", "reviewer", "read", target_run_id=owner.run_id))
+
+    class InterruptedReviewer:
+        async def complete(self, _context, _tools):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        await case.start(Main(), lambda spec: (
+            InterruptedReviewer() if spec.spec_id == "reviewer" else ScriptedModel([
+                turn(ToolCall("write", "write_file", {"path": "new.txt", "content": "kept"})),
+                done(),
+            ])
+        ))
+    owner, reviewer = case.children()
+    assert reviewer.status is RunStatus.RUNNING
+    assert reviewer.workspace_binding.worktree_owner_id == owner.run_id
+
+    call = (ToolCall("discard", "cleanup_worktree", {
+        "child_run_id": owner.run_id, "abandon": True,
+    }) if abandon else ToolCall("merge", "integrate_changes", {"child_run_id": owner.run_id}))
+    result = execute_worktree_operation(case.session, case.parent, call, case.store, case.manager)
+    assert result.ok, result.stderr
+    assert json.loads(result.stdout)["cleanup_status"] == "deferred"
+    deferred = case.store.load_worktree(owner.run_id)
+    expected_status = WorktreeStatus.ABANDONED if abandon else WorktreeStatus.INTEGRATED
+    assert deferred is not None and deferred.status is expected_status
+    assert deferred.path.is_dir() and not deferred.cleanup_pending
+
+    parent = case.store.load_run(case.parent.run_id)
+    late = create_child_run(
+        case.session, case.store.list_runs(case.session.session_id), parent, "late reviewer",
+        agent_spec_id="reviewer", model_name="scripted", max_steps=5, tool_call_id="late",
+    )
+    late.workspace_binding = WorkspaceBinding(owner.run_id)
+    with pytest.raises(WorktreeUnavailableError, match="closed to new bindings"):
+        case.store.create_run(case.session, late)
+
+    reader = ScriptedModel([turn(ToolCall("read", "read_file", {"path": "new.txt"})), done()])
+    resumed = await case.restart_batch(ScriptedModel([done()]), lambda _: reader)
+    assert resumed.status is RunStatus.COMPLETED
+    assert Path(reader.contexts[0].workspace) == deferred.path
+    assert "kept" in reader.contexts[-1].messages[-1].content[0]["content"]
+    cleaned = case.store.load_worktree(owner.run_id)
+    assert cleaned is not None and cleaned.cleaned and not cleaned.path.exists()
+    assert cleaned.status is expected_status
+
+
+@pytest.mark.parametrize("interrupt_at", ["before_cleanup", "after_remove", "cleanup_failure"])
+@run_async
+async def test_session_resume_recovers_cleanup_without_reapplying_integration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt_at: str,
+) -> None:
+    case = Scenario(tmp_path)
+
+    class Main:
+        step = 0
+
+        async def complete(self, _context, _tools):
+            self.step += 1
+            if self.step == 1:
+                return turn(delegate("impl", "implementer", "write"))
+            if self.step == 2:
+                child, = case.children()
+                return turn(ToolCall("merge", "integrate_changes", {"child_run_id": child.run_id}))
+            return done()
+
+    save = case.store.save_worktree
+
+    def stop_before_cleanup(*_args, **_kwargs):
+        if interrupt_at == "cleanup_failure":
+            raise WorktreeError("simulated remove failure")
+        raise KeyboardInterrupt
+
+    def stop_after_remove(expected, updated):
+        if updated.cleaned:
+            raise KeyboardInterrupt
+        save(expected, updated)
+
+    with monkeypatch.context() as patch:
+        if interrupt_at == "after_remove":
+            patch.setattr(case.store, "save_worktree", stop_after_remove)
+        else:
+            patch.setattr(case.manager, "cleanup", stop_before_cleanup)
+        operation = case.start(Main(), lambda _: ScriptedModel([
+            turn(ToolCall("write", "write_file", {"path": "new.txt", "content": "kept"})), done(),
+        ]))
+        if interrupt_at == "cleanup_failure":
+            await operation
+            merge = case.results()["merge"]
+            assert not merge["is_error"]
+            reported = json.loads(json.loads(merge["content"])["stdout"])
+            assert reported["worktree_status"] == "integrated"
+            assert reported["cleanup_status"] == "failed"
+            assert reported["cleanup_error"] == "simulated remove failure"
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                await operation
+
+    child, = case.children()
+    pending = case.store.load_worktree(child.run_id)
+    assert pending is not None and pending.status is WorktreeStatus.INTEGRATED
+    assert pending.cleanup_pending is (interrupt_at == "after_remove")
+    assert pending.path.exists() is (interrupt_at != "after_remove")
+    integrated_head = git(case.repo, "rev-parse", "HEAD")
+    reopened = SQLiteStateStore(case.store.database_path)
+    monkeypatch.setattr(cli, "_state_store", lambda: reopened)
+    monkeypatch.setattr(cli, "_create_real_model", lambda _model: ScriptedModel([done()]))
+    args = Namespace(session_id=case.session.session_id)
+    assert await cli._resume_session(args) == 0
+    assert await cli._resume_session(args) == 0
+    recovered = reopened.load_worktree(child.run_id)
+    assert recovered is not None and recovered.cleaned and not recovered.path.exists()
+    assert not recovered.cleanup_pending
+    assert git(case.repo, "rev-parse", "HEAD") == integrated_head
+    assert git(case.repo, "show", f"{recovered.branch}:new.txt") == "kept"
+
+
+@pytest.mark.parametrize(
+    "alteration", ["dirty", "assume_unchanged", "replacement", "symlink", "legacy_record"],
+)
+@run_async
+async def test_cleanup_refuses_unsaved_or_unverified_checkouts(
+    tmp_path: Path, alteration: str,
+) -> None:
+    case = Scenario(tmp_path)
+    await case.start(
+        ScriptedModel([turn(delegate("impl", "implementer", "write")), done()]),
+        lambda _: ScriptedModel([
+            turn(ToolCall("write", "write_file", {"path": "new.txt", "content": "saved"})), done(),
+        ]),
+    )
+    child, = case.children()
+    saved = case.store.load_worktree(child.run_id)
+    assert saved is not None
+    integrated = case.manager.integrate(saved, case.store)
+    if alteration in {"dirty", "assume_unchanged"}:
+        if alteration == "assume_unchanged":
+            git(integrated.path, "update-index", "--assume-unchanged", "new.txt")
+        (integrated.path / "new.txt").write_text("unsaved")
+        expected = "uncommitted" if alteration == "dirty" else "index hides tracked changes"
+    elif alteration == "legacy_record":
+        with sqlite3.connect(case.store.database_path) as connection:
+            connection.execute(
+                "UPDATE worktrees "
+                "SET record_json = json_remove(record_json, '$.directory_identity') "
+                "WHERE owner_run_id = ?",
+                (child.run_id,),
+            )
+        integrated = replace(integrated, directory_identity=None)
+        expected = "no recorded directory identity"
+    else:
+        moved = tmp_path / "moved-worktree"
+        integrated.path.rename(moved)
+        if alteration == "replacement":
+            # Even a byte-for-byte copy with the original Git link is a new directory.
+            shutil.copytree(moved, integrated.path, symlinks=True)
+            expected = "directory was replaced"
+        else:
+            integrated.path.symlink_to(moved, target_is_directory=True)
+            expected = "missing or moved"
+
+    with pytest.raises(WorktreeError, match=expected):
+        case.manager.cleanup(integrated, case.store, abandon=False)
+    assert integrated.path.exists()
+    assert (integrated.path / "new.txt").read_text() == (
+        "unsaved" if alteration in {"dirty", "assume_unchanged"} else "saved"
+    )
+    assert (case.repo / "new.txt").read_text() == "saved"
+    assert case.store.load_worktree(child.run_id) == integrated

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -72,17 +73,21 @@ def _check_idle(path: Path) -> None:
             raise WorktreeError(f"Git operation already in progress in {path} ({name})")
 
 
-def _check_clean(path: Path, *, protect_ignored: bool = False) -> None:
-    args = ("--ignored=matching",) if protect_ignored else ()
+def _check_clean(path: Path) -> None:
     status = _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all",
-                  "--ignore-submodules=none", *args)
-    for entry in status.stdout.split(b"\0")[:-1]:
-        if entry.startswith(b"!! "):
-            name = entry[3:]
-            if name.startswith((b".venv/", b".pytest_cache/")):
-                continue
-            raise WorktreeError(f"Protected ignored path in Worktree: {os.fsdecode(name)!r}")
+                  "--ignore-submodules=none")
+    if status.stdout:
         raise WorktreeError(f"Workspace has uncommitted or untracked changes: {path}")
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise WorktreeError(f"Cannot read Worktree directory identity: {path}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise WorktreeError(f"Worktree path is not a real directory: {path}")
+    return info.st_dev, info.st_ino
 
 
 def _matches_checkout(path: Path, commit: str) -> bool:
@@ -211,8 +216,13 @@ class WorktreeManager:
     def validate(self, tree: Worktree) -> Path:
         if tree.cleaned or tree.cleanup_pending:
             raise WorktreeError(f"Worktree for {tree.owner_run_id} was cleaned or is being cleaned")
-        if tree.path.resolve() != tree.path or not tree.path.is_dir():
+        if tree.path.is_symlink() or tree.path.resolve() != tree.path or not tree.path.is_dir():
             raise WorktreeError(f"Worktree is missing or moved: {tree.path}")
+        if (
+            tree.directory_identity is not None
+            and _directory_identity(tree.path) != tree.directory_identity
+        ):
+            raise WorktreeError(f"Worktree directory was replaced: {tree.path}")
         registration = _registrations(tree.repository).get(tree.path)
         if (registration is None or registration.get("branch") != f"refs/heads/{tree.branch}"
                 or "prunable" in registration):
@@ -251,7 +261,10 @@ class WorktreeManager:
             if _head(tree.path) != tree.base_commit:
                 raise WorktreeError("Unfinished worktree creation has unexpected commits")
             _check_clean(tree.path)
-            return self._update(store, tree, status=WorktreeStatus.ACTIVE)
+            return self._update(
+                store, tree, status=WorktreeStatus.ACTIVE,
+                directory_identity=_directory_identity(tree.path),
+            )
 
     def snapshot(self, tree: Worktree, store: RunStore) -> Worktree:
         with self._locked(tree):
@@ -482,6 +495,9 @@ class WorktreeManager:
             tree = self._reload(tree, store)
             if tree.cleaned:
                 return tree
+            key = sha256(tree.owner_run_id.encode()).hexdigest()
+            if tree.path.name != key or tree.branch != f"handshake/{key}":
+                raise WorktreeError("Worktree path or branch does not match its owner")
             if not tree.cleanup_pending:
                 if abandon and tree.status is WorktreeStatus.INTEGRATING:
                     _check_idle(tree.repository)
@@ -493,26 +509,66 @@ class WorktreeManager:
                         tree = self._finish_integration(tree, store)
                     else:
                         tree = self._clear_intent(tree, store)
-                if tree.status is WorktreeStatus.INTEGRATED:
-                    self._check_snapshot(tree)
-                elif abandon and tree.status in {WorktreeStatus.ACTIVE, WorktreeStatus.SAVED}:
+                if abandon and tree.status in {WorktreeStatus.ACTIVE, WorktreeStatus.SAVED}:
                     tree = self._snapshot(tree, store)
-                elif tree.status is not WorktreeStatus.ABANDONED:
+                    tree = self._update(store, tree, status=WorktreeStatus.ABANDONED)
+                if not tree.ready_for_cleanup:
                     raise WorktreeError("Integrate the worktree or explicitly abandon its changes")
-                _check_clean(tree.path, protect_ignored=True)
-                tree = self._update(
-                    store, tree, cleanup_pending=True,
-                    status=(WorktreeStatus.INTEGRATED if tree.status is WorktreeStatus.INTEGRATED
-                            else WorktreeStatus.ABANDONED),
-                )
-            registered = _registrations(tree.repository).get(tree.path)
-            if registered is not None or os.path.lexists(tree.path):
-                active = replace(tree, cleanup_pending=False)
-                self._check_snapshot(active)
-                _check_clean(tree.path, protect_ignored=True)
+                # Integration and abandonment close new bindings before this check.
+                if store.has_active_worktree_bindings(tree.owner_run_id):
+                    return tree
+                self._check_removal(tree)
+                tree = self._update(store, tree, cleanup_pending=True)
+            elif not tree.ready_for_cleanup:
+                raise WorktreeError("Worktree has an inconsistent cleanup record")
+            elif store.has_active_worktree_bindings(tree.owner_run_id):
+                return tree
+            registrations = _registrations(tree.repository)
+            if tree.path in registrations or os.path.lexists(tree.path):
+                self._check_removal(replace(tree, cleanup_pending=False))
                 _git(tree.repository, "worktree", "remove", "--", str(tree.path))
+                registrations = _registrations(tree.repository)
+                if tree.path in registrations or os.path.lexists(tree.path):
+                    raise WorktreeError("Worktree removal did not finish")
+            if any(
+                info.get("branch") == f"refs/heads/{tree.branch}"
+                for info in registrations.values()
+            ):
+                raise WorktreeError("Worktree branch is registered at a different path")
+            if _head(tree.repository, f"refs/heads/{tree.branch}") != tree.saved_commit:
+                raise WorktreeError("Worktree backup branch differs from the saved commit")
             # Keep the branch as an explicit backup, including for abandoned changes.
             return self._update(store, tree, cleanup_pending=False, cleaned=True)
+
+    def _check_removal(self, tree: Worktree) -> None:
+        if tree.directory_identity is None:
+            raise WorktreeError("Worktree has no recorded directory identity; checkout kept")
+        self._check_snapshot(tree)
+        gitfile = tree.path / ".git"
+        if gitfile.is_symlink() or not gitfile.is_file():
+            raise WorktreeError("Worktree Git link must be a regular file")
+        git_dir = Path(os.fsdecode(_git(
+            tree.path, "rev-parse", "--absolute-git-dir",
+        ).stdout.rstrip(b"\n"))).resolve()
+        if git_dir.parent != _common_directory(tree.repository) / "worktrees":
+            raise WorktreeError("Worktree Git link is not registered in the expected repository")
+        try:
+            reverse_link = os.fsdecode((git_dir / "gitdir").read_bytes().rstrip(b"\n"))
+        except OSError as exc:
+            raise WorktreeError("Cannot read the Worktree registration") from exc
+        if (git_dir / reverse_link).resolve() != gitfile:
+            raise WorktreeError("Worktree registration points to a different directory")
+        index = _git(tree.path, "ls-files", "-v", "-z").stdout
+        if any(entry[:1].islower() or entry.startswith(b"S ") for entry in index.split(b"\0")):
+            raise WorktreeError("Worktree index hides tracked changes; checkout kept")
+        if tree.path.is_mount() or any(
+            (path := Path(parent) / name).is_mount() and not path.is_symlink()
+            for parent, dirs, _ in os.walk(tree.path)
+            for name in dirs
+        ):
+            raise WorktreeError("Worktree contains a mount point; checkout kept")
+        if _directory_identity(tree.path) != tree.directory_identity:
+            raise WorktreeError(f"Worktree directory changed before removal: {tree.path}")
 
     @staticmethod
     def _reload(tree: Worktree, store: RunStore) -> Worktree:

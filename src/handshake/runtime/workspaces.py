@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from handshake.models.protocol import ToolCall
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.runs import TERMINAL_RUN_STATUSES
 from handshake.runtime.state import Run, RunStatus, Session, ToolResult, Worktree, WorktreeStatus
-from handshake.storage.errors import RunNotFoundError
+from handshake.storage.errors import RunNotFoundError, StorageError
 from handshake.tools.worktree import CLEANUP_WORKTREE, INSPECT_CHANGES, INTEGRATE_CHANGES
 from handshake.worktrees.manager import WorktreeError, WorktreeManager
+
+WORKTREE_LIFETIME_NOTICE = (
+    "Worktrees are temporary. Cleanup discards files outside the saved Git commit, "
+    "including ignored files and local test data."
+)
 
 
 def owned_worktree(session: Session, owner_id: str, store: RunStore) -> tuple[Run, Worktree]:
@@ -44,8 +50,45 @@ def test_outcomes(run: Run) -> list[dict[str, object]]:
     ]
 
 
+def reclaim_worktree(
+    tree: Worktree, store: RunStore, manager: WorktreeManager, emit: Callable[[str], None],
+) -> tuple[Worktree, str | None]:
+    if not tree.ready_for_cleanup or tree.cleaned:
+        return tree, None
+    try:
+        if not store.has_active_worktree_bindings(tree.owner_run_id):
+            emit(
+                f"Reclaiming temporary Worktree for {tree.owner_run_id}. {WORKTREE_LIFETIME_NOTICE}"
+            )
+        updated = manager.cleanup(tree, store, abandon=False)
+    except (WorktreeError, StorageError) as exc:
+        emit(f"Worktree for {tree.owner_run_id} is {tree.status.value}; cleanup failed: {exc}")
+        return store.load_worktree(tree.owner_run_id) or tree, str(exc)
+    if not updated.cleaned:
+        emit(f"Worktree cleanup deferred; another Run is using {tree.owner_run_id}")
+    return updated, None
+
+
+def reclaim_session_worktrees(
+    session: Session, store: RunStore, manager: WorktreeManager, emit: Callable[[str], None],
+) -> None:
+    for run in store.list_runs(session.session_id):
+        if (
+            run.status in TERMINAL_RUN_STATUSES
+            and run.workspace_binding.worktree_owner_id == run.run_id
+        ):
+            try:
+                tree = bound_worktree(session, run, store)
+            except WorktreeError as exc:
+                emit(f"Worktree cleanup failed for {run.run_id}: {exc}")
+                continue
+            if tree is not None:
+                reclaim_worktree(tree, store, manager, emit)
+
+
 def execute_worktree_operation(
     session: Session, run: Run, call: ToolCall, store: RunStore, manager: WorktreeManager,
+    emit: Callable[[str], None] = lambda _message: None,
 ) -> ToolResult:
     if run.parent_run_id is not None or run.workspace_binding.worktree_owner_id is not None:
         return ToolResult(False, stderr="Only the main Run can manage child Worktrees")
@@ -73,19 +116,24 @@ def execute_worktree_operation(
                 raise WorktreeError("Only changes from a completed implementer may be integrated")
             tree = manager.integrate(tree, store)
             data = manager.changes(tree)
+            tree, cleanup_error = reclaim_worktree(tree, store, manager, emit)
+            data["cleaned"] = tree.cleaned
+            if cleanup_error is not None:
+                data["cleanup_error"] = cleanup_error
+                data["cleanup_status"] = "failed"
+            else:
+                data["cleanup_status"] = "cleaned" if tree.cleaned else "deferred"
         elif call.name == CLEANUP_WORKTREE.name:
             abandon = call.arguments.get("abandon", False)
             if type(abandon) is not bool:
                 raise WorktreeError("abandon must be a boolean")
-            if any(
-                other.run_id != owner_id
-                and other.workspace_binding.worktree_owner_id == owner_id
-                and other.status not in TERMINAL_RUN_STATUSES
-                for other in store.list_runs(session.session_id)
-            ):
-                raise WorktreeError("Another Run still uses this Worktree")
+            if not tree.cleaned:
+                emit(WORKTREE_LIFETIME_NOTICE)
             tree = manager.cleanup(tree, store, abandon=abandon)
             data = manager.changes(tree)
+            data["cleanup_status"] = "cleaned" if tree.cleaned else "deferred"
+            if not tree.cleaned:
+                emit(f"Worktree cleanup deferred; another Run is using {tree.owner_run_id}")
         else:
             raise WorktreeError(f"Unknown Worktree operation: {call.name}")
         data["tests"] = test_outcomes(owner)

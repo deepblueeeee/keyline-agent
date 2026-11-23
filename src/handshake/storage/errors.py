@@ -11,3 +11,7 @@ class RunNotFoundError(StorageError):
 
 class SessionNotFoundError(StorageError):
     """Raised when a requested durable session does not exist."""
+
+
+class WorktreeUnavailableError(StorageError):
+    """The target Worktree closed to new bindings before a child was saved."""
