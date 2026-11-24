@@ -14,7 +14,7 @@ from time import monotonic
 from typing import Any
 
 from docker import DockerClient
-from docker.errors import DockerException
+from docker.errors import DockerException, ImageNotFound
 from docker.models.containers import Container
 from docker.types import LogConfig, Mount
 from requests.exceptions import ConnectionError as DockerConnectionError
@@ -22,18 +22,16 @@ from requests.exceptions import ReadTimeout
 
 from handshake.runtime.state import ToolResult
 
-from .swebench import IMAGE_TAG
-
-_IMAGE = f"swebench/sweb.eval.x86_64.sympy_1776_sympy-20590:{IMAGE_TAG}"
 _TESTBED = "/testbed"
 _PATH = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
 
 
 class DockerWorkspace:
-    def __init__(self, client: DockerClient, path: Path, base_commit: str) -> None:
+    def __init__(self, client: DockerClient, path: Path, base_commit: str, *, image: str) -> None:
         self.client = client
         self.path = path.resolve()
         self.base_commit = base_commit
+        self.image = image
         self.git_dir = self.path.parent / "baseline.git"
         self._cleanup_failed = False
 
@@ -42,7 +40,7 @@ class DockerWorkspace:
         # A fresh command container prevents background processes from racing host file tools.
         mounts = [Mount(_TESTBED, str(self.path), type="bind")] if bind else []
         container = self.client.containers.create(
-            _IMAGE,
+            self.image,
             command=list(argv),
             platform="linux/amd64",
             working_dir=_TESTBED,
@@ -102,6 +100,10 @@ class DockerWorkspace:
                 self._check_checkout_files()
 
     def prepare(self) -> None:
+        try:
+            self.client.images.get(self.image)
+        except ImageNotFound:
+            self.client.images.pull(self.image.replace(":latest@", "@"), platform="linux/amd64")
         # Upload-pack sends only the base snapshot. Copying /testbed/.git directly can
         # expose unrelated refs and objects from the official scoring image.
         command = (

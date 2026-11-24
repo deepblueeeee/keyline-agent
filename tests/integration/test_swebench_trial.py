@@ -13,15 +13,21 @@ pytest.importorskip("docker")
 pytest.importorskip("swebench")
 
 import docker  # noqa: E402
+from swebench.harness.test_spec.test_spec import make_test_spec  # noqa: E402
 from swebench.harness.utils import load_swebench_dataset  # noqa: E402
 
 from evals import swebench, swebench_run  # noqa: E402
-from evals.swebench import INSTANCE_ID, dataset_snapshot  # noqa: E402
+from evals.swebench import dataset_snapshot  # noqa: E402
 from evals.swebench_workspace import DockerWorkspace  # noqa: E402
+from evals.tasks import load_tasks  # noqa: E402
 from handshake.models.errors import ModelProviderError  # noqa: E402
 from handshake.models.protocol import ModelContext, ModelTurn, ModelUsage, ToolCall  # noqa: E402
 from handshake.models.scripted import ScriptedModel  # noqa: E402
 from handshake.storage.sqlite import SQLiteStateStore  # noqa: E402
+
+INSTANCE_ID = "sympy__sympy-20590"
+TASK = next(task for task in load_tasks() if task.instance_id == INSTANCE_ID)
+BUDGET = swebench_run.Budget()
 
 
 @pytest.fixture
@@ -31,14 +37,17 @@ def trial_workspace(monkeypatch: pytest.MonkeyPatch) -> Mock:
     client.containers.get.side_effect = docker.errors.NotFound("already removed")
     monkeypatch.setattr(docker, "from_env", Mock(return_value=client))
     monkeypatch.setattr(swebench_run, "DockerWorkspace", Mock(return_value=workspace))
-    monkeypatch.setattr(swebench_run, "dataset_snapshot", lambda: "dataset")
-    monkeypatch.setattr(swebench, "dataset_snapshot", lambda: "dataset")
+    monkeypatch.setattr(swebench_run, "dataset_snapshot", lambda _task: "dataset")
+    monkeypatch.setattr(swebench, "dataset_snapshot", lambda _task: "dataset")
     monkeypatch.setattr(
         swebench_run,
         "load_swebench_dataset",
         Mock(return_value=[{"base_commit": "base", "problem_statement": "fixture"}]),
     )
     monkeypatch.setattr(swebench_run, "read_deepseek_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        swebench_run, "make_test_spec", Mock(return_value=Mock(instance_image_key="image"))
+    )
     monkeypatch.setattr(swebench_run, "DeepSeekAnthropicModel", Mock(return_value=object()))
     monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
 
@@ -78,7 +87,7 @@ def test_exported_crlf_patch_reaches_evaluator_unchanged(
 
     (checkout / "example.txt").write_bytes(b"first\r\nchanged\r\n")
     expected = git("diff", "--binary")
-    patch = DockerWorkspace(Mock(), checkout, base).export_patch()
+    patch = DockerWorkspace(Mock(), checkout, base, image="fixture-image").export_patch()
     run = subprocess.run
 
     def official_cli(command: list[str], *, cwd: Path, **kwargs: object) -> None:
@@ -88,7 +97,7 @@ def test_exported_crlf_patch_reaches_evaluator_unchanged(
         run(["git", "apply", "--check", "-"], cwd=scorer, input=data, check=True)
 
     monkeypatch.setattr(subprocess, "run", official_cli)
-    swebench.evaluate(patch, output_dir=tmp_path / "results")
+    swebench.evaluate(TASK, patch, output_dir=tmp_path / "results")
 
 
 def test_empty_patch_is_not_an_official_unresolved_result(
@@ -100,7 +109,7 @@ def test_empty_patch_is_not_an_official_unresolved_result(
     evaluate = Mock()
     monkeypatch.setattr(swebench_run, "evaluate", evaluate)
     directory = tmp_path / "trial"
-    result = swebench_run.run_trial(directory)
+    result = swebench_run.run_trial(TASK, directory, BUDGET)
 
     evaluate.assert_not_called()
     assert result["agent"]["status"] == "completed"
@@ -109,6 +118,20 @@ def test_empty_patch_is_not_an_official_unresolved_result(
     assert result["official_scoring_attempted"] is False
     assert result["official"] is None
     assert json.loads((directory / "result.json").read_text()) == result
+
+
+def test_report_without_test_scores_does_not_count_as_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trial_workspace: Mock,
+) -> None:
+    trial_workspace.export_patch.return_value = "candidate patch"
+    official = {"resolved": False, "patch_successfully_applied": False}
+    monkeypatch.setattr(swebench_run, "evaluate", Mock(return_value=(tmp_path, official, None)))
+    result = swebench_run.run_trial(TASK, tmp_path / "trial", BUDGET)
+    assert result["status"] == "scoring_failed"
+    assert result["official"] == official
+    assert result["resolved"] is None
 
 
 @pytest.mark.parametrize(("fallback_fails", "cli_fails"), [(False, False), (True, True)])
@@ -125,22 +148,23 @@ def test_scorer_cleanup_failure_keeps_official_report(
     container = get.return_value
     if fallback_fails:
         container.remove.side_effect = docker.errors.APIError("cleanup failed")
+    official = {"resolved": True, "patch_successfully_applied": True, "tests_status": {}}
 
     def official_cli(command: list[str], *, cwd: Path, **kwargs: object) -> None:
         run_id = command[command.index("--run_id") + 1]
         report = cwd / "logs" / "run_evaluation" / run_id / "candidate" / INSTANCE_ID
         report.mkdir(parents=True)
-        (report / "report.json").write_text(json.dumps({INSTANCE_ID: {"resolved": True}}))
+        (report / "report.json").write_text(json.dumps({INSTANCE_ID: official}))
         if cli_fails:
             raise subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(subprocess, "run", official_cli)
     directory = tmp_path / "trial"
-    result = swebench_run.run_trial(directory)
+    result = swebench_run.run_trial(TASK, directory, BUDGET)
 
     assert result["status"] == "scoring_cleanup_failed"
     assert result["official_scoring_attempted"] is True
-    assert result["official"] == {"resolved": True}
+    assert result["official"] == official
     assert result["resolved"] is True
     scoring_dir = Path(result["scoring_dir"])
     get.assert_called_once_with(f"sweb.eval.{INSTANCE_ID}.{scoring_dir.name}")
@@ -173,20 +197,17 @@ def test_trial_restores_state_directory(
     trial_workspace.prepare.side_effect = prepare
     if error is KeyboardInterrupt:
         with pytest.raises(KeyboardInterrupt):
-            swebench_run.run_trial(directory)
+            swebench_run.run_trial(TASK, directory, BUDGET)
     else:
-        result = swebench_run.run_trial(directory)
+        result = swebench_run.run_trial(TASK, directory, BUDGET)
         assert result["status"] == ("error" if error else "empty_patch")
     assert os.environ.get("HANDSHAKE_HOME") == previous
 
 
-def test_requests_are_capped_and_usage_is_written(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(swebench_run, "MAX_REQUESTS", 1)
+def test_requests_are_capped_and_usage_is_written(tmp_path: Path) -> None:
     turn = ModelTurn(({"type": "text", "text": "done"},), usage=ModelUsage(11, 2, 3, 4))
     path = tmp_path / "usage.jsonl"
-    model = swebench_run.BudgetedModel(ScriptedModel([turn]), path)
+    model = swebench_run.BudgetedModel(ScriptedModel([turn]), path, request_limit=1)
 
     async def run() -> None:
         context = ModelContext("system", "goal", "workspace", (), ())
@@ -208,7 +229,7 @@ def test_container_cleanup_failure_prevents_export(tmp_path: Path) -> None:
     container = client.containers.create.return_value
     container.attrs = {"HostConfig": {"NetworkMode": "bridge"}, "Mounts": []}
     container.remove.side_effect = RuntimeError("failed to remove container")
-    workspace = DockerWorkspace(client, tmp_path / "workspace", "base")
+    workspace = DockerWorkspace(client, tmp_path / "workspace", "base", image="fixture-image")
     with (
         pytest.raises(RuntimeError, match="failed to remove"),
         workspace._container(("true",), bind=False),
@@ -223,7 +244,7 @@ def test_special_files_cannot_be_exported(tmp_path: Path) -> None:
     checkout = tmp_path / "workspace"
     checkout.mkdir()
     os.mkfifo(checkout / "pipe")
-    workspace = DockerWorkspace(Mock(), checkout, "base")
+    workspace = DockerWorkspace(Mock(), checkout, "base", image="fixture-image")
     with pytest.raises(RuntimeError, match="Unsupported workspace file: pipe"):
         workspace.export_patch()
 
@@ -235,7 +256,8 @@ def test_runtime_and_docker_share_checkout_and_export_patch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (task,) = load_swebench_dataset(dataset_snapshot(), "test", [INSTANCE_ID])
+    (task,) = load_swebench_dataset(dataset_snapshot(TASK), "test", [INSTANCE_ID])
+    spec = make_test_spec(task, namespace="swebench", instance_image_tag=TASK.image_tag)
     monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path))
     command = """import errno, os, socket, subprocess, sympy
 from pathlib import Path
@@ -273,7 +295,9 @@ Path('AUTHORS').unlink(); Path('README.md').write_text('modified by test\\n')
     turns.append(ModelTurn(({"type": "text", "text": "done"},), stop_reason="end_turn"))
 
     with closing(docker.from_env()) as client:
-        workspace = DockerWorkspace(client, tmp_path / "workspace", task["base_commit"])
+        workspace = DockerWorkspace(
+            client, tmp_path / "workspace", task["base_commit"], image=spec.instance_image_key
+        )
         workspace.prepare()
         assert workspace.export_patch() == ""
         stats = asyncio.run(
@@ -283,6 +307,7 @@ Path('AUTHORS').unlink(); Path('README.md').write_text('modified by test\\n')
                 "scripted",
                 ScriptedModel(turns),
                 tmp_path,
+                BUDGET,
             )
         )
         assert stats["status"] == "completed"

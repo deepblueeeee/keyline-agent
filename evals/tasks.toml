@@ -1,0 +1,24 @@
+# Small validation dataset. Suite assignments are provisional until repeated live trials.
+[benchmark]
+source = "princeton-nlp/SWE-bench_Lite"
+revision = "6ec7bb89b9342f664a54a6e0a6ea6501d3437cc2"
+
+[[tasks]]
+instance_id = "sympy__sympy-20590"
+suite = "capability"
+image_digest = "sha256:bcdff110a35d19a6838fde5f678d1b5103610234bd034e5703df46878aad3b63"
+tags = ["python", "object-model"]
+
+[[tasks]]
+instance_id = "django__django-10924"
+suite = "regression"
+image_digest = "sha256:dc6669a2d777afce781f68d604e63169639eb1a858242f8531675e66810c37b9"
+tags = ["orm", "field-api"]
+
+[[tasks]]
+instance_id = "pytest-dev__pytest-7571"
+source = "princeton-nlp/SWE-bench_Verified"
+revision = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+suite = "capability"
+image_digest = "sha256:a4cdd92a11a554106948342c614cbcaa9a7fc7f42b261859c9deef149a673cfe"
+tags = ["fixtures", "logging"]

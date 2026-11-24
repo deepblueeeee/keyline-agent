@@ -1,4 +1,4 @@
-"""Run one live Handshake trial and score its patch with the official evaluator."""
+"""Run a serial batch of Handshake SWE-bench trials."""
 
 from __future__ import annotations
 
@@ -9,13 +9,15 @@ import os
 import traceback
 from collections import Counter
 from contextlib import closing
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
+from itertools import product
 from pathlib import Path
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 import docker
+from swebench.harness.test_spec.test_spec import make_test_spec
 from swebench.harness.utils import load_swebench_dataset
 
 from handshake.config.provider import DeepSeekConfig, read_deepseek_api_key
@@ -34,25 +36,31 @@ from handshake.tools.files import file_tool_bindings
 from handshake.tools.registry import ToolRegistry
 from handshake.tools.shell import process_tool_bindings
 
-from .swebench import INSTANCE_ID, dataset_snapshot, evaluate
+from .swebench import dataset_snapshot, evaluate
 from .swebench_workspace import DockerWorkspace
+from .tasks import DEFAULT_DATASET, Task, load_tasks, select_tasks
 
-MAX_REQUESTS = 20
-MAX_STEPS = 16
-AGENT_SECONDS = 480
 MAX_OUTPUT_TOKENS = 8192
 
 
+@dataclass(frozen=True, slots=True)
+class Budget:
+    requests: int = 20
+    steps: int = 16
+    seconds: int = 480
+
+
 class BudgetedModel:
-    def __init__(self, model: ModelAdapter, ledger: Path) -> None:
+    def __init__(self, model: ModelAdapter, ledger: Path, request_limit: int) -> None:
         self.model = model
         self.ledger = ledger
+        self.request_limit = request_limit
         self.requests = 0
         self.responses_with_usage = 0
         self.usage: Counter[str] = Counter()
 
     async def complete(self, context: ModelContext, tools: tuple[ToolDefinition, ...]) -> ModelTurn:
-        if self.requests >= MAX_REQUESTS:
+        if self.requests >= self.request_limit:
             raise ModelProviderError("Evaluation model request budget exhausted")
         self.requests += 1
         record: dict[str, Any] = {"request": self.requests, "usage": None}
@@ -73,7 +81,12 @@ class BudgetedModel:
 
 
 async def run_agent(
-    workspace: DockerWorkspace, goal: str, model_name: str, model: ModelAdapter, directory: Path
+    workspace: DockerWorkspace,
+    goal: str,
+    model_name: str,
+    model: ModelAdapter,
+    directory: Path,
+    budget: Budget,
 ) -> dict[str, Any]:
     registry = ToolRegistry()
     for binding in file_tool_bindings():
@@ -97,13 +110,13 @@ async def run_agent(
     session = Session(workspace.path)
     store.create_session(session)
     run = session.context_scope.new_run(
-        goal, sequence=1, model_name=model_name, max_steps=MAX_STEPS, agent_spec_id=spec.spec_id
+        goal, sequence=1, model_name=model_name, max_steps=budget.steps, agent_spec_id=spec.spec_id
     )
-    observed = BudgetedModel(model, directory / "usage.jsonl")
+    observed = BudgetedModel(model, directory / "usage.jsonl", budget.requests)
     started = monotonic()
     with (directory / "progress.log").open("w", encoding="utf-8", buffering=1) as log:
         try:
-            async with asyncio.timeout(AGENT_SECONDS):
+            async with asyncio.timeout(budget.seconds):
                 await start_run(
                     session,
                     run,
@@ -114,7 +127,7 @@ async def run_agent(
                     emit=lambda text: print(text, file=log),
                 )
         except TimeoutError:
-            run.error = f"Agent exceeded its {AGENT_SECONDS}s evaluation budget"
+            run.error = f"Agent exceeded its {budget.seconds}s evaluation budget"
             if run.status is RunStatus.RUNNING:
                 run.transition(RunStatus.CANCELLED)
                 store.checkpoint_run(session, run)
@@ -145,13 +158,16 @@ async def run_agent(
     }
 
 
-def run_trial(directory: Path) -> dict[str, Any]:
+def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
     directory.mkdir(mode=0o700, parents=True)
     previous_home = os.environ.get("HANDSHAKE_HOME")
     started = monotonic()
     report: dict[str, Any] = {
-        "instance_id": INSTANCE_ID,
+        "instance_id": task.instance_id,
+        "task": task.as_dict(),
+        "budget": asdict(budget),
         "status": "prepare",
+        "agent": None,
         "official_scoring_attempted": False,
         "official": None,
         "resolved": None,
@@ -161,10 +177,17 @@ def run_trial(directory: Path) -> dict[str, Any]:
         config = DeepSeekConfig.from_environment()
         if config.base_url.rstrip("/") != DeepSeekConfig().base_url:
             raise ValueError("This live evaluation requires the approved api.deepseek.com endpoint")
-        (task,) = load_swebench_dataset(dataset_snapshot(), "test", [INSTANCE_ID])
-        report["base_commit"] = task["base_commit"]
+        (instance,) = load_swebench_dataset(dataset_snapshot(task), "test", [task.instance_id])
+        spec = make_test_spec(instance, namespace="swebench", instance_image_tag=task.image_tag)
+        report["base_commit"] = instance["base_commit"]
+        report["image"] = spec.instance_image_key
         with closing(docker.from_env()) as client:
-            workspace = DockerWorkspace(client, directory / "workspace", task["base_commit"])
+            workspace = DockerWorkspace(
+                client,
+                directory / "workspace",
+                instance["base_commit"],
+                image=spec.instance_image_key,
+            )
             workspace.prepare()
             report["status"] = "agent"
             model = DeepSeekAnthropicModel(
@@ -178,7 +201,12 @@ def run_trial(directory: Path) -> dict[str, Any]:
             async def run() -> dict[str, Any]:
                 try:
                     return await run_agent(
-                        workspace, task["problem_statement"], config.model, model, directory
+                        workspace,
+                        instance["problem_statement"],
+                        config.model,
+                        model,
+                        directory,
+                        budget,
                     )
                 finally:
                     await close_model(model)
@@ -189,11 +217,20 @@ def run_trial(directory: Path) -> dict[str, Any]:
             (directory / "candidate.patch").write_bytes(patch.encode("utf-8"))
         if patch:
             report.update(status="scoring", official_scoring_attempted=True)
-            scoring_dir, official, cleanup_error = evaluate(patch, output_dir=directory / "scoring")
+            scoring_dir, official, cleanup_error = evaluate(
+                task, patch, output_dir=directory / "scoring"
+            )
+            resolved = None
+            if (
+                official
+                and official.get("patch_successfully_applied")
+                and "tests_status" in official
+            ):
+                resolved = official["resolved"]
             report.update(
-                status="scored" if official is not None else "scoring_failed",
+                status="scored" if resolved is not None else "scoring_failed",
                 scoring_dir=str(scoring_dir),
-                resolved=official["resolved"] if official is not None else None,
+                resolved=resolved,
                 official=official,
             )
             if cleanup_error is not None:
@@ -213,18 +250,97 @@ def run_trial(directory: Path) -> dict[str, Any]:
     return report
 
 
+def run_batch(
+    tasks: tuple[Task, ...], directory: Path, trials: int, budget: Budget
+) -> dict[str, Any]:
+    directory.mkdir(mode=0o700, parents=True)
+    started = monotonic()
+    results: list[dict[str, Any]] = []
+    interrupted = False
+    try:
+        for task, number in product(tasks, range(1, trials + 1)):
+            artifact_dir = directory / task.instance_id / f"trial-{number:03d}"
+            entry: dict[str, Any] = {
+                "instance_id": task.instance_id,
+                "suite": task.suite,
+                "trial": number,
+                "artifact_dir": str(artifact_dir),
+                "agent": None,
+                "official": None,
+                "resolved": None,
+            }
+            results.append(entry)
+            print(f"{task.instance_id} trial {number}/{trials}: {artifact_dir}", flush=True)
+            try:
+                entry.update(run_trial(task, artifact_dir, budget))
+            except Exception as exc:
+                entry.update(status="error", error=type(exc).__name__)
+            except KeyboardInterrupt:
+                entry["status"] = "interrupted"
+                raise
+    except KeyboardInterrupt:
+        interrupted = True
+
+    counts = Counter(resolved=0, unresolved=0, unscored=0)
+    usage: Counter[str] = Counter()
+    outcomes = {True: "resolved", False: "unresolved", None: "unscored"}
+    for entry in results:
+        counts[outcomes[entry["resolved"]]] += 1
+        usage.update((entry.get("agent") or {}).get("usage") or {})
+    summary = {
+        "task_count": len(tasks),
+        "planned_trials": len(tasks) * trials,
+        "recorded_trials": len(results),
+        "trials_per_task": trials,
+        "interrupted": interrupted,
+        "counts": dict(counts),
+        "tasks": [task.as_dict() for task in tasks],
+        "budget": asdict(budget),
+        "trials": results,
+        "usage": dict(usage) if usage else None,
+        "elapsed_seconds": round(monotonic() - started, 3),
+    }
+    (directory / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--instance-id", action="append", help="Select a task; repeat for multiple"
+    )
+    selection.add_argument("--suite", choices=("regression", "capability"))
+    parser.add_argument("--trials", type=int, default=1)
+    defaults = Budget()
+    parser.add_argument("--max-requests", type=int, default=defaults.requests)
+    parser.add_argument("--max-steps", type=int, default=defaults.steps)
+    parser.add_argument("--agent-seconds", type=int, default=defaults.seconds)
     parser.add_argument(
         "--live", action="store_true", required=True, help="Authorize real API requests"
     )
     args = parser.parse_args()
+    budget = Budget(args.max_requests, args.max_steps, args.agent_seconds)
+    if min(args.trials, budget.requests, budget.steps, budget.seconds) < 1:
+        parser.error("Trials and execution budget limits must be positive")
+    try:
+        tasks = select_tasks(
+            load_tasks(args.dataset), instance_ids=args.instance_id, suite=args.suite
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(str(exc))
     directory = args.output_dir.resolve() / uuid4().hex
-    print(f"Trial directory: {directory}", flush=True)
-    result = run_trial(directory)
-    print(f"Outcome: {result['status']}, resolved: {result['resolved']}")
-    return 0 if result["status"] in {"scored", "empty_patch"} else 2
+    summary = run_batch(tasks, directory, args.trials, budget)
+    print(f"Summary: {directory / 'summary.json'}")
+    if summary["interrupted"]:
+        return 130
+    return (
+        2
+        if any(entry["status"] not in {"scored", "empty_patch"} for entry in summary["trials"])
+        else 0
+    )
 
 
 if __name__ == "__main__":
