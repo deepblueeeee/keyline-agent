@@ -30,6 +30,7 @@ from handshake.models.errors import ModelProviderError
 from handshake.models.protocol import ModelContext, ModelTurn
 from handshake.runtime.agents import main_agent_spec
 from handshake.runtime.loop import start_run
+from handshake.runtime.progress import current_run
 from handshake.runtime.state import RunStatus, Session
 from handshake.storage.sqlite import SQLiteStateStore
 from handshake.tools.files import file_tool_bindings
@@ -39,6 +40,7 @@ from handshake.tools.shell import process_tool_bindings
 from .swebench import dataset_snapshot, evaluate
 from .swebench_workspace import DockerWorkspace
 from .tasks import DEFAULT_DATASET, Task, load_tasks, select_tasks
+from .tool_observations import visible_context
 
 MAX_OUTPUT_TOKENS = 8192
 
@@ -58,6 +60,7 @@ class BudgetedModel:
         self.requests = 0
         self.responses_with_usage = 0
         self.usage: Counter[str] = Counter()
+        self.recorded_tool_definitions = False
 
     async def complete(self, context: ModelContext, tools: tuple[ToolDefinition, ...]) -> ModelTurn:
         if self.requests >= self.request_limit:
@@ -66,6 +69,16 @@ class BudgetedModel:
         record: dict[str, Any] = {"request": self.requests, "usage": None}
         try:
             turn = await self.model.complete(context, tools)
+            if (run := current_run()) is not None and context.goal and turn.tool_calls:
+                # The eval runner uses a single agent with a fixed tool registry.
+                if not self.recorded_tool_definitions:
+                    record["tool_definitions"] = [tool.as_anthropic() for tool in tools]
+                    self.recorded_tool_definitions = True
+                record["tool_decision"] = {
+                    "turn": run.model_turns + 1,
+                    "calls": [asdict(call) for call in turn.tool_calls],
+                    **visible_context(context),
+                }
             if turn.usage is not None:
                 counts = asdict(turn.usage)
                 self.usage.update(counts)

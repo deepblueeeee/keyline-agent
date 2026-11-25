@@ -6,6 +6,7 @@ dependencies = [
     "docker",
     "handshake",
     "huggingface-hub",
+    "jsonschema",
     "requests",
     "swebench==4.1.0",
 ]
