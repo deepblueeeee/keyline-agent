@@ -66,9 +66,18 @@ class BudgetedModel:
         if self.requests >= self.request_limit:
             raise ModelProviderError("Evaluation model request budget exhausted")
         self.requests += 1
-        record: dict[str, Any] = {"request": self.requests, "usage": None}
+        purpose = "compaction" if not context.goal and not tools else "agent"
+        record: dict[str, Any] = {"request": self.requests, "purpose": purpose, "usage": None}
+        started = monotonic()
+        if purpose == "compaction":
+            record["compaction"] = {
+                "input": json.loads(context.messages[0].content[0]["text"]),
+                "output": None,
+            }
         try:
             turn = await self.model.complete(context, tools)
+            if "compaction" in record and not turn.tool_calls and turn.stop_reason != "max_tokens":
+                record["compaction"]["output"] = turn.text
             if (run := current_run()) is not None and context.goal and turn.tool_calls:
                 # The eval runner uses a single agent with a fixed tool registry.
                 if not self.recorded_tool_definitions:
@@ -89,6 +98,8 @@ class BudgetedModel:
             record["error"] = type(exc).__name__
             raise
         finally:
+            if "compaction" in record:
+                record["compaction"]["seconds"] = round(monotonic() - started, 3)
             with self.ledger.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record) + "\n")
 

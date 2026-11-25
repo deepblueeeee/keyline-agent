@@ -1,0 +1,116 @@
+[
+  {
+    "id": "retry-triage",
+    "target_count": 8,
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"Fix retries that exceed the 30 second delay cap in jobs/retry.py. Keep retry_delay(attempt, rng) as the public API. Keep changes within the retry package and its tests."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"read1","name":"read_file","input":{"path":"jobs/retry.py"}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"read1","content":"def retry_delay(attempt, rng):\n    base = min(30, 2 ** attempt)\n    return base + rng.uniform(0, 1)\n\nWORKER_SHUTDOWN_TIMEOUT = 120"}]},
+      {"role":"assistant","content":[{"type":"text","text":"Jitter is added after applying the cap. Clamp the final delay. I ruled out removing jitter because it spreads simultaneous retries."}]},
+      {"role":"user","content":[{"type":"text","text":"One more constraint: add no dependencies. Use a seeded RNG in regression tests and leave the worker shutdown setting alone."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"edit1","name":"edit_file","input":{"path":"jobs/retry.py","old_text":"return base + rng.uniform(0, 1)","new_text":"return min(30, base + rng.uniform(0, 1))"}},{"type":"tool_use","id":"tests1","name":"run_tests","input":{"argv":["python","-m","pytest","tests/test_retry.py","-q"]}},{"type":"tool_use","id":"integration1","name":"run_tests","input":{"argv":["python","-m","pytest","tests/integration/test_jobs.py","-q"]}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"edit1","content":"Applied 1 replacement"},{"type":"tool_result","tool_use_id":"tests1","content":"7 passed in 0.21s"},{"type":"tool_result","tool_use_id":"integration1","is_error":true,"content":"Timeout while bootstrapping the queue fixture. No cases collected."}]},
+      {"role":"assistant","content":[{"type":"text","text":"The source change is in place and seven existing unit tests pass. A dedicated seeded cap regression test still needs to be added. The integration run timed out before collecting any cases."}]},
+      {"role":"user","content":[{"type":"text","text":"For the next step, focus on the dedicated test. Do not retry the integration suite while the queue is offline."}]}
+    ],
+    "facts": [
+      {"id":"api","sequence":0,"fact":"Keep the public signature exactly identifiable as retry_delay(attempt, rng).","literal":"retry_delay(attempt, rng)"},
+      {"id":"decision","sequence":3,"fact":"Clamp the delay after adding jitter. Removing jitter was ruled out to spread simultaneous retries."},
+      {"id":"deps","sequence":4,"fact":"Add no dependencies and leave the worker shutdown setting alone."},
+      {"id":"unit","sequence":6,"fact":"The existing retry unit tests passed, seven in total."},
+      {"id":"integration","sequence":6,"fact":"The jobs integration run timed out in queue fixture startup before collecting any cases."},
+      {"id":"remaining","sequence":7,"fact":"The retry source fix is in place. A dedicated seeded cap regression test is still pending."},
+      {"id":"next","sequence":8,"fact":"Do not retry the integration suite while the queue is offline."}
+    ]
+  },
+  {
+    "id": "cli-configuration",
+    "target_count": 5,
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"Add a --profile flag to the exporter. Old invocations must keep the default output path and format."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"search1","name":"search_files","input":{"query":"resolve_config"}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"search1","content":"src/exporter/cli.py:41:def resolve_config(profile):\nsrc/exporter/tests/test_cli.py:87:assert opts.format == 'jsonl'"}]},
+      {"role":"user","content":[{"type":"text","text":"Update: use --preset as the flag name. Settings are already loaded from settings.toml. Environment variables should keep their existing precedence."}]},
+      {"role":"assistant","content":[{"type":"text","text":"The final flag is --preset. Reuse resolve_config in src/exporter/cli.py and leave env override order unchanged. The investigation is complete and no files have changed. Compatibility tests and the new flag are both pending."}]}
+    ],
+    "facts": [
+      {"id":"flag","sequence":3,"fact":"The final public flag is --preset, replacing the initial --profile proposal."},
+      {"id":"defaults","sequence":0,"fact":"Default output path and JSONL format must remain compatible for old invocations."},
+      {"id":"precedence","sequence":3,"fact":"Reuse settings.toml configuration and preserve environment-variable precedence."},
+      {"id":"progress","sequence":4,"fact":"Investigation finished. Implementation and compatibility tests are pending."}
+    ]
+  },
+  {
+    "id": "migration-checkpoint",
+    "target_count": 5,
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"Add nullable source_id to the event model. Defer any historical backfill to a separate review. Keep old databases readable."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"migration","name":"write_file","input":{"path":"migrations/0042_event_source.py","content":"operations = [AddField('event', 'source_id', nullable=True)]"}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"migration","content":"Wrote migrations/0042_event_source.py"}]},
+      {"role":"assistant","content":[{"type":"text","text":"The migration file exists. I have not run it against a database. A SQLite migration round-trip and reading a pre-migration event are the two pending checks."}]},
+      {"role":"user","content":[{"type":"text","text":"Please keep fixtures with source_id unset. Production migrations are out of scope for this session."}]},
+      {"role":"assistant","content":[{"type":"text","text":"I will add the fixtures next."}]}
+    ],
+    "facts": [
+      {"id":"schema","sequence":0,"fact":"Add a nullable source_id and keep old databases readable."},
+      {"id":"path","sequence":2,"fact":"The exact migration path is migrations/0042_event_source.py.","literal":"migrations/0042_event_source.py"},
+      {"id":"progress","sequence":3,"fact":"The migration file was written. Database application and both validation checks are pending."},
+      {"id":"limits","sequence":4,"fact":"Fixtures leave source_id unset and this session excludes production migrations."},
+      {"id":"backfill","sequence":0,"fact":"Historical backfill was deferred to a separate review."}
+    ]
+  },
+  {
+    "id": "cache-investigation",
+    "target_count": 5,
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"Investigate stale dashboard totals. This is a read-only investigation. Find the invalidation gap and avoid a full cache flush."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"search","name":"run_shell","input":{"argv":["rg","dashboard_totals","src | head -30"]}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"search","is_error":true,"content":"rg: src | head -30: No such file or directory"}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"recover","name":"search_files","input":{"query":"dashboard_totals","path":"src"}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"recover","content":"src/billing/adjustments.py:61: publish('invoice.adjusted')\nsrc/dashboard/cache.py:78: subscribe('invoice.posted', invalidate_dashboard_totals)\nsrc/dashboard/cache.py:81: subscribe('invoice.deleted', invalidate_dashboard_totals)\nNo adjustment subscriber was found."}]}
+    ],
+    "facts": [
+      {"id":"scope","sequence":0,"fact":"The investigation is read-only and a full cache flush is excluded."},
+      {"id":"error","sequence":2,"fact":"The search passed the pipe expression as a literal argv path and failed."},
+      {"id":"finding","sequence":4,"fact":"Adjustments publish invoice.adjusted and the cache subscribes only to posted and deleted events in the inspected code."},
+      {"id":"file","sequence":4,"fact":"The exact cache implementation path is src/dashboard/cache.py.","literal":"src/dashboard/cache.py"}
+    ]
+  },
+  {
+    "id": "noisy-build",
+    "target_count": 4,
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"Diagnose why the release builder mislabels a mixed result as green. Keep artifacts generated for all targets. Report the failing target and next check."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"build","name":"run_shell","input":{"argv":["python","tools/build_release.py","--all-targets"]}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"build","is_error":true,"content":"[prepare] cache hit compiler-runtime; cache hit headers; cache hit locale; cache hit examples; cache hit fixture catalog\n[linux-x64] compile unit session 1 OK; compile unit session 2 OK; compile unit session 3 OK; compile unit session 4 OK; compile unit session 5 OK\n[linux-x64] copy resources: flags.json, strings.json, localization.json, examples.json, fonts.json, render.json, colors.json\n[linux-x64] package dist/linux-x64.tar; sha verified\n[mac-arm64] compile unit session 1 OK; compile unit session 2 OK; compile unit session 3 OK; compile unit session 4 OK; compile unit session 5 OK\n[mac-arm64] copy resources: flags.json, strings.json, localization.json, examples.json, fonts.json, render.json, colors.json\n[mac-arm64] package dist/mac-arm64.tar; sha verified\n[windows-x64] compile unit session 1 OK; compile unit session 2 OK; compile unit session 3 OK; compile unit session 4 OK; compile unit session 5 OK\n[windows-x64] copy resources: flags.json, strings.json, localization.json, examples.json, fonts.json, render.json, colors.json\n[windows-x64] signing failed: RELEASE_E_SIGN_PATH (input lacks .exe suffix)\n[summary] displayed overall green; exit code 1; 2 signed targets, 1 unsigned target\n[cleanup] scratch files cleared, existing dist artifacts retained"}]},
+      {"role":"assistant","content":[{"type":"text","text":"The build succeeded for Linux and macOS. Windows produced an unsigned artifact because signing rejected its path. Next inspect aggregate_status in tools/build_release.py. I have not modified files."}]}
+    ],
+    "facts": [
+      {"id":"artifacts","sequence":0,"fact":"Keep artifacts generated for every build target."},
+      {"id":"failure","sequence":2,"fact":"Windows x64 signing failed because the input lacked the .exe suffix. Linux x64 and macOS ARM64 passed."},
+      {"id":"code","sequence":2,"fact":"The exact diagnostic code is RELEASE_E_SIGN_PATH.","literal":"RELEASE_E_SIGN_PATH"},
+      {"id":"green","sequence":2,"fact":"The summary displayed green despite a nonzero exit and one unsigned target."},
+      {"id":"next","sequence":3,"fact":"Inspect aggregate_status in tools/build_release.py. No files have changed."}
+    ]
+  },
+  {
+    "id": "review-handoff-history",
+    "target_count": 6,
+    "messages": [
+      {"role":"user","content":[{"type":"text","text":"Review a proposed timeout fix. Only change the client timer if evidence supports it. The protocol retry policy is frozen during this release."}]},
+      {"role":"assistant","content":[{"type":"text","text":"Initial suspect: the client resets the timer between retries. I will check the trace before recommending a change."}]},
+      {"role":"assistant","content":[{"type":"tool_use","id":"trace","name":"read_file","input":{"path":"tests/fixtures/timeout.trace"}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"trace","content":"0ms allocate timer deadline=600ms\n180ms retry attempt=2 deadline=600ms\n505ms retry attempt=3 deadline=600ms\n600ms timeout fired\n790ms late success callback enqueued"}]},
+      {"role":"assistant","content":[{"type":"text","text":"The trace refutes the timer reset hypothesis. The deadline stays at 600ms. The late success callback is queued at 790ms after timeout. Leave the timer alone and examine client/callbacks.py for an expired-request guard."}]},
+      {"role":"user","content":[{"type":"text","text":"Keep this review-only. The callbacks owner will make any patch after we confirm the reproduction."}]},
+      {"role":"assistant","content":[{"type":"text","text":"I will prepare a minimal reproduction and send the trace findings to the owner."}]}
+    ],
+    "facts": [
+      {"id":"frozen","sequence":0,"fact":"Protocol retry policy is frozen for the release."},
+      {"id":"hypothesis","sequence":4,"fact":"Timer reset was investigated and refuted. The deadline stayed at 600ms across retries."},
+      {"id":"signal","sequence":4,"fact":"The success callback was queued at 790ms after the timeout at 600ms."},
+      {"id":"decision","sequence":4,"fact":"Leave the timer unchanged and investigate the expired-request guard in client/callbacks.py."},
+      {"id":"owner","sequence":5,"fact":"Keep work review-only. The callbacks owner will patch after reproduction is confirmed."}
+    ]
+  }
+]
