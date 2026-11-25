@@ -53,10 +53,15 @@ class Budget:
 
 
 class BudgetedModel:
-    def __init__(self, model: ModelAdapter, ledger: Path, request_limit: int) -> None:
+    def __init__(
+        self, model: ModelAdapter, ledger: Path, request_limit: int, *,
+        run_id: str | None = None, model_name: str | None = None,
+    ) -> None:
         self.model = model
         self.ledger = ledger
         self.request_limit = request_limit
+        self.run_id = run_id or uuid4().hex
+        self.model_name = model_name
         self.requests = 0
         self.responses_with_usage = 0
         self.usage: Counter[str] = Counter()
@@ -67,7 +72,10 @@ class BudgetedModel:
             raise ModelProviderError("Evaluation model request budget exhausted")
         self.requests += 1
         purpose = "compaction" if not context.goal and not tools else "agent"
-        record: dict[str, Any] = {"request": self.requests, "purpose": purpose, "usage": None}
+        record: dict[str, Any] = {
+            "run_id": self.run_id, "model": self.model_name,
+            "request": self.requests, "purpose": purpose, "usage": None,
+        }
         started = monotonic()
         if purpose == "compaction":
             record["compaction"] = {
@@ -136,7 +144,9 @@ async def run_agent(
     run = session.context_scope.new_run(
         goal, sequence=1, model_name=model_name, max_steps=budget.steps, agent_spec_id=spec.spec_id
     )
-    observed = BudgetedModel(model, directory / "usage.jsonl", budget.requests)
+    observed = BudgetedModel(
+        model, directory / "usage.jsonl", budget.requests, run_id=run.run_id, model_name=model_name,
+    )
     started = monotonic()
     with (directory / "progress.log").open("w", encoding="utf-8", buffering=1) as log:
         try:

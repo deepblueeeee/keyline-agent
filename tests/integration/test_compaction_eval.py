@@ -189,6 +189,7 @@ def test_trace_rollup_and_missing_judge_grade(tmp_path: Path) -> None:
     args = argparse.Namespace(sample=None, saved=None, trial=tmp_path, judge_model=None)
     report = asyncio.run(compaction.run(args))
     assert report["agent"]["requests"] == 1
+    assert report["run_id"] == model.run_id
     (entry,) = report["samples"]
     assert entry["compaction"]["requests"] == 1
     assert entry["source_ranges"] == [[0, 5]]

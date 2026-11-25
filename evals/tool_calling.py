@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 from collections import Counter
+from hashlib import sha256
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -202,7 +203,11 @@ def summarize(calls: list[dict[str, Any]], trial_id: str, judge: dict[str, Any])
             "redundant": redundant,
             "rate_among_judged_candidates": redundant / len(compared) if compared else None,
         },
-        "context_budget": {"visible_blocks": VISIBLE_BLOCKS, "excerpt_chars": EXCERPT_CHARS},
+        "context_budget": {
+            "visible_blocks": VISIBLE_BLOCKS,
+            "excerpt_chars": EXCERPT_CHARS,
+            "batch_size": BATCH_SIZE,
+        },
     }
 
 
@@ -236,6 +241,7 @@ def main() -> None:
 
     judge = asyncio.run(score())
     judge["model"] = config.model if calls else None
+    judge["rubric_digest"] = sha256(RUBRIC.read_bytes()).hexdigest()
     result = summarize(calls, payload["trial_id"], judge)
     output = args.output or args.trial / "tool_calling.json"
     output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

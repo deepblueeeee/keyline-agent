@@ -7,6 +7,7 @@ import asyncio
 import json
 from collections import Counter
 from contextlib import suppress
+from hashlib import sha256
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -32,7 +33,9 @@ def read_records(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-async def generate(sample: dict[str, Any], model: ModelAdapter, artifact: Path) -> dict[str, Any]:
+async def generate(
+    sample: dict[str, Any], model: ModelAdapter, artifact: Path, *, model_name: str | None = None,
+) -> dict[str, Any]:
     from .swebench_run import BudgetedModel
 
     history = tuple(
@@ -40,7 +43,7 @@ async def generate(sample: dict[str, Any], model: ModelAdapter, artifact: Path) 
         for i, message in enumerate(sample["messages"])
     )
     artifact.touch(mode=0o600, exist_ok=False)
-    condenser = LLMHistoryCondenser(BudgetedModel(model, artifact, request_limit=1))
+    condenser = LLMHistoryCondenser(BudgetedModel(model, artifact, 1, model_name=model_name))
     with suppress(ModelProtocolError, ModelProviderError):
         # The original request, result, and usage remain available in the ledger.
         await condenser.compact_raw((), history[: sample["target_count"]])
@@ -221,7 +224,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         artifact = args.output.with_suffix(".capture.jsonl")
         compactor = connect(args.compaction_model)
         try:
-            records = [await generate(sample, compactor, artifact)]
+            records = [
+                await generate(sample, compactor, artifact, model_name=args.compaction_model)
+            ]
         finally:
             await close_model(compactor)
     else:
@@ -243,13 +248,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             await close_model(judge)
     return {
         "artifact": str(artifact.resolve()),
+        "run_id": records[0].get("run_id") if records else None,
         "rubric": RUBRIC.name,
+        "rubric_digest": sha256(RUBRIC.read_bytes()).hexdigest(),
         "status": "evaluated" if captures else "not_applicable",
         "samples": scored,
         "agent": {"requests": len(agent), "usage": dict(usage) or None}
         if generating or agent or captures
         else None,
-        "compaction_model": args.compaction_model if generating else None,
+        "compaction_model": records[0].get("model") if records else None,
         "judge_model": args.judge_model,
         "scope": "condenser inputs and proposals; runtime acceptance is not measured",
     }
