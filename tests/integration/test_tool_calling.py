@@ -152,19 +152,27 @@ def test_no_calls_are_explicitly_unscored() -> None:
     assert empty["redundancy"]["rate_among_judged_candidates"] is None
 
 
-def test_invalid_judge_json_keeps_usage_and_other_batches(trial: Path) -> None:
+@pytest.mark.parametrize(
+    ("stop_reason", "error"), [("end_turn", "invalid_json"), ("max_tokens", "truncated_output")]
+)
+def test_invalid_judge_json_keeps_usage_and_other_batches(
+    trial: Path, stop_reason: str, error: str,
+) -> None:
     _, payload = tool_calling.prepare(trial)
     payload["batches"] = payload["batches"][:2]
     first, second = (batch["calls"][0]["id"] for batch in payload["batches"])
     judge = ScriptedModel([
-        ModelTurn(({"type": "text", "text": '{"grades":['},), usage=ModelUsage(7, 3)),
+        ModelTurn(
+            ({"type": "text", "text": '{"grades":['},),
+            stop_reason=stop_reason, usage=ModelUsage(7, 3),
+        ),
         _response([{
             "id": second,
             "selection": {"score": 3, "reason": "Limited relevance", "evidence": [second]},
         }]),
     ])
     result = asyncio.run(tool_calling.score_batches(judge, payload))
-    assert result["errors"] == [{"ids": [first], "error": "invalid_json"}]
+    assert result["errors"] == [{"ids": [first], "error": error}]
     assert set(result["grades"]) == {second}
     assert result["responses_with_usage"] == 2
     assert result["usage"]["input_tokens"] == 18

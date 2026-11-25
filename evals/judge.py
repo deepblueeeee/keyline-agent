@@ -37,5 +37,6 @@ async def judge_json(
     try:
         data = json.loads(turn.text.removeprefix("```json\n").removesuffix("\n```"))
     except json.JSONDecodeError:
-        return None, usage, "invalid_json"
+        error = "truncated_output" if turn.stop_reason == "max_tokens" else "invalid_json"
+        return None, usage, error
     return (data, usage, None) if isinstance(data, dict) else (None, usage, "expected_object")

@@ -23,6 +23,7 @@ from .tool_observations import EXCERPT_CHARS, VISIBLE_BLOCKS
 
 RUBRIC = Path(__file__).with_name("tool_calling_prompt.txt")
 BATCH_SIZE = 6
+MAX_JUDGE_OUTPUT_TOKENS = 8192
 
 
 def prepare(directory: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -207,6 +208,7 @@ def summarize(calls: list[dict[str, Any]], trial_id: str, judge: dict[str, Any])
             "visible_blocks": VISIBLE_BLOCKS,
             "excerpt_chars": EXCERPT_CHARS,
             "batch_size": BATCH_SIZE,
+            "max_output_tokens": MAX_JUDGE_OUTPUT_TOKENS,
         },
     }
 
@@ -232,7 +234,8 @@ def main() -> None:
         key = read_deepseek_api_key()
         check_judge_input(json.dumps(payload), key)
         model = DeepSeekAnthropicModel(
-            api_key=key, model=config.model, max_tokens=4096, max_retries=0, timeout_seconds=60
+            api_key=key, model=config.model, max_tokens=MAX_JUDGE_OUTPUT_TOKENS,
+            max_retries=0, timeout_seconds=60,
         )
         try:
             return await score_batches(model, payload)

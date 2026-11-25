@@ -16,7 +16,7 @@ import docker  # noqa: E402
 from swebench.harness.test_spec.test_spec import make_test_spec  # noqa: E402
 from swebench.harness.utils import load_swebench_dataset  # noqa: E402
 
-from evals import swebench, swebench_run  # noqa: E402
+from evals import swebench, swebench_run, swebench_workspace  # noqa: E402
 from evals.swebench import dataset_snapshot  # noqa: E402
 from evals.swebench_workspace import DockerWorkspace  # noqa: E402
 from evals.tasks import load_tasks  # noqa: E402
@@ -58,10 +58,20 @@ def trial_workspace(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return workspace
 
 
-def test_exported_crlf_patch_reaches_evaluator_unchanged(
+@pytest.mark.parametrize(
+    ("original", "changed", "binary"),
+    [
+        (b"first\r\nsecond\r\n", b"first\r\nchanged\r\n", False),
+        (b"caf\xe9\nold\n", b"caf\xe9\nnew\n", True),
+    ],
+)
+def test_exported_patch_preserves_file_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     trial_workspace: Mock,
+    original: bytes,
+    changed: bytes,
+    binary: bool,
 ) -> None:
     checkout = tmp_path / "workspace"
     checkout.mkdir()
@@ -77,7 +87,7 @@ def test_exported_crlf_patch_reaches_evaluator_unchanged(
 
     git("init", "-q")
     git("config", "core.autocrlf", "false")
-    (checkout / "example.txt").write_bytes(b"first\r\nsecond\r\n")
+    (checkout / "example.txt").write_bytes(original)
     git("add", ".")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.org", "commit", "-qm", "base")
     base = git("rev-parse", "HEAD").decode().strip()
@@ -85,19 +95,47 @@ def test_exported_crlf_patch_reaches_evaluator_unchanged(
     shutil.copytree(checkout, scorer)
     shutil.copytree(checkout / ".git", tmp_path / "baseline.git")
 
-    (checkout / "example.txt").write_bytes(b"first\r\nchanged\r\n")
+    attributes = tmp_path / "baseline.git" / "info" / "attributes"
+    attributes.write_bytes(b"example.txt diff\n")
+    (checkout / "example.txt").write_bytes(changed)
     expected = git("diff", "--binary")
     patch = DockerWorkspace(Mock(), checkout, base, image="fixture-image").export_patch()
+    assert attributes.read_bytes() == b"example.txt diff\n"
     run = subprocess.run
 
     def official_cli(command: list[str], *, cwd: Path, **kwargs: object) -> None:
         prediction = json.loads((cwd / "predictions.jsonl").read_text(encoding="utf-8"))
         data = prediction["model_patch"].encode("utf-8")
-        assert data == expected
-        run(["git", "apply", "--check", "-"], cwd=scorer, input=data, check=True)
+        if binary:
+            assert b"GIT binary patch" in data
+        else:
+            assert data == expected
+        run(["git", "apply", "-"], cwd=scorer, input=data, check=True)
+        assert (scorer / "example.txt").read_bytes() == changed
 
     monkeypatch.setattr(subprocess, "run", official_cli)
     swebench.evaluate(TASK, patch, output_dir=tmp_path / "results")
+
+
+@pytest.mark.parametrize(("http_status", "expected_attempts"), [(500, 3), (401, 1)])
+def test_pinned_image_pull_retries_transient_errors_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, http_status: int, expected_attempts: int
+) -> None:
+    pause = Mock()
+    monkeypatch.setattr(swebench_workspace, "sleep", pause)
+    client = Mock()
+    client.images.get.side_effect = docker.errors.ImageNotFound("not cached")
+    error = docker.errors.APIError("pull failed", response=Mock(status_code=http_status))
+    client.images.pull.side_effect = error
+    workspace = DockerWorkspace(client, tmp_path, "base", image="fixture:latest@sha256:pin")
+
+    with pytest.raises(docker.errors.APIError) as caught:
+        workspace._ensure_image()
+
+    assert caught.value is error
+    assert client.images.pull.call_count == expected_attempts
+    client.images.pull.assert_called_with("fixture@sha256:pin", platform="linux/amd64")
+    assert pause.call_count == expected_attempts - 1
 
 
 def test_empty_patch_is_not_an_official_unresolved_result(

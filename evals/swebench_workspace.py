@@ -10,11 +10,11 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryFile
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 
 from docker import DockerClient
-from docker.errors import DockerException, ImageNotFound
+from docker.errors import APIError, DockerException, ImageNotFound
 from docker.models.containers import Container
 from docker.types import LogConfig, Mount
 from requests.exceptions import ConnectionError as DockerConnectionError
@@ -24,6 +24,7 @@ from handshake.runtime.state import ToolResult
 
 _TESTBED = "/testbed"
 _PATH = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
+_RETRYABLE_IMAGE_ERRORS = {408, 429, 500, 502, 503, 504}
 
 
 class DockerWorkspace:
@@ -99,11 +100,27 @@ class DockerWorkspace:
             if bind:
                 self._check_checkout_files()
 
+    def _ensure_image(self) -> None:
+        for attempt in range(3):
+            try:
+                try:
+                    self.client.images.get(self.image)
+                except ImageNotFound:
+                    pinned = self.image.replace(":latest@", "@")
+                    self.client.images.pull(pinned, platform="linux/amd64")
+                    self.client.images.get(self.image)
+            except (ImageNotFound, DockerConnectionError, ReadTimeout):
+                if attempt == 2:
+                    raise
+            except APIError as exc:
+                if attempt == 2 or exc.status_code not in _RETRYABLE_IMAGE_ERRORS:
+                    raise
+            else:
+                return
+            sleep(2**attempt)
+
     def prepare(self) -> None:
-        try:
-            self.client.images.get(self.image)
-        except ImageNotFound:
-            self.client.images.pull(self.image.replace(":latest@", "@"), platform="linux/amd64")
+        self._ensure_image()
         # Upload-pack sends only the base snapshot. Copying /testbed/.git directly can
         # expose unrelated refs and objects from the official scoring image.
         command = (
@@ -191,6 +208,19 @@ class DockerWorkspace:
             raise RuntimeError("Cannot export a checkout still in use by a command container")
         self._check_checkout_files()
         self._git("add", "-A")
-        return self._git(
-            "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", self.base_commit
-        ).decode("utf-8")
+        args = ("diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", self.base_commit)
+        try:
+            return self._git(*args).decode("utf-8")
+        except UnicodeDecodeError:
+            # Predictions are UTF-8 JSON. Git binary patches preserve non-UTF-8 file bytes.
+            attributes = self.git_dir / "info" / "attributes"
+            original = attributes.read_bytes() if attributes.exists() else None
+            attributes.parent.mkdir(exist_ok=True)
+            try:
+                attributes.write_bytes((original or b"") + b"\n* -diff\n")
+                return self._git(*args).decode("utf-8")
+            finally:
+                if original is None:
+                    attributes.unlink(missing_ok=True)
+                else:
+                    attributes.write_bytes(original)
