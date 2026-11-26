@@ -17,6 +17,7 @@ from handshake.config import credentials as provider_credentials
 from handshake.config.approval import ApprovalMode
 from handshake.context import AgentContextManager
 from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
+from handshake.models.scripted import ScriptedModel
 from handshake.runtime.state import (
     DependencyStatus,
     RunStatus,
@@ -504,6 +505,40 @@ def test_run_answers_text_wait_and_finishes_in_same_process(
     assert "User response: navy" in history(store, session)[-2].content[0]["text"]
 
 
+def test_cli_reopens_the_same_run_after_disabling_its_turn_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "state"
+    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
+    call = ToolCall("write", "write_file", {"path": "result.txt", "content": "first"})
+    turn = ModelTurn(({
+        "type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments,
+    },), (call,), "tool_use")
+    monkeypatch.setattr(cli, "_create_real_model", lambda _: ScriptedModel([turn]))
+    assert cli.main(["run", str(tmp_path), "write", "--max-steps", "1"]) == 2
+    store = _store(home)
+    (paused,) = store.list_runs()
+    result = tmp_path / "result.txt"
+    assert paused.status is RunStatus.PAUSED and result.read_text() == "first"
+    result.write_text("kept across resume")
+
+    monkeypatch.setattr(cli, "_create_real_model", lambda _: pytest.fail("Run is still paused"))
+    resume = ["resume", paused.session_id]
+    assert cli.main(resume) == 2
+    assert cli.main([*resume, "--max-steps", "1"]) == 2
+    assert store.load_run(paused.run_id).status is RunStatus.PAUSED
+
+    model = ScriptedModel([_finish("done")])
+    monkeypatch.setattr(cli, "_create_real_model", lambda _: model)
+    assert cli.main([*resume, "--max-steps", "0", "--run-id", paused.run_id]) == 0
+    (completed,) = store.list_runs()
+    assert completed.run_id == paused.run_id and completed.status is RunStatus.COMPLETED
+    assert completed.model_turns == 2 and completed.max_steps == 0
+    assert result.read_text() == "kept across resume"
+    assert model.contexts[0].messages[-1].content[0]["tool_use_id"] == call.id
+
+
 def test_multiple_waits_resume_after_partial_input_across_cli_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -720,7 +755,7 @@ def test_interactive_session_creates_followup_run_with_full_history(
     assert exit_code == 0
     assert [run.goal for run in runs] == ["first request", "second request"]
     assert runs[1].context_scope_id == runs[0].context_scope_id
-    assert runs[1].max_steps == 9
+    assert runs[0].max_steps == 9 and runs[1].max_steps == 0
     assert runs[1].model_turns == 1
     messages = second_model.contexts[0].messages
     assert [message.run_id for message in messages] == [

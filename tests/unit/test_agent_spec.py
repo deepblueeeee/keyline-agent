@@ -42,7 +42,7 @@ def test_agent_spec_holds_stable_configuration() -> None:
     )
     assert spec.spec_id == "reader"
     assert spec.instructions == "Read the code."
-    assert spec.default_max_steps == 50
+    assert spec.default_max_steps == 0
     assert spec.allowed_tools == {"read_file", "search_files"}
 
 
@@ -75,7 +75,7 @@ def test_agent_spec_rejects_invalid_configuration() -> None:
     with pytest.raises(ValueError):
         AgentSpec("", "model", "prompt")
     with pytest.raises(ValueError):
-        AgentSpec("reader", "model", "prompt", default_max_steps=0)
+        AgentSpec("reader", "model", "prompt", default_max_steps=-1)
 
 
 def test_model_selection_uses_current_spec_for_bound_runs(tmp_path) -> None:

@@ -20,7 +20,6 @@ from handshake.models.protocol import ModelContext, ModelMessage, ToolCall
 from handshake.runtime.agents import AgentSpec, model_name_for_run
 from handshake.runtime.errors import (
     AgentLoopError,
-    StepLimitExceededError,
     ToolOutcomeUnknownError,
     UserCancelledError,
 )
@@ -355,15 +354,17 @@ async def _run_turns(
         and (delegation is not None or definition.name not in WORKTREE_TOOL_NAMES)
     )
     while True:
+        if run.max_steps and run.model_turns >= run.max_steps:
+            run.transition(RunStatus.PAUSED)
+            _checkpoint(session, run, store, context_manager, [])
+            emit(f"Model turn limit reached ({run.max_steps})")
+            return run
         pending_messages: list[ModelMessage] = []
         messages_after_checkpoint: list[str] = []
         return_after_checkpoint = False
         try:
-            if run.model_turns >= run.max_steps:
-                raise StepLimitExceededError(
-                    f"Agent exceeded the maximum of {run.max_steps} model turns"
-                )
-            emit(f"Model turn {run.model_turns + 1}/{run.max_steps}")
+            limit = f"/{run.max_steps}" if run.max_steps else ""
+            emit(f"Model turn {run.model_turns + 1}{limit}")
             context = await _prepare_model_context(
                 session, run, definitions, agent_spec.instructions, store, context_manager,
                 workspace,
@@ -568,8 +569,8 @@ async def start_run(
     """Start one user-request run and execute until terminal state or a wait."""
     scheduler = scheduler or (delegation.scheduler if delegation else CooperativeScheduler())
     with scheduler.run_scope(run):
-        if run.max_steps < 1:
-            raise ValueError("max_steps must be >= 1")
+        if run.max_steps < 0:
+            raise ValueError("max_steps must be >= 0")
         if run.status is not RunStatus.CREATED:
             raise AgentLoopError("Only a newly created run can be started")
         if run.session_id != session.session_id:

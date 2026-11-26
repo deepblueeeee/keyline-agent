@@ -53,7 +53,7 @@ from handshake.runtime.loop import (
 )
 from handshake.runtime.persistence import RunStore
 from handshake.runtime.progress import RunReporter, current_run, format_run_message
-from handshake.runtime.recovery import resume_run
+from handshake.runtime.recovery import resume_run, update_paused_step_limit
 from handshake.runtime.runs import (
     create_followup_run,
     create_initial_run,
@@ -328,6 +328,8 @@ async def _drive_run(
             delegation=delegation,
             pending_messages=(continuation,),
         )
+    if run.status is RunStatus.PAUSED:
+        return _WAITING_EXIT_CODE, run
     if run.status is not RunStatus.COMPLETED:
         raise HandshakeError(f"Run {run.run_id} stopped in unsupported state {run.status.value}")
     _print_final_summary(run)
@@ -382,6 +384,9 @@ async def _process_current_run(
     scheduler: CooperativeScheduler | None = None,
     terminal: TerminalInput | None = None,
 ) -> tuple[int, Run]:
+    if run.status is RunStatus.PAUSED:
+        print(format_run_message(run, "Adjust the turn limit with resume --max-steps."))
+        return _WAITING_EXIT_CODE, run
     if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         return _print_terminal_run(run), run
     if run.status not in {RunStatus.CREATED, RunStatus.WAITING, RunStatus.RUNNING}:
@@ -501,7 +506,9 @@ async def _drive_session(
         if goal is None:
             return 0
         runs = store.list_runs(session.session_id)
-        run = create_followup_run(session, runs, goal)
+        run = create_followup_run(
+            session, runs, goal, max_steps=_spec_for_run(run, agent_specs).default_max_steps,
+        )
         result_code, run = await _settle_run(
             session,
             run,
@@ -588,6 +595,20 @@ async def _resume_session(args: argparse.Namespace) -> int:
     session = store.load_session(args.session_id)
     if not session.workspace.is_dir():
         raise HandshakeError(f"Repository directory does not exist: {session.workspace}")
+    run_id = getattr(args, "run_id", None)
+    limit = getattr(args, "max_steps", None)
+    if run_id is not None and limit is None:
+        raise HandshakeError("--run-id requires --max-steps")
+    if limit is not None:
+        paused = [
+            run for run in store.list_runs(session.session_id)
+            if run.status is RunStatus.PAUSED and (run_id is None or run.run_id == run_id)
+        ]
+        if not paused:
+            raise HandshakeError("No matching paused run in this session")
+        if len(paused) > 1:
+            raise HandshakeError("More than one run is paused. Select one with --run-id")
+        update_paused_step_limit(session, paused[0], limit, store=store)
     await run_blocking(lambda: reclaim_session_worktrees(session, store, WorktreeManager(), print))
     settings = load_runtime_settings()
     _announce_approval_mode(settings.approval_mode)
@@ -658,7 +679,7 @@ def _inspect_session(args: argparse.Namespace) -> int:
         goal = run.goal.replace("\n", " ")
         print(
             f"  - #{run.sequence} {run.run_id} agent={run.agent_spec_id} [{run.status.value}] "
-            f"{run.model_turns}/{run.max_steps} {goal}"
+            f"{run.model_turns}/{run.max_steps or 'unlimited'} {goal}"
         )
         for dependency in run.open_dependencies():
             print(
@@ -697,7 +718,7 @@ def _inspect_run(args: argparse.Namespace) -> int:
     print(f"Agent:       {run.agent_spec_id}")
     print(f"Parent run:  {run.parent_run_id or '(root)'}")
     print(f"Model:       {run.model_name or '(not recorded)'}")
-    print(f"Model turns: {run.model_turns}/{run.max_steps}")
+    print(f"Model turns: {run.model_turns}/{run.max_steps or 'unlimited'}")
     print(f"Messages:    {message_count}")
     print("Plan:")
     if run.plan:
@@ -865,6 +886,13 @@ def _show_config(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _step_limit(value: str) -> int:
+    limit = int(value)
+    if limit < 0:
+        raise argparse.ArgumentTypeError("Enter a non-negative turn limit (0 for unlimited)")
+    return limit
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="handshake")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -877,11 +905,13 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         help="DeepSeek model name",
     )
-    run_parser.add_argument("--max-steps", type=int)
+    run_parser.add_argument("--max-steps", type=_step_limit, help="model turns (0 = unlimited)")
     run_parser.set_defaults(handler=_run_real)
 
     resume_parser = subparsers.add_parser("resume", help="resume a durable session")
     resume_parser.add_argument("session_id", help="durable session ID")
+    resume_parser.add_argument("--max-steps", type=_step_limit, help="total turns (0 = unlimited)")
+    resume_parser.add_argument("--run-id", help="paused Run to update with --max-steps")
     resume_parser.set_defaults(handler=_resume_session)
 
     list_parser = subparsers.add_parser("list", help="list durable sessions")

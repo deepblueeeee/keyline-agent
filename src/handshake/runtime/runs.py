@@ -50,8 +50,8 @@ def create_child_run(
         raise AgentLoopError("Delegating parent must belong to this session")
     if parent.status is not RunStatus.WAITING:
         raise AgentLoopError("Delegating parent must be waiting for its child")
-    if not agent_spec_id or not tool_call_id or max_steps < 1:
-        raise AgentLoopError("Child needs an agent, tool call, and positive step budget")
+    if not agent_spec_id or not tool_call_id or max_steps < 0:
+        raise AgentLoopError("Child needs an agent, tool call, and non-negative step budget")
     if any(
         run.parent_run_id == parent.run_id and run.delegation_tool_call_id == tool_call_id
         for run in runs
@@ -92,6 +92,8 @@ def create_followup_run(
     session: Session,
     runs: Sequence[Run],
     goal: str,
+    *,
+    max_steps: int = 0,
 ) -> Run:
     """Create a root run after every existing run has terminated."""
     _validate_goal(goal)
@@ -113,7 +115,7 @@ def create_followup_run(
         sequence=latest.sequence + 1,
         agent_spec_id=previous_root.agent_spec_id,
         model_name=previous_root.model_name,
-        max_steps=previous_root.max_steps,
+        max_steps=max_steps,
     )
 
 

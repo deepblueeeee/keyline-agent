@@ -20,7 +20,7 @@ class AgentSpec:
     profile: str = ""
     allowed_tools: frozenset[str] = frozenset()
     default_budget: ContextBudgetPolicy = field(default_factory=ContextBudgetPolicy)
-    default_max_steps: int = 50
+    default_max_steps: int = 0
 
     def __post_init__(self) -> None:
         if not self.spec_id or not self.model_name or not self.instructions:
@@ -30,8 +30,8 @@ class AgentSpec:
         tools = frozenset(self.allowed_tools)
         if any(not isinstance(tool, str) or not tool for tool in tools):
             raise ValueError("Allowed tool names must be non-empty strings")
-        if type(self.default_max_steps) is not int or self.default_max_steps <= 0:
-            raise ValueError("Agent step budget must be positive")
+        if type(self.default_max_steps) is not int or self.default_max_steps < 0:
+            raise ValueError("Agent step budget must be a non-negative integer")
         if self.default_budget.hard_input_tokens <= 0:
             raise ValueError("Agent context budget must allow model input")
         object.__setattr__(self, "allowed_tools", tools)

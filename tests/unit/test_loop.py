@@ -10,12 +10,10 @@ from handshake.models.errors import ModelProtocolError, ModelProviderError
 from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
 from handshake.models.scripted import ScriptedModel
 from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.errors import (
-    StepLimitExceededError,
-    UserCancelledError,
-)
+from handshake.runtime.errors import UserCancelledError
 from handshake.runtime.loop import continue_run, start_run
 from handshake.runtime.persistence import RunStore
+from handshake.runtime.recovery import resume_run, update_paused_step_limit
 from handshake.runtime.runs import create_followup_run
 from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
@@ -56,7 +54,7 @@ def final_turn(text: str = "done") -> ModelTurn:
 
 
 def _session_run(
-    tmp_path: Path, goal: str, *, max_steps: int = 50
+    tmp_path: Path, goal: str, *, max_steps: int = 0
 ) -> tuple[Session, Run, RunStore]:
     session = Session(workspace=tmp_path)
     run = Run(
@@ -69,44 +67,14 @@ def _session_run(
     return session, run, fresh_store(tmp_path, session)
 
 
-class _RecordingStore(SQLiteStateStore):
-    def __init__(
-        self, events: list[str], database: Path, *, fail_checkpoint: bool = False
-    ) -> None:
-        super().__init__(database)
-        self.events = events
-        self.fail_checkpoint = fail_checkpoint
-        self.snapshots: list[
-            tuple[RunStatus, DependencyStatus | None, int]
-        ] = []
-
-    def create_run(
-        self,
-        session: Session,
-        run: Run,
-        messages: tuple[ModelMessage, ...] = (),
-    ) -> tuple[SequencedMessage, ...]:
-        self.events.append("create-run")
-        return super().create_run(session, run, messages)
-
+class _FailingMessageStore(SQLiteStateStore):
     def checkpoint_run(
         self,
         session: Session,
         run: Run,
         messages: tuple[ModelMessage, ...] = (),
     ) -> tuple[SequencedMessage, ...]:
-        dependency_status = (
-            run.dependencies[-1].status if run.dependencies else None
-        )
-        self.snapshots.append(
-            (
-                run.status,
-                dependency_status,
-                self.message_count(run.context_scope_id) + len(messages),
-            )
-        )
-        self.events.append(f"checkpoint:{run.status.value}")
-        if self.fail_checkpoint:
+        if messages:
             raise StorageError("checkpoint unavailable")
         return super().checkpoint_run(session, run, messages)
 
@@ -253,17 +221,43 @@ async def test_step_limit_is_owned_by_run(tmp_path: Path) -> None:
         ]
     )
 
-    with pytest.raises(StepLimitExceededError):
-        await start_run(
-            session,
-            run,
-            model,
-            create_default_registry(lambda _cwd, _argv: True),
-            store=store,
-            agent_spec=TEST_AGENT_SPEC,
-        )
+    registry = create_default_registry(lambda _cwd, _argv: True)
+    await start_run(session, run, model, registry, store=store, agent_spec=TEST_AGENT_SPEC)
+    restored = store.load_run(run.run_id)
+    assert restored.status is RunStatus.PAUSED
+    assert restored.error is None
+    original = tuple(store.read_messages(run.context_scope_id))
 
-    assert run.status is RunStatus.FAILED
+    update_paused_step_limit(session, restored, 2, store=store)
+    restored = store.load_run(run.run_id)
+    assert restored.status is RunStatus.RUNNING
+    await resume_run(
+        session, restored, ScriptedModel([final_turn()]), registry,
+        store=store, agent_spec=TEST_AGENT_SPEC,
+    )
+    completed = store.load_run(run.run_id)
+    assert completed.status is RunStatus.COMPLETED
+    assert completed.model_turns == 2
+    assert [tool.tool_call_id for tool in completed.tool_runs] == ["search"]
+    assert tuple(store.read_messages(run.context_scope_id))[:-1] == original
+
+
+@run_async
+async def test_run_has_no_default_turn_limit(tmp_path: Path) -> None:
+    session = Session(tmp_path)
+    run = Run("Read, then finish", session.session_id, TEST_AGENT_SPEC.spec_id)
+    store = fresh_store(tmp_path, session)
+    (tmp_path / "source.txt").write_text("example")
+    read = tool_turn(ToolCall("read", "read_file", {"path": "source.txt"}))
+
+    await start_run(
+        session, run, ScriptedModel([read] * 51 + [final_turn()]),
+        create_default_registry(lambda _cwd, _argv: True), store=store, agent_spec=TEST_AGENT_SPEC,
+    )
+
+    saved = store.load_run(run.run_id)
+    assert saved.status is RunStatus.COMPLETED
+    assert saved.max_steps == 0 and saved.model_turns == 52
 
 
 @run_async
@@ -663,27 +657,32 @@ async def test_invalid_wait_rejects_entire_wait_batch(tmp_path: Path) -> None:
 async def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
     tmp_path: Path,
 ) -> None:
-    events: list[str] = []
-    session, run, _unused_store = _session_run(tmp_path, "choose a color")
-    store = _RecordingStore(events, tmp_path / "recording.db")
-    store.create_session(session)
+    session, run, store = _session_run(tmp_path, "choose a color")
     wait_model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
     )
+    waiting = "Waiting for text: Which color?"
+    resuming = "Input received; resuming run"
+    completed = "Run completed"
+    notifications: list[tuple[str, RunStatus, DependencyStatus, ModelMessage]] = []
+
+    def emit(message: str) -> None:
+        if message in {waiting, resuming, completed}:
+            saved = store.load_run(run.run_id)
+            notifications.append(
+                (message, saved.status, saved.dependencies[0].status, history(store, session)[-1])
+            )
 
     await start_run(
         session,
         run,
         wait_model,
         create_default_registry(lambda _cwd, _argv: True),
-        emit=events.append,
+        emit=emit,
         store=store,
         agent_spec=TEST_AGENT_SPEC,
     )
 
-    assert events.index("checkpoint:waiting") < events.index(
-        "Waiting for text: Which color?"
-    )
     continuation = resolve_text_dependency(
         session, run, run.dependencies[0].dependency_id, "navy"
     )
@@ -692,30 +691,27 @@ async def test_wait_and_resolution_are_checkpointed_before_they_are_reported(
         run,
         ScriptedModel([final_turn("used navy")]),
         create_default_registry(lambda _cwd, _argv: True),
-        emit=events.append,
+        emit=emit,
         store=store,
         pending_messages=(continuation,),
         agent_spec=TEST_AGENT_SPEC,
     )
 
-    assert store.snapshots == [
-        (RunStatus.WAITING, DependencyStatus.OPEN, 3),
-        (RunStatus.RUNNING, DependencyStatus.SATISFIED, 4),
-        (RunStatus.COMPLETED, DependencyStatus.SATISFIED, 5),
+    assert [(message, status, dependency) for message, status, dependency, _ in notifications] == [
+        (waiting, RunStatus.WAITING, DependencyStatus.OPEN),
+        (resuming, RunStatus.RUNNING, DependencyStatus.SATISFIED),
+        (completed, RunStatus.COMPLETED, DependencyStatus.SATISFIED),
     ]
-    assert events.index("checkpoint:running") < events.index(
-        "Input received; resuming run"
-    )
-    assert events.index("checkpoint:completed") < events.index("Run completed")
+    assert notifications[0][3].content[0]["tool_use_id"] == "ask"
+    assert notifications[1][3] == continuation
+    assert notifications[2][3].content == final_turn("used navy").content
 
 
 @run_async
 async def test_checkpoint_failure_is_not_reclassified_as_run_failure(tmp_path: Path) -> None:
     events: list[str] = []
     session, run, _unused_store = _session_run(tmp_path, "choose a color")
-    store = _RecordingStore(
-        events, tmp_path / "recording-failure.db", fail_checkpoint=True
-    )
+    store = _FailingMessageStore(tmp_path / "checkpoint-failure.db")
     store.create_session(session)
     model = ScriptedModel(
         [tool_turn(ToolCall("ask", "wait_for_text", {"prompt": "Which color?"}))]
@@ -785,15 +781,17 @@ async def test_model_turn_budget_is_preserved_across_wait(tmp_path: Path) -> Non
         "A",
     )
 
-    with pytest.raises(StepLimitExceededError):
-        await continue_run(
-            resumed_session,
-            resumed_run,
-            ScriptedModel([final_turn()]),
-            create_default_registry(lambda _cwd, _argv: True),
-            store=store,
-            pending_messages=(continuation,),
-            agent_spec=TEST_AGENT_SPEC,
-        )
+    resumed_model = ScriptedModel([final_turn()])
+    await continue_run(
+        resumed_session,
+        resumed_run,
+        resumed_model,
+        create_default_registry(lambda _cwd, _argv: True),
+        store=store,
+        pending_messages=(continuation,),
+        agent_spec=TEST_AGENT_SPEC,
+    )
 
-    assert resumed_run.status is RunStatus.FAILED
+    assert resumed_run.status is RunStatus.PAUSED
+    assert not resumed_model.contexts
+    assert history(store, resumed_session)[-1] == continuation

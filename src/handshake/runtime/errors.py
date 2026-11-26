@@ -11,10 +11,6 @@ class ToolExecutionError(HandshakeError):
     """Raised for invalid tool arguments or workspace access."""
 
 
-class StepLimitExceededError(HandshakeError):
-    """Raised when the agent exceeds its configured model-turn budget."""
-
-
 class AgentLoopError(HandshakeError):
     """Raised when the runtime cannot safely continue a run."""
 

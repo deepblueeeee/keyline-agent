@@ -36,7 +36,7 @@ def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, .
     return run, messages
 
 
-def test_followup_run_inherits_config_without_owning_messages(tmp_path: Path) -> None:
+def test_followup_run_inherits_model_and_context_with_a_fresh_step_limit(tmp_path: Path) -> None:
     session = Session(workspace=tmp_path)
     first, messages = _completed_initial_run(session)
     session.context_scope = session.context_scope.advance(first)
@@ -48,7 +48,7 @@ def test_followup_run_inherits_config_without_owning_messages(tmp_path: Path) ->
     assert second.previous_run_id == first.run_id
     assert second.agent_spec_id == first.agent_spec_id
     assert second.model_name == "deepseek-v4-pro"
-    assert second.max_steps == 17
+    assert second.max_steps == 0
     assert second.model_turns == 0
     assert not hasattr(second, "messages")
     assert [message.run_id for message in messages] == [

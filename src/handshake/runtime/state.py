@@ -17,6 +17,7 @@ class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING = "waiting"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -98,6 +99,7 @@ _RUN_TRANSITIONS = {
     RunStatus.CREATED: {RunStatus.RUNNING, RunStatus.CANCELLED},
     RunStatus.RUNNING: {
         RunStatus.WAITING,
+        RunStatus.PAUSED,
         RunStatus.COMPLETED,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
@@ -107,6 +109,7 @@ _RUN_TRANSITIONS = {
         RunStatus.FAILED,
         RunStatus.CANCELLED,
     },
+    RunStatus.PAUSED: {RunStatus.RUNNING},
     RunStatus.COMPLETED: set(),
     RunStatus.FAILED: set(),
     RunStatus.CANCELLED: set(),
@@ -297,7 +300,7 @@ class Run:
     error: str | None = None
     model_name: str = ""
     model_turns: int = 0
-    max_steps: int = 50
+    max_steps: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     workspace_binding: WorkspaceBinding = field(default_factory=WorkspaceBinding)

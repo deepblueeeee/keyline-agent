@@ -34,6 +34,19 @@ from handshake.tools.secret_command import SecretCommandRunner
 if TYPE_CHECKING:
     from handshake.runtime.delegation import DelegationRuntime
 
+
+def update_paused_step_limit(session: Session, run: Run, limit: int, *, store: RunStore) -> None:
+    """Save a new limit and make the paused run runnable if it has room to continue."""
+    if run.session_id != session.session_id or run.status is not RunStatus.PAUSED:
+        raise AgentLoopError("Only a paused run in this session can change its step limit")
+    if limit < 0:
+        raise ValueError("max_steps must be >= 0")
+    run.max_steps = limit
+    if limit == 0 or run.model_turns < limit:
+        run.transition(RunStatus.RUNNING)
+    store.checkpoint_run(session, run)
+
+
 async def resume_run(
     session: Session,
     run: Run,

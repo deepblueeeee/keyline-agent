@@ -26,7 +26,7 @@ from handshake.runtime.agents import child_agent_specs, main_agent_spec
 from handshake.runtime.delegation import DelegationRuntime, continue_delegation
 from handshake.runtime.errors import UserCancelledError
 from handshake.runtime.loop import start_run
-from handshake.runtime.recovery import resume_run
+from handshake.runtime.recovery import resume_run, update_paused_step_limit
 from handshake.runtime.runs import create_child_run
 from handshake.runtime.secret_dependencies import resolve_secret_dependency
 from handshake.runtime.state import (
@@ -1104,9 +1104,10 @@ async def test_finalized_worktree_reclaims_arbitrary_ignored_data(
 
 
 @pytest.mark.parametrize("abandon", [False, True], ids=["integrate", "abandon"])
+@pytest.mark.parametrize("paused", [False, True], ids=["interrupted", "budget-paused"])
 @run_async
 async def test_cleanup_waits_for_bound_reviewer_then_runs_automatically(
-    tmp_path: Path, abandon: bool,
+    tmp_path: Path, abandon: bool, paused: bool,
 ) -> None:
     case = Scenario(tmp_path)
 
@@ -1124,15 +1125,25 @@ async def test_cleanup_waits_for_bound_reviewer_then_runs_automatically(
         async def complete(self, _context, _tools):
             raise KeyboardInterrupt
 
-    with pytest.raises(KeyboardInterrupt):
-        await case.start(Main(), lambda spec: (
-            InterruptedReviewer() if spec.spec_id == "reviewer" else ScriptedModel([
-                turn(ToolCall("write", "write_file", {"path": "new.txt", "content": "kept"})),
-                done(),
-            ])
-        ))
+    read = turn(ToolCall("read", "read_file", {"path": "new.txt"}))
+
+    def children(spec):
+        if spec.spec_id == "reviewer":
+            return ScriptedModel([read]) if paused else InterruptedReviewer()
+        return ScriptedModel([
+            turn(ToolCall("write", "write_file", {"path": "new.txt", "content": "kept"})),
+            done(),
+        ])
+
+    if paused:
+        case.specs["reviewer"] = replace(case.specs["reviewer"], default_max_steps=1)
+        await case.start(Main(), children)
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            await case.start(Main(), children)
     owner, reviewer = case.children()
-    assert reviewer.status is RunStatus.RUNNING
+    assert reviewer.status is (RunStatus.PAUSED if paused else RunStatus.RUNNING)
+    assert "review" not in case.results()
     assert reviewer.workspace_binding.worktree_owner_id == owner.run_id
 
     call = (ToolCall("discard", "cleanup_worktree", {
@@ -1155,11 +1166,22 @@ async def test_cleanup_waits_for_bound_reviewer_then_runs_automatically(
     with pytest.raises(WorktreeUnavailableError, match="closed to new bindings"):
         case.store.create_run(case.session, late)
 
-    reader = ScriptedModel([turn(ToolCall("read", "read_file", {"path": "new.txt"})), done()])
-    resumed = await case.restart_batch(ScriptedModel([done()]), lambda _: reader)
+    if paused:
+        blocked = await case.restart_batch(ScriptedModel([]), lambda _: pytest.fail("Paused child"))
+        assert blocked.status is RunStatus.WAITING and deferred.path.is_dir()
+        update_paused_step_limit(case.session, reviewer, 2, store=case.store)
+    reader = ScriptedModel([done()] if paused else [read, done()])
+    parent_model = ScriptedModel([done()])
+    resumed = await case.restart_batch(parent_model, lambda _: reader)
     assert resumed.status is RunStatus.COMPLETED
     assert Path(reader.contexts[0].workspace) == deferred.path
     assert "kept" in reader.contexts[-1].messages[-1].content[0]["content"]
+    assert [b["tool_use_id"] for b in parent_model.contexts[0].messages[-1].content] == ["review"]
+    handoff = json.loads(case.results()["review"]["content"])
+    assert handoff["run_id"] == reviewer.run_id
+    saved_reviewer = case.store.load_run(reviewer.run_id)
+    assert saved_reviewer.status is RunStatus.COMPLETED and saved_reviewer.model_turns == 2
+    assert [tool.tool_call_id for tool in saved_reviewer.tool_runs] == ["read"]
     cleaned = case.store.load_worktree(owner.run_id)
     assert cleaned is not None and cleaned.cleaned and not cleaned.path.exists()
     assert cleaned.status is expected_status
