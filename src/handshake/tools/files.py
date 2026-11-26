@@ -27,6 +27,9 @@ _DEFAULT_SEARCH_RESULTS = 50
 _DEFAULT_GLOB_PATTERN = "**/*"
 _MAX_RESULTS = 1000
 _MAX_MATCH_CHARACTERS = 500
+_WORKSPACE_PATH_DESCRIPTION = (
+    "Workspace-relative path or absolute path inside the workspace. Do not include '..' segments."
+)
 
 _IGNORED_DIRECTORIES = {
     ".git",
@@ -76,12 +79,14 @@ def _optional_bool(arguments: Mapping[str, Any], name: str, default: bool) -> bo
 def resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
     """Resolve a model path while rejecting every workspace escape route."""
     candidate = Path(raw_path)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise ToolExecutionError("Path must be relative and remain inside the workspace")
+    if ".." in candidate.parts:
+        raise ToolExecutionError("Path must not contain '..'. Use a path inside the workspace.")
     root = workspace.resolve()
     resolved = (root / candidate).resolve(strict=False)
     if not resolved.is_relative_to(root):
-        raise ToolExecutionError("Resolved path escapes the workspace")
+        raise ToolExecutionError(
+            "Resolved path escapes the workspace. Try a workspace-relative path."
+        )
     private_home = (Path.home() / ".handshake").resolve(strict=False)
     if resolved.is_relative_to(private_home):
         raise ToolExecutionError("User configuration and credentials are not workspace files")
@@ -100,13 +105,7 @@ def _open_readable_text(workspace: Path, raw_path: str) -> Iterator[TextIO]:
             yield artifact
         return
 
-    try:
-        path = resolve_workspace_path(workspace, raw_path)
-    except ToolExecutionError:
-        raise ToolExecutionError(
-            "Read path must be relative and remain inside the workspace or use an "
-            "@handshake/artifacts reference; a path that escapes the workspace is rejected"
-        ) from None
+    path = resolve_workspace_path(workspace, raw_path)
     if not path.is_file():
         raise ToolExecutionError(f"File does not exist: {raw_path}")
     with path.open(encoding="utf-8") as stream:
@@ -453,7 +452,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "description": _WORKSPACE_PATH_DESCRIPTION},
                         "pattern": {"type": "string"},
                         "max_results": {
                             "type": "integer",
@@ -480,7 +479,11 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
+                        "path": {
+                            "type": "string",
+                            "description": _WORKSPACE_PATH_DESCRIPTION
+                            + " Also accepts an @handshake/artifacts reference.",
+                        },
                         "start_line": {"type": "integer", "minimum": 1},
                         "end_line": {"type": "integer", "minimum": 1},
                         "start_character": {"type": "integer", "minimum": 1},
@@ -521,7 +524,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "description": _WORKSPACE_PATH_DESCRIPTION},
                         "pattern": {"type": "string"},
                         "case_sensitive": {"type": "boolean"},
                         "max_results": {
@@ -548,7 +551,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "description": _WORKSPACE_PATH_DESCRIPTION},
                         "old_text": {"type": "string", "minLength": 1},
                         "new_text": {"type": "string"},
                         "expected_replacements": {
@@ -573,7 +576,7 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "description": _WORKSPACE_PATH_DESCRIPTION},
                         "content": {"type": "string"},
                     },
                     "required": ["path", "content"],

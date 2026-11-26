@@ -23,18 +23,36 @@ def test_read_search_and_write_file(tmp_path: Path) -> None:
     assert (tmp_path / "new" / "nested.txt").read_text(encoding="utf-8") == "written"
 
 
-def test_path_escape_is_rejected(tmp_path: Path) -> None:
+def test_file_tools_accept_absolute_workspace_paths(tmp_path: Path) -> None:
+    path = tmp_path / "src" / "example.txt"
+    assert write_file(tmp_path, {"path": str(path), "content": "needle\n"}).ok
+    assert read_file(tmp_path, {"path": str(path)}).stdout == "needle\n"
+    assert list_files(tmp_path, {"path": str(path.parent)}).stdout == "src/example.txt"
+    assert search_files(
+        tmp_path, {"path": str(path.parent), "query": "needle"}
+    ).stdout == "src/example.txt:1:needle"
+    assert edit_file(
+        tmp_path, {"path": str(path), "old_text": "needle", "new_text": "edited"}
+    ).ok
+    assert path.read_text(encoding="utf-8") == "edited\n"
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_path_traversal_is_rejected(tmp_path: Path, absolute: bool) -> None:
     from handshake.tools import create_default_registry
 
     registry = create_default_registry(lambda _cwd, _argv: True)
-    result = registry.execute("read_file", tmp_path, {"path": "../outside.txt"})
+    relative = "src/../example.txt"
+    path = str(tmp_path / relative) if absolute else relative
+    result = registry.execute("read_file", tmp_path, {"path": path})
 
     assert not result.ok
-    assert "inside the workspace" in result.stderr
+    assert "must not contain '..'" in result.stderr
 
 
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
 def test_workspace_tools_cannot_read_or_change_user_configuration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absolute: bool
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     private_home = tmp_path / ".handshake"
@@ -44,29 +62,32 @@ def test_workspace_tools_cannot_read_or_change_user_configuration(
     from handshake.tools import create_default_registry
 
     registry = create_default_registry(lambda _cwd, _argv: True)
-    read = registry.execute("read_file", tmp_path, {"path": ".handshake/config.toml"})
-    write = registry.execute(
-        "write_file", tmp_path, {"path": ".handshake/config.toml", "content": "changed"}
-    )
+    path = str(config) if absolute else ".handshake/config.toml"
+    read = registry.execute("read_file", tmp_path, {"path": path})
+    write = registry.execute("write_file", tmp_path, {"path": path, "content": "changed"})
 
     assert not read.ok
     assert not write.ok
+    assert read.stderr == write.stderr
+    assert "User configuration and credentials" in read.stderr
     assert config.read_text(encoding="utf-8") == "[approval]\nmode = 'always_ask'\n"
 
 
-def test_symlink_escape_is_rejected_by_registry(tmp_path: Path) -> None:
+def test_paths_outside_the_workspace_are_rejected(tmp_path: Path) -> None:
     from handshake.tools import create_default_registry
 
-    outside = tmp_path.parent / "outside-handshake-test.txt"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "workspace-sibling.txt"
     outside.write_text("secret", encoding="utf-8")
-    (tmp_path / "link.txt").symlink_to(outside)
+    link = workspace / "link.txt"
+    link.symlink_to(outside)
     registry = create_default_registry(lambda _cwd, _argv: True)
 
-    result = registry.execute("read_file", tmp_path, {"path": "link.txt"})
-
-    assert not result.ok
-    assert "escapes" in result.stderr
-    outside.unlink()
+    for path in (link.name, str(link), str(outside)):
+        result = registry.execute("read_file", workspace, {"path": path})
+        assert not result.ok
+        assert "escapes the workspace" in result.stderr
 
 
 def test_search_skips_binary_files_and_caches(tmp_path: Path) -> None:
@@ -170,7 +191,7 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
     from handshake.tools import create_default_registry
 
     artifact = store_text_artifact("test-result", "recover me")
-    output = home / "artifacts" / "private.txt"
+    (output,) = (home / "artifacts").glob("*/*.txt")
     internal = home / "handshake.db"
     internal.write_text("do not expose", encoding="utf-8")
 
@@ -188,7 +209,7 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
     assert allowed.ok and allowed.stdout == "recover me"
     assert not absolute_rejected.ok
     assert not rejected.ok
-    assert "inside the workspace or use an @handshake/artifacts reference" in rejected.stderr
+    assert "escapes the workspace" in rejected.stderr
     assert not traversal_rejected.ok
     assert "Invalid Handshake artifact reference" in traversal_rejected.stderr
     assert not write_rejected.ok
