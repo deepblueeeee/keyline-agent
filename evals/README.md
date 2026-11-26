@@ -26,11 +26,26 @@ Trial's budget. Each invocation creates a new UUID directory under
 `experiment.json` records the Git commit, UTC start time, model settings, task
 list with dataset revisions and image digests, Trial count and budget.
 
+Each Trial uses one isolated container. File tools and commands share the
+checkout at `/testbed`, with a one-commit Git history. Files created in the
+container, including files under `/tmp`, persist across commands. Each command
+still starts a separate process. The runner exports `candidate.patch` before
+removing the container and submitting the patch for official scoring.
+
+When a Trial pauses at the model-turn limit, `result.json` also records the
+Docker image ID in `workspace_checkpoint`. A Budget Extension can copy the
+Trial's state and artifacts, call `DockerWorkspace.prepare(checkpoint=...)`
+with that ID on the same Docker host, and use `agent_setup` to resume the saved
+Run with the same tool bindings. The checkpoint preserves files and installed
+environments. Retain the Docker image while planning to extend that Trial.
+
 ### Verified80 historical artifacts
 
 The original tree remains at `.handshake/evals/verified80-baseline`.
 The archive and its index are in
 `.handshake/eval-archives/verified80-baseline-2026-11-27`.
+The historical Budget Extension scripts use the runner and workspaces saved
+with those experiments.
 
 ## Score components
 

@@ -12,6 +12,7 @@ from collections import Counter
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from itertools import product
 from pathlib import Path
 from time import monotonic
@@ -30,7 +31,7 @@ from handshake.models.base import ModelAdapter, ToolDefinition, close_model
 from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
 from handshake.models.errors import ModelProviderError
 from handshake.models.protocol import ModelContext, ModelTurn
-from handshake.runtime.agents import main_agent_spec
+from handshake.runtime.agents import AgentSpec, main_agent_spec
 from handshake.runtime.loop import start_run
 from handshake.runtime.progress import current_run
 from handshake.runtime.state import RunStatus, Session
@@ -116,17 +117,12 @@ class BudgetedModel:
                 stream.write(json.dumps(record) + "\n")
 
 
-async def run_agent(
-    workspace: DockerWorkspace,
-    goal: str,
-    model_name: str,
-    model: ModelAdapter,
-    directory: Path,
-    budget: Budget,
-) -> dict[str, Any]:
+def agent_setup(workspace: DockerWorkspace, model_name: str) -> tuple[ToolRegistry, AgentSpec]:
     registry = ToolRegistry()
     for binding in file_tool_bindings():
-        registry.register(binding)
+        registry.register(replace(
+            binding, handler=partial(workspace.execute_file, binding.definition.name)
+        ))
     for binding in process_tool_bindings(lambda _path, _argv: False):
         registry.register(replace(binding, handler=workspace.execute, prepare=None))
     spec = main_agent_spec(
@@ -142,6 +138,18 @@ async def run_agent(
             "checkout used by the file tools. Its Python environment is already on PATH."
         ),
     )
+    return registry, spec
+
+
+async def run_agent(
+    workspace: DockerWorkspace,
+    goal: str,
+    model_name: str,
+    model: ModelAdapter,
+    directory: Path,
+    budget: Budget,
+) -> dict[str, Any]:
+    registry, spec = agent_setup(workspace, model_name)
     store = SQLiteStateStore(directory / "state.db")
     session = Session(workspace.path)
     store.create_session(session)
@@ -219,13 +227,12 @@ def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
         spec = make_test_spec(instance, namespace="swebench", instance_image_tag=task.image_tag)
         report["base_commit"] = instance["base_commit"]
         report["image"] = spec.instance_image_key
-        with closing(docker.from_env()) as client:
-            workspace = DockerWorkspace(
-                client,
-                directory / "workspace",
-                instance["base_commit"],
-                image=spec.instance_image_key,
-            )
+        with (
+            closing(docker.from_env(timeout=120)) as client,
+            closing(DockerWorkspace(
+                client, instance["base_commit"], image=spec.instance_image_key
+            )) as workspace,
+        ):
             workspace.prepare()
             report["status"] = "agent"
             model = DeepSeekAnthropicModel(
@@ -253,6 +260,9 @@ def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
             report["status"] = "patch_export"
             patch = workspace.export_patch()
             (directory / "candidate.patch").write_bytes(patch.encode("utf-8"))
+            if report["agent"]["status"] == RunStatus.PAUSED:
+                report["workspace_checkpoint"] = workspace.checkpoint()
+            report["status"] = "workspace_cleanup"
         if patch:
             report.update(status="scoring", official_scoring_attempted=True)
             scoring_dir, official, cleanup_error = evaluate(

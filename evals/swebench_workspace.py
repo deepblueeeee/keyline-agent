@@ -1,104 +1,81 @@
-"""Expose one clean SWE-bench checkout to file tools and isolated commands."""
+"""Run the tools for one SWE-bench trial in the same isolated container."""
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
+import json
 import tarfile
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
+from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryFile
-from time import monotonic, sleep
+from time import sleep
 from typing import Any
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from docker import DockerClient
-from docker.errors import APIError, DockerException, ImageNotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from docker.models.containers import Container
-from docker.types import LogConfig, Mount
+from docker.types import LogConfig
 from requests.exceptions import ConnectionError as DockerConnectionError
 from requests.exceptions import ReadTimeout
 
+import handshake
 from handshake.runtime.state import ToolResult
+from handshake.tools.files import read_file
+from handshake.tools.shell import parse_process_arguments
 
 _TESTBED = "/testbed"
 _PATH = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
+_PRIVATE = "/.handshake-eval"
+_BASELINE = f"{_PRIVATE}/baseline.git"
+_TOOL_APP = f"{_PRIVATE}/tools.pyz"
+_PYTHON = "/opt/miniconda3/bin/python"
+_AGENT = "1000:1000"
 _RETRYABLE_IMAGE_ERRORS = {408, 429, 500, 502, 503, 504}
 
 
+def _tool_archive() -> bytes:
+    """Package the current file handlers and their standard-library dependencies."""
+    package = Path(handshake.__file__).parent
+    app = BytesIO()
+    with ZipFile(app, "w", ZIP_DEFLATED) as zip_app:
+        zip_app.write(Path(__file__).with_name("_swebench_tools.py"), "__main__.py")
+        for source in package.rglob("*.py"):
+            zip_app.write(source, source.relative_to(package.parent))
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        entry = tarfile.TarInfo("tools.pyz")
+        entry.size = app.tell()
+        entry.mode = 0o644
+        app.seek(0)
+        tar.addfile(entry, app)
+    return archive.getvalue()
+
+
 class DockerWorkspace:
-    def __init__(self, client: DockerClient, path: Path, base_commit: str, *, image: str) -> None:
+    path = Path(_TESTBED)
+
+    def __init__(self, client: DockerClient, base_commit: str, *, image: str) -> None:
         self.client = client
-        self.path = path.resolve()
         self.base_commit = base_commit
         self.image = image
-        self.git_dir = self.path.parent / "baseline.git"
-        self._cleanup_failed = False
+        self._container: Container | None = None
 
-    @contextmanager
-    def _container(self, argv: tuple[str, ...], *, bind: bool) -> Iterator[Container]:
-        # A fresh command container prevents background processes from racing host file tools.
-        mounts = [Mount(_TESTBED, str(self.path), type="bind")] if bind else []
-        container = self.client.containers.create(
-            self.image,
-            command=list(argv),
-            platform="linux/amd64",
-            working_dir=_TESTBED,
-            user=f"{os.getuid()}:{os.getgid()}" if bind else "0:0",
-            mounts=mounts,
-            network_mode="none",
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges"],
-            use_config_proxy=False,
-            environment={
-                "PATH": _PATH,
-                "HOME": "/tmp",
-                "PYTHONPATH": _TESTBED,
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "safe.directory",
-                "GIT_CONFIG_VALUE_0": _TESTBED,
-            },
-            log_config=LogConfig(
-                type="local", config={"max-size": "4m", "max-file": "1", "compress": "false"}
-            ),
-            mem_limit="2g",
-            pids_limit=128,
-        )
+    @property
+    def container(self) -> Container:
+        if self._container is None:
+            raise RuntimeError("Docker workspace is not prepared")
+        return self._container
+
+    def close(self) -> None:
+        if self._container is None:
+            return
         try:
-            container.reload()
-            config = container.attrs["HostConfig"]
-            actual = container.attrs["Mounts"]
-            expected = {str(self.path), f"/host_mnt{self.path}"}
-            if (
-                config["NetworkMode"] != "none"
-                or config["Privileged"]
-                or config.get("Binds")
-                or config.get("CapAdd")
-                or "ALL" not in (config.get("CapDrop") or [])
-                or "no-new-privileges" not in (config.get("SecurityOpt") or [])
-                or len(actual) != int(bind)
-                or (
-                    bind
-                    and (
-                        actual[0]["Type"] != "bind"
-                        or actual[0]["Source"] not in expected
-                        or actual[0]["Destination"] != _TESTBED
-                        or not actual[0]["RW"]
-                    )
-                )
-            ):
-                raise RuntimeError("Docker workspace isolation verification failed")
-            container.start()
-            yield container
-        finally:
-            try:
-                container.remove(force=True)
-            except Exception:
-                self._cleanup_failed = True
-                raise
-            if bind:
-                self._check_checkout_files()
+            self._container.remove(force=True, v=True)
+        except NotFound:
+            pass
+        except Exception as exc:
+            raise RuntimeError(f"Could not remove trial container {self._container.id}") from exc
+        self._container = None
 
     def _ensure_image(self) -> None:
         for attempt in range(3):
@@ -119,108 +96,147 @@ class DockerWorkspace:
                 return
             sleep(2**attempt)
 
-    def prepare(self) -> None:
-        self._ensure_image()
-        # Upload-pack sends only the base snapshot. Copying /testbed/.git directly can
-        # expose unrelated refs and objects from the official scoring image.
-        command = (
-            "/bin/sh",
-            "-ec",
-            'git update-ref refs/heads/eval-base "$1"; '
-            "git clone -q --depth 1 -b eval-base file:///testbed /tmp/source; "
-            "git -C /tmp/source remote remove origin",
-            "sh",
-            self.base_commit,
+    def prepare(self, *, checkpoint: str | None = None) -> None:
+        if self._container is not None:
+            raise RuntimeError("Docker workspace already has a container")
+        if checkpoint is None:
+            self._ensure_image()
+        self._container = self.client.containers.create(
+            checkpoint or self.image,
+            entrypoint=["/bin/sleep"],
+            command=["infinity"],
+            platform="linux/amd64",
+            working_dir="/",
+            user="0:0",
+            init=True,
+            network_mode="none",
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
+            use_config_proxy=False,
+            environment={
+                "PATH": _PATH,
+                "HOME": "/tmp",
+                "PYTHONPATH": _TESTBED,
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": _TESTBED,
+            },
+            log_config=LogConfig(
+                type="local", config={"max-size": "4m", "max-file": "1", "compress": "false"}
+            ),
+            mem_limit="2g",
+            pids_limit=128,
         )
-        self.path.mkdir()
-        with self._container(command, bind=False) as container:
-            if container.wait(timeout=90)["StatusCode"] != 0:
-                raise RuntimeError(container.logs().decode(errors="replace"))
-            with TemporaryFile() as archive:
-                for chunk in container.get_archive("/tmp/source/.")[0]:
-                    archive.write(chunk)
-                archive.seek(0)
-                with tarfile.open(fileobj=archive) as checkout:
-                    checkout.extractall(self.path, filter="data")
-        shutil.copytree(self.path / ".git", self.git_dir)
-        if self._git("rev-parse", "HEAD").strip() != self.base_commit.encode("ascii") or self._git(
-            "status", "--porcelain", "--untracked-files=all"
-        ):
+        try:
+            self.container.reload()
+            config = self.container.attrs["HostConfig"]
+            if (
+                config["NetworkMode"] != "none"
+                or config["Privileged"]
+                or config.get("Binds")
+                or config.get("CapAdd")
+                or "ALL" not in (config.get("CapDrop") or [])
+                or "no-new-privileges" not in (config.get("SecurityOpt") or [])
+                or self.container.attrs["Mounts"]
+            ):
+                raise RuntimeError("Docker workspace isolation verification failed")
+            self.container.start()
+            if checkpoint is None:
+                self._prepare_checkout()
+            base = self._checked(("git", f"--git-dir={_BASELINE}", "rev-parse", "HEAD"), root=True)
+            if base.strip().decode("ascii") != self.base_commit:
+                raise RuntimeError("The task checkout differs from the pinned base commit")
+        except BaseException:
+            self.close()
+            raise
+
+    def _prepare_checkout(self) -> None:
+        # Only the pinned commit goes into the bare template or the agent's checkout.
+        self._checked(
+            (
+                "/bin/sh", "-ec",
+                f"mkdir -m 755 {_PRIVATE}; "
+                f"git -C {_TESTBED} update-ref refs/heads/eval-base \"$1\"; "
+                f"git clone -q --bare --depth 1 --single-branch -b eval-base "
+                f"file://{_TESTBED} {_BASELINE}; "
+                f"git --git-dir={_BASELINE} remote remove origin; "
+                f"rm -rf {_TESTBED}; mkdir -m 777 {_TESTBED}",
+                "sh", self.base_commit,
+            ),
+            root=True,
+        )
+        self._checked((
+            "/bin/sh", "-ec",
+            f"cp -R {_BASELINE} .git; git config core.bare false; git reset -q --hard",
+        ))
+        if self._checked(("git", "status", "--porcelain", "--untracked-files=all")):
             raise RuntimeError("The task checkout differs from the pinned base commit")
+        if not self.container.put_archive(_PRIVATE, _tool_archive()):
+            raise RuntimeError("Could not install the trial's file tools")
+
+    def _checked(self, argv: tuple[str, ...], *, root: bool = False) -> bytes:
+        code, (stdout, stderr) = self.container.exec_run(
+            argv, demux=True, workdir="/" if root else _TESTBED, user="0:0" if root else _AGENT,
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            } if root else None,
+        )
+        if code:
+            raise RuntimeError((stderr or stdout or b"").decode(errors="replace"))
+        return stdout or b""
+
+    def _check_workspace(self, workspace: Path) -> None:
+        if workspace != self.path:
+            raise RuntimeError("Docker command does not have a safe workspace")
+
+    def execute_file(
+        self, name: str, workspace: Path, arguments: Mapping[str, Any],
+    ) -> ToolResult:
+        self._check_workspace(workspace)
+        path = arguments.get("path")
+        if name == "read_file" and isinstance(path, str) and (
+            path == "@handshake/artifacts" or path.startswith("@handshake/artifacts/")
+        ):
+            return read_file(workspace, arguments)
+        # Split JSON into argv chunks to stay below Linux's per-argument byte limit.
+        payload = json.dumps(dict(arguments))
+        chunks = tuple(payload[i : i + 60_000] for i in range(0, len(payload), 60_000))
+        output = self._checked((
+            "/usr/bin/timeout", "-k", "1s", "60s",
+            _PYTHON, "-I", "-B", _TOOL_APP, "file", name, *chunks,
+        ))
+        return ToolResult(**json.loads(output))
 
     def execute(self, workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
-        from handshake.tools.shell import parse_process_arguments
-
-        if workspace.resolve() != self.path or self._cleanup_failed:
-            raise RuntimeError("Docker command does not have a safe workspace")
+        self._check_workspace(workspace)
         argv, timeout = parse_process_arguments(arguments)
-        timeout = min(timeout, 60)
         try:
-            with self._container(argv, bind=True) as container:
-                deadline = monotonic() + timeout
-                try:
-                    code = container.wait(timeout=timeout)["StatusCode"]
-                except (ReadTimeout, DockerConnectionError) as exc:
-                    # Requests may report a timeout on a streamed response as a connection error.
-                    if isinstance(exc, DockerConnectionError) and monotonic() < deadline:
-                        raise
-                    return ToolResult(ok=False, stderr=f"Command timed out after {timeout:g}s")
-                return ToolResult(
-                    ok=code == 0,
-                    stdout=container.logs(stdout=True, stderr=False).decode(errors="replace"),
-                    stderr=container.logs(stdout=False, stderr=True).decode(errors="replace"),
-                    exit_code=code,
-                )
+            output = self._checked((
+                _PYTHON, "-I", "-B", _TOOL_APP, "command", str(min(timeout, 60)), *argv,
+            ))
         except DockerException as exc:
-            if self._cleanup_failed:
-                raise RuntimeError("Could not remove the command container") from exc
             return ToolResult(ok=False, stderr=str(getattr(exc, "explanation", exc)))
-
-    def _git(self, *args: str) -> bytes:
-        return subprocess.run(
-            [
-                "git",
-                f"--git-dir={self.git_dir}",
-                f"--work-tree={self.path}",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                *args,
-            ],
-            cwd=self.path,
-            env={"PATH": os.defpath, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
-            capture_output=True,
-            check=True,
-            timeout=60,
-        ).stdout
+        self._check_checkout_files()
+        return ToolResult(**json.loads(output))
 
     def _check_checkout_files(self) -> None:
-        # A command can create FIFOs that would block a subsequent host search or read.
-        for directory, _, names in os.walk(self.path):
-            for name in names:
-                path = Path(directory) / name
-                if not path.is_symlink() and not path.is_file():
-                    raise RuntimeError(f"Unsupported workspace file: {path.relative_to(self.path)}")
+        # A FIFO or socket can block a later file tool.
+        special = self._checked((
+            "/usr/bin/find", ".", "!", "-type", "f", "!", "-type", "d",
+            "!", "-type", "l", "-print", "-quit",
+        ))
+        if special:
+            path = special.decode(errors="replace").strip()
+            raise RuntimeError(f"Unsupported workspace file: {path}")
 
     def export_patch(self) -> str:
-        if self._cleanup_failed:
-            raise RuntimeError("Cannot export a checkout still in use by a command container")
         self._check_checkout_files()
-        self._git("add", "-A")
-        args = ("diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", self.base_commit)
-        try:
-            return self._git(*args).decode("utf-8")
-        except UnicodeDecodeError:
-            # Predictions are UTF-8 JSON. Git binary patches preserve non-UTF-8 file bytes.
-            attributes = self.git_dir / "info" / "attributes"
-            original = attributes.read_bytes() if attributes.exists() else None
-            attributes.parent.mkdir(exist_ok=True)
-            try:
-                attributes.write_bytes((original or b"") + b"\n* -diff\n")
-                return self._git(*args).decode("utf-8")
-            finally:
-                if original is None:
-                    attributes.unlink(missing_ok=True)
-                else:
-                    attributes.write_bytes(original)
+        return self._checked(
+            (_PYTHON, "-I", "-B", _TOOL_APP, "patch", _BASELINE, self.base_commit)
+        ).decode("utf-8")
+
+    def checkpoint(self) -> str:
+        """Save the filesystem of a paused trial so its container can be removed."""
+        return self.container.commit().id

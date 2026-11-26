@@ -16,13 +16,15 @@ import docker  # noqa: E402
 from swebench.harness.test_spec.test_spec import make_test_spec  # noqa: E402
 from swebench.harness.utils import load_swebench_dataset  # noqa: E402
 
-from evals import swebench, swebench_run, swebench_workspace  # noqa: E402
+from evals import _swebench_tools, swebench, swebench_run, swebench_workspace  # noqa: E402
 from evals.swebench import dataset_snapshot  # noqa: E402
 from evals.swebench_workspace import DockerWorkspace  # noqa: E402
 from evals.tasks import load_tasks  # noqa: E402
+from handshake.artifacts import store_text_artifact  # noqa: E402
 from handshake.models.errors import ModelProviderError  # noqa: E402
 from handshake.models.protocol import ModelContext, ModelTurn, ModelUsage, ToolCall  # noqa: E402
 from handshake.models.scripted import ScriptedModel  # noqa: E402
+from handshake.runtime.recovery import resume_run, update_paused_step_limit  # noqa: E402
 from handshake.storage.sqlite import SQLiteStateStore  # noqa: E402
 
 INSTANCE_ID = "sympy__sympy-20590"
@@ -92,14 +94,15 @@ def test_exported_patch_preserves_file_bytes(
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.org", "commit", "-qm", "base")
     base = git("rev-parse", "HEAD").decode().strip()
     scorer = tmp_path / "scorer"
+    baseline = tmp_path / "baseline.git"
     shutil.copytree(checkout, scorer)
-    shutil.copytree(checkout / ".git", tmp_path / "baseline.git")
+    shutil.copytree(checkout / ".git", baseline)
 
-    attributes = tmp_path / "baseline.git" / "info" / "attributes"
+    attributes = baseline / "info" / "attributes"
     attributes.write_bytes(b"example.txt diff\n")
     (checkout / "example.txt").write_bytes(changed)
     expected = git("diff", "--binary")
-    patch = DockerWorkspace(Mock(), checkout, base, image="fixture-image").export_patch()
+    patch = _swebench_tools.export_patch(checkout, baseline, base).decode("utf-8")
     assert attributes.read_bytes() == b"example.txt diff\n"
     run = subprocess.run
 
@@ -119,7 +122,7 @@ def test_exported_patch_preserves_file_bytes(
 
 @pytest.mark.parametrize(("http_status", "expected_attempts"), [(500, 3), (401, 1)])
 def test_pinned_image_pull_retries_transient_errors_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, http_status: int, expected_attempts: int
+    monkeypatch: pytest.MonkeyPatch, http_status: int, expected_attempts: int
 ) -> None:
     pause = Mock()
     monkeypatch.setattr(swebench_workspace, "sleep", pause)
@@ -127,7 +130,7 @@ def test_pinned_image_pull_retries_transient_errors_only(
     client.images.get.side_effect = docker.errors.ImageNotFound("not cached")
     error = docker.errors.APIError("pull failed", response=Mock(status_code=http_status))
     client.images.pull.side_effect = error
-    workspace = DockerWorkspace(client, tmp_path, "base", image="fixture:latest@sha256:pin")
+    workspace = DockerWorkspace(client, "base", image="fixture:latest@sha256:pin")
 
     with pytest.raises(docker.errors.APIError) as caught:
         workspace._ensure_image()
@@ -150,6 +153,7 @@ def test_empty_patch_is_not_an_official_unresolved_result(
     result = swebench_run.run_trial(TASK, directory, BUDGET)
 
     evaluate.assert_not_called()
+    trial_workspace.close.assert_called_once_with()
     assert result["agent"]["status"] == "completed"
     assert result["status"] == "empty_patch"
     assert result["resolved"] is None
@@ -170,6 +174,43 @@ def test_report_without_test_scores_does_not_count_as_unresolved(
     assert result["status"] == "scoring_failed"
     assert result["official"] == official
     assert result["resolved"] is None
+
+
+def test_paused_trial_records_checkpoint_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trial_workspace: Mock,
+) -> None:
+    async def pause_agent(*args: object) -> dict[str, str]:
+        return {"status": "paused"}
+
+    monkeypatch.setattr(swebench_run, "run_agent", pause_agent)
+    trial_workspace.export_patch.return_value = ""
+    trial_workspace.checkpoint.return_value = "checkpoint-image"
+    directory = tmp_path / "trial"
+
+    result = swebench_run.run_trial(TASK, directory, BUDGET)
+
+    assert result["workspace_checkpoint"] == "checkpoint-image"
+    assert json.loads((directory / "result.json").read_text()) == result
+    trial_workspace.checkpoint.assert_called_once_with()
+    trial_workspace.close.assert_called_once_with()
+
+
+def test_trial_preserves_patch_if_container_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trial_workspace: Mock,
+) -> None:
+    trial_workspace.export_patch.return_value = "candidate patch"
+    trial_workspace.close.side_effect = RuntimeError("container removal failed")
+    evaluate = Mock()
+    monkeypatch.setattr(swebench_run, "evaluate", evaluate)
+    directory = tmp_path / "trial"
+
+    result = swebench_run.run_trial(TASK, directory, BUDGET)
+
+    assert result["status"] == "error"
+    assert result["failed_stage"] == "workspace_cleanup"
+    assert not result["official_scoring_attempted"]
+    assert (directory / "candidate.patch").read_text() == "candidate patch"
+    evaluate.assert_not_called()
 
 
 @pytest.mark.parametrize(("fallback_fails", "cli_fails"), [(False, False), (True, True)])
@@ -239,6 +280,7 @@ def test_trial_restores_state_directory(
     else:
         result = swebench_run.run_trial(TASK, directory, BUDGET)
         assert result["status"] == ("error" if error else "empty_patch")
+    trial_workspace.close.assert_called_once_with()
     assert os.environ.get("HANDSHAKE_HOME") == previous
 
 
@@ -262,29 +304,15 @@ def test_requests_are_capped_and_usage_is_written(tmp_path: Path) -> None:
     }
 
 
-def test_container_cleanup_failure_prevents_export(tmp_path: Path) -> None:
+def test_unsafe_container_is_removed_before_any_tool_executes() -> None:
     client = Mock()
     container = client.containers.create.return_value
     container.attrs = {"HostConfig": {"NetworkMode": "bridge"}, "Mounts": []}
-    container.remove.side_effect = RuntimeError("failed to remove container")
-    workspace = DockerWorkspace(client, tmp_path / "workspace", "base", image="fixture-image")
-    with (
-        pytest.raises(RuntimeError, match="failed to remove"),
-        workspace._container(("true",), bind=False),
-    ):
-        pytest.fail("unsafe container should never start")
+    workspace = DockerWorkspace(client, "base", image="fixture-image")
+    with pytest.raises(RuntimeError, match="isolation verification failed"):
+        workspace.prepare()
     container.start.assert_not_called()
-    with pytest.raises(RuntimeError, match="still in use"):
-        workspace.export_patch()
-
-
-def test_special_files_cannot_be_exported(tmp_path: Path) -> None:
-    checkout = tmp_path / "workspace"
-    checkout.mkdir()
-    os.mkfifo(checkout / "pipe")
-    workspace = DockerWorkspace(Mock(), checkout, "base", image="fixture-image")
-    with pytest.raises(RuntimeError, match="Unsupported workspace file: pipe"):
-        workspace.export_patch()
+    container.remove.assert_called_once_with(force=True, v=True)
 
 
 @pytest.mark.skipif(
@@ -302,18 +330,24 @@ from pathlib import Path
 assert sympy.__file__.startswith('/testbed/')
 credentials = ('DEEPSEEK_API_KEY', 'DOCKER_HOST', 'HTTP_PROXY', 'HTTPS_PROXY')
 assert not any(x in os.environ for x in credentials)
+assert os.geteuid() != 0
 assert not Path('/var/run/docker.sock').exists()
 assert not Path('/eval.sh').exists()
+assert not os.access('/.handshake-eval/tools.pyz', os.W_OK)
+assert not os.access('/.handshake-eval/baseline.git/config', os.W_OK)
 assert subprocess.check_output(['git','rev-list','--all','--count'], text=True).strip() == '1'
 s = socket.socket(); s.settimeout(1)
 assert s.connect_ex(('192.0.2.1',80)) == errno.ENETUNREACH
-p = Path('task1b-check.txt'); assert p.read_text() == 'host file\\n'; p.write_text('docker file\\n')
+p = Path('task1b-check.txt'); assert p.read_text() == 'file tool\\n'; p.write_text('shell tool\\n')
 Path('AUTHORS').unlink(); Path('README.md').write_text('modified by test\\n')
+Path('/tmp/task1b-marker').write_text('container-local state')
 """
     calls = (
-        ToolCall("write", "write_file", {"path": "task1b-check.txt", "content": "host file\n"}),
+        ToolCall(
+            "write", "write_file", {"path": "/testbed/task1b-check.txt", "content": "file tool\n"}
+        ),
         ToolCall("shell", "run_shell", {"argv": ["python", "-c", command]}),
-        ToolCall("read", "read_file", {"path": "task1b-check.txt"}),
+        ToolCall("read", "read_file", {"path": "/testbed/task1b-check.txt"}),
     )
     turns = [
         ModelTurn(
@@ -332,32 +366,72 @@ Path('AUTHORS').unlink(); Path('README.md').write_text('modified by test\\n')
     ]
     turns.append(ModelTurn(({"type": "text", "text": "done"},), stop_reason="end_turn"))
 
-    with closing(docker.from_env()) as client:
-        workspace = DockerWorkspace(
-            client, tmp_path / "workspace", task["base_commit"], image=spec.instance_image_key
-        )
-        workspace.prepare()
-        assert workspace.export_patch() == ""
-        stats = asyncio.run(
-            swebench_run.run_agent(
-                workspace,
-                "Exercise the shared tools",
-                "scripted",
-                ScriptedModel(turns),
-                tmp_path,
-                BUDGET,
-            )
-        )
-        assert stats["status"] == "completed"
-        run = SQLiteStateStore(tmp_path / "state.db").load_run(stats["run_id"])
-        assert all(tool.result and tool.result.ok for tool in run.tool_runs), run.tool_runs
-        assert "docker file" in run.tool_runs[-1].result.stdout
-        patch = workspace.export_patch()
-        assert "+++ b/task1b-check.txt" in patch and "+++ b/README.md" in patch
-        assert "--- a/AUTHORS" in patch
-        timeout = workspace.execute(
-            workspace.path, {"argv": ["sleep", "10"], "timeout_seconds": 0.2}
-        )
-        assert not timeout.ok and "timed out" in timeout.stderr
-        assert not workspace.execute(workspace.path, {"argv": ["no-command-task1b-test"]}).ok
-        assert workspace.export_patch() == patch
+    with closing(docker.from_env(timeout=120)) as client:
+        checkpoint = None
+        try:
+            with closing(DockerWorkspace(
+                client, task["base_commit"], image=spec.instance_image_key
+            )) as workspace:
+                workspace.prepare()
+                container_id = workspace.container.id
+                assert workspace.export_patch() == ""
+                stats = asyncio.run(swebench_run.run_agent(
+                    workspace, "Exercise the shared tools", "scripted",
+                    ScriptedModel(turns[:2]), tmp_path, swebench_run.Budget(steps=2),
+                ))
+                assert stats["status"] == "paused"
+                marker = workspace.execute(workspace.path, {"argv": ["cat", "/tmp/task1b-marker"]})
+                assert marker.stdout == "container-local state"
+                artifact = store_text_artifact("test-trial", "host artifact")
+                assert workspace.execute_file(
+                    "read_file", workspace.path, {"path": artifact.reference}
+                ).stdout == "host artifact"
+                timeout = workspace.execute(
+                    workspace.path, {"argv": ["sleep", "10"], "timeout_seconds": 0.2}
+                )
+                assert not timeout.ok and "timed out" in timeout.stderr
+                normal_exit = workspace.execute(workspace.path, {"argv": ["sh", "-c", "exit 124"]})
+                assert normal_exit.exit_code == 124 and not normal_exit.stderr
+                assert not workspace.execute(
+                    workspace.path, {"argv": ["no-command-task1b-test"]}
+                ).ok
+                patch = workspace.export_patch()
+                assert "+++ b/task1b-check.txt" in patch and "+++ b/README.md" in patch
+                assert "--- a/AUTHORS" in patch
+                checkpoint = workspace.checkpoint()
+            with pytest.raises(docker.errors.NotFound):
+                client.containers.get(container_id)
+
+            fork_db = tmp_path / "fork.db"
+            shutil.copyfile(tmp_path / "state.db", fork_db)
+            store = SQLiteStateStore(fork_db)
+            run = store.load_run(stats["run_id"])
+            session = store.load_session(run.session_id)
+            assert session.workspace == Path("/testbed") == workspace.path
+            update_paused_step_limit(session, run, 4, store=store)
+            with closing(DockerWorkspace(
+                client, task["base_commit"], image=spec.instance_image_key
+            )) as restored:
+                restored.prepare(checkpoint=checkpoint)
+                restored_id = restored.container.id
+                registry, agent_spec = swebench_run.agent_setup(restored, "scripted")
+                asyncio.run(resume_run(
+                    session, run, ScriptedModel(turns[2:]), registry, store=store,
+                    agent_spec=agent_spec,
+                ))
+                resumed = store.load_run(run.run_id)
+                assert resumed.status == "completed"
+                assert all(tool.result and tool.result.ok for tool in resumed.tool_runs)
+                assert "shell tool" in resumed.tool_runs[-1].result.stdout
+                marker = restored.execute(restored.path, {"argv": ["cat", "/tmp/task1b-marker"]})
+                assert marker.stdout == "container-local state"
+                assert restored.export_patch() == patch
+                with pytest.raises(RuntimeError, match="Unsupported workspace file: ./pipe"):
+                    restored.execute(restored.path, {"argv": ["mkfifo", "pipe"]})
+                with pytest.raises(RuntimeError, match="Unsupported workspace file: ./pipe"):
+                    restored.export_patch()
+            with pytest.raises(docker.errors.NotFound):
+                client.containers.get(restored_id)
+        finally:
+            if checkpoint:
+                client.images.remove(checkpoint)

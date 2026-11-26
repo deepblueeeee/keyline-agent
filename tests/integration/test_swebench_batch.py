@@ -152,7 +152,8 @@ def test_batch_cli_starts_each_trial_with_clean_workspace_and_state(
         (run,) = SQLiteStateStore(directory / "state.db").list_runs()
         assert not run.tool_runs[0].result.ok
         assert run.tool_runs[1].result.ok
-        assert (directory / "workspace" / "eval-trial-marker.txt").read_text() == "marker\n"
+        assert not (directory / "workspace").exists()
+        assert "+marker\n" in (directory / "candidate.patch").read_text()
         assert entry["agent"]["status"] == "completed"
         sessions.add(run.session_id)
     assert len(sessions) == 2

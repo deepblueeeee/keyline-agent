@@ -14,6 +14,7 @@ from evals.judge import check_judge_input  # noqa: E402
 from handshake.models.protocol import ModelTurn, ModelUsage, ToolCall  # noqa: E402
 from handshake.models.scripted import ScriptedModel  # noqa: E402
 from handshake.runtime.state import ToolResult  # noqa: E402
+from handshake.tools import create_default_registry  # noqa: E402
 
 
 @pytest.fixture
@@ -24,6 +25,7 @@ def trial(tmp_path: Path) -> Path:
     (checkout / "target.py").write_text("before\n")
     (checkout / "other.py").write_text("other\n")
     workspace = Mock(path=checkout)
+    workspace.execute_file.side_effect = create_default_registry(lambda _path, _argv: True).execute
     workspace.execute.return_value = ToolResult(ok=True, stdout="test passed", exit_code=0)
     test = {"argv": ["python", "check.py"]}
     calls = (
