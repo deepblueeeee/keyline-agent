@@ -99,7 +99,8 @@ def test_search_skips_binary_files_and_caches(tmp_path: Path) -> None:
     result = search_files(tmp_path, {"query": "needle"})
 
     assert result.ok
-    assert result.stdout == ""
+    assert "0 UTF-8 files searched" in result.stdout
+    assert "binary.dat" not in result.stdout and "ignored.txt" not in result.stdout
 
 
 def test_read_file_defaults_to_bounded_page_with_continuation(tmp_path: Path) -> None:
@@ -291,36 +292,35 @@ def test_list_files_filters_with_glob_and_bounds_results(tmp_path: Path) -> None
     ]
 
 
-def test_glob_only_recurses_with_explicit_globstar(tmp_path: Path) -> None:
+def test_search_and_list_glob_semantics(tmp_path: Path) -> None:
     source = tmp_path / "src"
     nested = source / "package"
-    nested.mkdir(parents=True)
+    deep = nested / "deep"
+    deep.mkdir(parents=True)
     (source / "top.py").write_text("needle\n", encoding="utf-8")
-    (nested / "nested.py").write_text("needle\n", encoding="utf-8")
+    (nested / "test_nested.py").write_text("needle\n", encoding="utf-8")
+    (deep / "test_deep.py").write_text("needle\n", encoding="utf-8")
 
     default_list = list_files(tmp_path, {"path": "src"})
     shallow_list = list_files(tmp_path, {"path": "src", "pattern": "*.py"})
     recursive_list = list_files(tmp_path, {"path": "src", "pattern": "**/*.py"})
-    default_search = search_files(tmp_path, {"path": "src", "query": "needle"})
-    shallow_search = search_files(
-        tmp_path, {"path": "src", "pattern": "*.py", "query": "needle"}
-    )
-    recursive_search = search_files(
-        tmp_path, {"path": "src", "pattern": "**/*.py", "query": "needle"}
-    )
-
-    assert default_list.stdout.splitlines() == ["src/top.py", "src/package/nested.py"]
+    paths = ["src/top.py", "src/package/test_nested.py", "src/package/deep/test_deep.py"]
+    assert default_list.stdout.splitlines() == paths
     assert shallow_list.stdout.splitlines() == ["src/top.py"]
-    assert recursive_list.stdout.splitlines() == ["src/top.py", "src/package/nested.py"]
-    assert default_search.stdout.splitlines() == [
-        "src/top.py:1:needle",
-        "src/package/nested.py:1:needle",
-    ]
-    assert shallow_search.stdout.splitlines() == ["src/top.py:1:needle"]
-    assert recursive_search.stdout.splitlines() == [
-        "src/top.py:1:needle",
-        "src/package/nested.py:1:needle",
-    ]
+    assert recursive_list.stdout.splitlines() == paths
+
+    arguments = {"path": "src", "query": "needle"}
+    matches = [f"{path}:1:needle" for path in paths]
+    assert search_files(tmp_path, arguments).stdout.splitlines() == matches
+    for pattern, expected in (
+        ("*.py", matches),
+        ("test_*.py", matches[1:]),
+        ("./*.py", matches[:1]),
+        ("package/*.py", matches[1:2]),
+        ("package/**/*.py", matches[1:]),
+    ):
+        result = search_files(tmp_path, {**arguments, "pattern": pattern})
+        assert result.ok and result.stdout.splitlines() == expected
 
 
 def test_search_files_supports_glob_and_case_insensitive_matching(tmp_path: Path) -> None:
@@ -334,6 +334,23 @@ def test_search_files_supports_glob_and_case_insensitive_matching(tmp_path: Path
 
     assert result.ok
     assert result.stdout == "code.py:1:Needle here"
+
+
+def test_search_without_matches_reports_files_searched(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    nested = source / "package"
+    nested.mkdir(parents=True)
+    (source / "top.py").write_text("other text\n", encoding="utf-8")
+    (nested / "example.py").write_text("nested text\n", encoding="utf-8")
+
+    arguments = {"path": "src", "pattern": "*.py", "query": "needle"}
+    result = search_files(tmp_path, arguments)
+
+    assert result.ok and "no literal matches" in result.stdout
+    assert "path='src'" in result.stdout and "pattern='*.py'" in result.stdout
+    assert "2 UTF-8 files searched" in result.stdout
+    assert "Try a shorter literal query" in result.stdout
+    assert "**/*.py" not in result.stdout
 
 
 def test_edit_file_applies_unique_targeted_replacement(tmp_path: Path) -> None:
@@ -352,7 +369,7 @@ def test_edit_file_applies_unique_targeted_replacement(tmp_path: Path) -> None:
 
 def test_edit_file_does_not_change_ambiguous_match(tmp_path: Path) -> None:
     path = tmp_path / "example.py"
-    original = "same\nsame\n"
+    original = "header\n  same same\n" + "same\n" * 5
     path.write_text(original, encoding="utf-8")
 
     from handshake.tools import create_default_registry
@@ -364,5 +381,8 @@ def test_edit_file_does_not_change_ambiguous_match(tmp_path: Path) -> None:
     )
 
     assert not result.ok
-    assert "found 2; file was not changed" in result.stderr
+    assert "found 7; file was not changed" in result.stderr
+    assert "2:3, 2:8, 3:1, 4:1, 5:1" in result.stderr
+    assert "(+2 more)" in result.stderr
+    assert "surrounding text in old_text" in result.stderr
     assert path.read_text(encoding="utf-8") == original

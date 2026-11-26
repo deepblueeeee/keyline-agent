@@ -304,6 +304,28 @@ def test_requests_are_capped_and_usage_is_written(tmp_path: Path) -> None:
     }
 
 
+def test_eval_command_tools_advertise_and_enforce_the_same_timeout() -> None:
+    workspace = DockerWorkspace(Mock(), "base", image="fixture-image")
+    registry, _ = swebench_run.agent_setup(workspace, "scripted")
+    definitions = {definition.name: definition for definition in registry.definitions()}
+
+    for name in ("run_shell", "run_tests"):
+        schema = definitions[name].input_schema["properties"]["timeout_seconds"]
+        assert schema["maximum"] == 60
+        result = registry.execute(name, workspace.path, {"argv": ["true"], "timeout_seconds": 61})
+        assert not result.ok and "at most 60" in result.stderr
+
+
+def test_timed_out_command_returns_output_already_written() -> None:
+    result = _swebench_tools.run_command(
+        ["sh", "-c", "printf 'started\\n'; printf 'warning\\n' >&2; sleep 3"], 0.5,
+    )
+
+    assert not result.ok and result.exit_code is None
+    assert result.stdout == "started\n"
+    assert result.stderr == "warning\nCommand timed out after 0.5s"
+
+
 def test_unsafe_container_is_removed_before_any_tool_executes() -> None:
     client = Mock()
     container = client.containers.create.return_value
@@ -387,9 +409,25 @@ Path('/tmp/task1b-marker').write_text('container-local state')
                     "read_file", workspace.path, {"path": artifact.reference}
                 ).stdout == "host artifact"
                 timeout = workspace.execute(
-                    workspace.path, {"argv": ["sleep", "10"], "timeout_seconds": 0.2}
+                    workspace.path,
+                    {
+                        "argv": ["sh", "-c", "(sleep 1; touch /tmp/late-output) & wait"],
+                        "timeout_seconds": 0.5,
+                    },
                 )
-                assert not timeout.ok and "timed out" in timeout.stderr
+                assert not timeout.ok and timeout.exit_code is None
+                assert "timed out" in timeout.stderr
+                assert workspace.execute(
+                    workspace.path, {"argv": ["sh", "-c", "sleep 1; test ! -e /tmp/late-output"]}
+                ).ok
+                registry, _ = swebench_run.agent_setup(workspace, "scripted")
+                pipeline = "(printf 'test failed\\n'; exit 7) | tail -n 1"
+                for shell, flag in (("bash", "-lc"), ("/bin/sh", "-c")):
+                    test_result = registry.execute(
+                        "run_tests", workspace.path, {"argv": [shell, flag, pipeline]}
+                    )
+                    assert not test_result.ok and test_result.exit_code == 7
+                    assert test_result.stdout == "test failed\n"
                 normal_exit = workspace.execute(workspace.path, {"argv": ["sh", "-c", "exit 124"]})
                 assert normal_exit.exit_code == 124 and not normal_exit.stderr
                 assert not workspace.execute(

@@ -26,11 +26,18 @@ Trial's budget. Each invocation creates a new UUID directory under
 `experiment.json` records the Git commit, UTC start time, model settings, task
 list with dataset revisions and image digests, Trial count and budget.
 
-Each Trial uses one isolated container. File tools and commands share the
-checkout at `/testbed`, with a one-commit Git history. Files created in the
-container, including files under `/tmp`, persist across commands. Each command
-still starts a separate process. The runner exports `candidate.patch` before
-removing the container and submitting the patch for official scoring.
+Each Trial uses one container with no external network access or host mounts.
+File tools and commands share `/testbed`, which starts with the pinned base
+commit and no Git remote. Files and installed environments in the container,
+including `/tmp`, persist across commands. Each command starts a separate
+process. The runner exports `candidate.patch` before removing the container
+and submitting the patch for official scoring.
+
+Shell and test commands default to 60 seconds and accept timeouts up to
+that limit. On timeout the command's process group is killed and its captured
+output is returned with a timeout message. Prefer invoking test runners directly
+with `run_tests`. Direct `bash` and `sh` invocations in `run_tests` use Bash with
+`pipefail` so a successful output filter cannot hide a failed test pipeline.
 
 When a Trial pauses at the model-turn limit, `result.json` also records the
 Docker image ID in `workspace_checkpoint`. A Budget Extension can copy the

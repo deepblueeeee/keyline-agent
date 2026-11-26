@@ -23,6 +23,7 @@ from handshake.runtime.state import ToolResult
 from handshake.tools.files import read_file
 from handshake.tools.shell import parse_process_arguments
 
+COMMAND_TIMEOUT_SECONDS = 60
 _TESTBED = "/testbed"
 _PATH = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
 _PRIVATE = "/.handshake-eval"
@@ -209,12 +210,18 @@ class DockerWorkspace:
         ))
         return ToolResult(**json.loads(output))
 
-    def execute(self, workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
+    def execute(
+        self, workspace: Path, arguments: Mapping[str, Any], *, test_command: bool = False,
+    ) -> ToolResult:
         self._check_workspace(workspace)
-        argv, timeout = parse_process_arguments(arguments)
+        argv, timeout = parse_process_arguments(arguments, timeout_limit=COMMAND_TIMEOUT_SECONDS)
+        if test_command and Path(argv[0]).name == "sh":
+            argv = ("/bin/bash", "--posix", "-o", "pipefail", *argv[1:])
+        elif test_command and Path(argv[0]).name == "bash":
+            argv = (argv[0], "-o", "pipefail", *argv[1:])
         try:
             output = self._checked((
-                _PYTHON, "-I", "-B", _TOOL_APP, "command", str(min(timeout, 60)), *argv,
+                _PYTHON, "-I", "-B", _TOOL_APP, "command", str(timeout), *argv,
             ))
         except DockerException as exc:
             return ToolResult(ok=False, stderr=str(getattr(exc, "explanation", exc)))

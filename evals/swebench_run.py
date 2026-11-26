@@ -41,7 +41,7 @@ from handshake.tools.registry import ToolRegistry
 from handshake.tools.shell import process_tool_bindings
 
 from .swebench import dataset_snapshot, evaluate
-from .swebench_workspace import DockerWorkspace
+from .swebench_workspace import COMMAND_TIMEOUT_SECONDS, DockerWorkspace
 from .tasks import DEFAULT_DATASET, Task, load_tasks, select_tasks
 from .tool_observations import visible_context
 
@@ -124,7 +124,18 @@ def agent_setup(workspace: DockerWorkspace, model_name: str) -> tuple[ToolRegist
             binding, handler=partial(workspace.execute_file, binding.definition.name)
         ))
     for binding in process_tool_bindings(lambda _path, _argv: False):
-        registry.register(replace(binding, handler=workspace.execute, prepare=None))
+        definition = binding.definition
+        timeout_schema = definition.input_schema["properties"]["timeout_seconds"]
+        timeout_schema["maximum"] = COMMAND_TIMEOUT_SECONDS
+        test_command = definition.name == "run_tests"
+        if test_command:
+            definition = replace(
+                definition,
+                description="Run a test command using explicit argv. Prefer invoking the test "
+                "runner directly. Explicit bash and sh commands use Bash with pipefail.",
+            )
+        handler = partial(workspace.execute, test_command=test_command)
+        registry.register(replace(binding, definition=definition, handler=handler, prepare=None))
     spec = main_agent_spec(
         model_name,
         {"update_plan", *(definition.name for definition in registry.definitions())},
@@ -134,8 +145,11 @@ def agent_setup(workspace: DockerWorkspace, model_name: str) -> tuple[ToolRegist
         spec,
         instructions=spec.instructions
         + (
-            "\nShell and test commands run in Linux at /testbed. The workspace is the same "
-            "checkout used by the file tools. Its Python environment is already on PATH."
+            "\nShell, tests and file tools share /testbed in one Linux container with no external "
+            "network or host mounts. Files and installed environments within the container, "
+            "including /tmp, persist across commands in this Trial. Each command starts a "
+            "separate process. Git starts with only the pinned base commit and no remote. "
+            "The testbed Python environment is on PATH. Use run_tests for test commands."
         ),
     )
     return registry, spec

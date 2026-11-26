@@ -92,7 +92,9 @@ def prepare_process_environment(cwd: Path, argv: tuple[str, ...]) -> dict[str, s
     return env
 
 
-def parse_process_arguments(arguments: Mapping[str, Any]) -> tuple[tuple[str, ...], float]:
+def parse_process_arguments(
+    arguments: Mapping[str, Any], *, timeout_limit: int = 600,
+) -> tuple[tuple[str, ...], float]:
     raw_argv = arguments.get("argv")
     if (
         not isinstance(raw_argv, list)
@@ -100,13 +102,15 @@ def parse_process_arguments(arguments: Mapping[str, Any]) -> tuple[tuple[str, ..
         or any(not isinstance(item, str) or not item for item in raw_argv)
     ):
         raise ToolExecutionError("argv must be a non-empty array of non-empty strings")
-    raw_timeout = arguments.get("timeout_seconds", 120)
+    raw_timeout = arguments.get("timeout_seconds", min(120, timeout_limit))
     if (
         isinstance(raw_timeout, bool)
         or not isinstance(raw_timeout, (int, float))
-        or not 0 < raw_timeout <= 600
+        or not 0 < raw_timeout <= timeout_limit
     ):
-        raise ToolExecutionError("timeout_seconds must be a number between 0 and 600")
+        raise ToolExecutionError(
+            f"timeout_seconds must be a number greater than 0 and at most {timeout_limit}"
+        )
     return tuple(raw_argv), float(raw_timeout)
 
 

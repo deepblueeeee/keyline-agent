@@ -31,18 +31,22 @@ def run_command(argv: list[str], timeout: float) -> ToolResult:
                     with suppress(ProcessLookupError):
                         os.killpg(command.pid, signal.SIGKILL)
         except subprocess.TimeoutExpired:
-            return ToolResult(ok=False, stderr=f"Command timed out after {timeout:g}s")
+            code = None
         except OSError as exc:
             return ToolResult(ok=False, stderr=f"Could not start process: {exc}")
-        if code < 0:
+        if code is not None and code < 0:
             code = 128 - code
         stdout.seek(0)
         stderr.seek(0)
         output = stdout.read(_MAX_OUTPUT)
+        error = stderr.read(_MAX_OUTPUT - len(output)).decode(errors="replace")
+        if code is None:
+            separator = "\n" if error and not error.endswith("\n") else ""
+            error += f"{separator}Command timed out after {timeout:g}s"
         return ToolResult(
             ok=code == 0,
             stdout=output.decode(errors="replace"),
-            stderr=stderr.read(_MAX_OUTPUT - len(output)).decode(errors="replace"),
+            stderr=error,
             exit_code=code,
         )
 

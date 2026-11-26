@@ -27,6 +27,7 @@ _DEFAULT_SEARCH_RESULTS = 50
 _DEFAULT_GLOB_PATTERN = "**/*"
 _MAX_RESULTS = 1000
 _MAX_MATCH_CHARACTERS = 500
+_MAX_EDIT_MATCH_LOCATIONS = 5
 _WORKSPACE_PATH_DESCRIPTION = (
     "Workspace-relative path or absolute path inside the workspace. Do not include '..' segments."
 )
@@ -366,10 +367,12 @@ def search_files(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
 
     matches: list[str] = []
     workspace_root = workspace.resolve()
+    match_pattern = f"**/{pattern}" if Path(pattern).name == pattern else pattern
     compared_query = query if case_sensitive else query.casefold()
+    files_searched = 0
     truncated = False
     for path in _iter_workspace_files(root, workspace):
-        if not _matches_glob(path, root, pattern):
+        if not _matches_glob(path, root, match_pattern):
             continue
         try:
             raw = path.read_bytes()
@@ -378,6 +381,7 @@ def search_files(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
             text = raw.decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        files_searched += 1
         relative = path.relative_to(workspace_root).as_posix()
         for line_number, line in enumerate(text.splitlines(), start=1):
             compared_line = line if case_sensitive else line.casefold()
@@ -392,6 +396,12 @@ def search_files(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
     if truncated:
         matches.append(
             f"[search_files: stopped after {max_results} matches; narrow path, pattern, or query]"
+        )
+    elif not matches:
+        matches.append(
+            f"[search_files: no literal matches for path={raw_path!r} with pattern={pattern!r} "
+            f"({files_searched} UTF-8 files searched). "
+            "Try a shorter literal query or adjust path or pattern.]"
         )
     return ToolResult(ok=True, stdout="\n".join(matches))
 
@@ -415,9 +425,24 @@ def edit_file(workspace: Path, arguments: Mapping[str, Any]) -> ToolResult:
     content = path.read_text(encoding="utf-8")
     actual = content.count(old_text)
     if actual != expected:
+        hint = "Use read_file to copy the exact text, including whitespace and line breaks."
+        if actual:
+            locations = []
+            offset = 0
+            for _ in range(min(actual, _MAX_EDIT_MATCH_LOCATIONS)):
+                start = content.index(old_text, offset)
+                line = content.count("\n", 0, start) + 1
+                column = start - content.rfind("\n", 0, start)
+                locations.append(f"{line}:{column}")
+                offset = start + len(old_text)
+            more = f" (+{actual - len(locations)} more)" if actual > len(locations) else ""
+            hint = (
+                f"Matches start at {', '.join(locations)}{more} (line:column). "
+                "Use read_file around the intended match and include surrounding text in old_text."
+            )
         raise ToolExecutionError(
             f"Expected {expected} exact occurrence(s) of old_text in {raw_path}, "
-            f"found {actual}; file was not changed"
+            f"found {actual}; file was not changed. {hint}"
         )
 
     updated = content.replace(old_text, new_text)
@@ -517,8 +542,9 @@ def file_tool_bindings() -> tuple[ToolBinding, ...]:
                 name="search_files",
                 description=(
                     "Search UTF-8 workspace files recursively by default for a literal string and "
-                    "return bounded path:line matches. An explicit glob is relative to path: "
-                    "'*.py' is shallow; '**/*.py' is recursive."
+                    "return bounded path:line matches. A glob without a directory separator "
+                    "matches filenames at any depth, such as '*.py'. Patterns with a separator "
+                    "are relative to path. Use './*.py' for files directly under path."
                 ),
                 input_schema={
                     "type": "object",
