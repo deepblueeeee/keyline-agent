@@ -222,6 +222,9 @@ def main() -> None:
         "--live", action="store_true", required=True, help="Authorize Judge requests"
     )
     args = parser.parse_args()
+    output = args.output or args.trial / "tool_calling.json"
+    if output.exists() or output.is_symlink():
+        parser.error(f"Output already exists: {output}. Choose a new --output path.")
     calls, payload = prepare(args.trial)
     config = DeepSeekConfig.from_environment(model_override=args.judge_model)
     if config.base_url.rstrip("/") != DeepSeekConfig().base_url:
@@ -246,8 +249,8 @@ def main() -> None:
     judge["model"] = config.model if calls else None
     judge["rubric_digest"] = sha256(RUBRIC.read_bytes()).hexdigest()
     result = summarize(calls, payload["trial_id"], judge)
-    output = args.output or args.trial / "tool_calling.json"
-    output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    with output.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     print(output)
 
 

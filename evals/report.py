@@ -384,6 +384,11 @@ def main() -> None:
     for command in (generate, comparison):
         command.add_argument("--output", type=Path, required=True, help="JSON and Markdown prefix")
     args = parser.parse_args()
+    json_path = args.output.with_suffix(".json")
+    markdown_path = args.output.with_suffix(".md")
+    for path in (json_path, markdown_path):
+        if path.exists() or path.is_symlink():
+            parser.error(f"Output already exists: {path}. Choose a new --output prefix.")
     if args.command == "generate":
         if not (args.batch or args.tool_calling or args.compaction):
             parser.error("Generate requires at least one saved artifact")
@@ -392,9 +397,10 @@ def main() -> None:
         )
     else:
         report = compare(read(args.baseline), read(args.current))
-    json_report = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
-    args.output.with_suffix(".json").write_text(json_report, encoding="utf-8")
-    args.output.with_suffix(".md").write_text(markdown(report), encoding="utf-8")
+    with json_path.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    with markdown_path.open("x", encoding="utf-8") as stream:
+        stream.write(markdown(report))
 
 
 if __name__ == "__main__":

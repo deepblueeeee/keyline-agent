@@ -35,6 +35,7 @@ def test_batch_continues_and_preserves_trial_results(
     tasks = load_tasks()
     budget = swebench_run.Budget(requests=4, steps=3, seconds=20)
     paths: list[Path] = []
+    monkeypatch.setenv("DEEPSEEK_MODEL", "fixture-model")
 
     def trial(task: Task, directory: Path, trial_budget: swebench_run.Budget) -> dict[str, Any]:
         assert trial_budget is budget
@@ -68,6 +69,17 @@ def test_batch_continues_and_preserves_trial_results(
         raw = json.loads((Path(entry["artifact_dir"]) / "result.json").read_text())
         assert {key: entry[key] for key in raw} == raw
     assert json.loads((directory / "summary.json").read_text()) == result
+    experiment = json.loads((directory / "experiment.json").read_text())
+    assert experiment["git_commit"]
+    assert experiment["started_at"].endswith("+00:00")
+    assert experiment["model"]["name"] == "fixture-model"
+    assert experiment["model"]["max_tokens"] == swebench_run.MAX_OUTPUT_TOKENS
+    assert experiment["tasks"] == [task.as_dict() for task in tasks]
+    assert experiment["trials_per_task"] == 2
+    assert experiment["budget"] == {"requests": 4, "steps": 3, "seconds": 20}
+    with pytest.raises(FileExistsError):
+        swebench_run.run_batch(tasks, directory, trials=2, budget=budget)
+    assert json.loads((directory / "experiment.json").read_text()) == experiment
 
 
 def test_interrupted_batch_saves_partial_results(

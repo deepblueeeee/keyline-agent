@@ -277,9 +277,11 @@ def main() -> None:
     args = parser.parse_args()
     if (args.sample or args.judge_model) and not args.live:
         parser.error("Model requests require --live")
-    args.output.write_text(
-        json.dumps(asyncio.run(run(args)), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    if args.output.exists() or args.output.is_symlink():
+        parser.error(f"Output already exists: {args.output}. Choose a new --output path.")
+    result = asyncio.run(run(args))
+    with args.output.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(args.output)
 
 

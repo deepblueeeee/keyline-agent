@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +225,23 @@ def test_trial_without_compaction_is_not_applicable(
     assert report["status"] == "not_applicable"
     assert report["samples"] == []
     assert report["agent"]["requests"] == 1
+
+
+def test_existing_compaction_report_blocks_rescoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "compaction.json"
+    output.write_text("prior report\n")
+    monkeypatch.setattr(sys, "argv", [
+        "compaction", "--saved", str(tmp_path / "capture.jsonl"), "--output", str(output),
+    ])
+    monkeypatch.setattr(compaction, "run", lambda _: pytest.fail("Report already exists"))
+
+    with pytest.raises(SystemExit, match="2"):
+        compaction.main()
+
+    assert "already exists" in capsys.readouterr().err
+    assert output.read_text() == "prior report\n"
 
 
 def test_declined_or_malformed_compaction_is_unscored() -> None:

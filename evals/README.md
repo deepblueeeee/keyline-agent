@@ -21,12 +21,22 @@ uv run --project evals --locked python -m evals.swebench_run --live \
 
 Repeat `--instance-id` or select `--suite regression` or `--suite capability`.
 Set `--max-requests`, `--max-steps` and `--agent-seconds` to control each
-Trial's budget. The run prints the path to its `summary.json`.
+Trial's budget. Each invocation creates a new UUID directory under
+`--output-dir` and prints the path to its `summary.json` on exit.
+`experiment.json` records the Git commit, UTC start time, model settings, task
+list with dataset revisions and image digests, Trial count and budget.
+
+### Verified80 historical artifacts
+
+The original tree remains at `.handshake/evals/verified80-baseline`.
+The archive and its index are in
+`.handshake/eval-archives/verified80-baseline-2026-11-27`.
 
 ## Score components
 
 Set `TRIAL` to the directory of a completed Trial. Review the data before
-sending it for Judge scoring.
+sending it for Judge scoring. Choose a new `--output` for each scoring pass.
+An existing result or sample capture is protected from reuse as an output.
 
 ```sh
 uv run --project evals --locked python -m evals.tool_calling "$TRIAL" \
@@ -46,6 +56,7 @@ deterministic compaction scores without a Judge.
 Set `BATCH` to the saved `summary.json` or a single Trial's `result.json`.
 Supply any subset of artifact types and repeat the component flags as needed.
 Both commands write `.json` and `.md` files using the given output prefix.
+Use a different prefix when either file already exists.
 
 ```sh
 uv run --project evals --locked python -m evals.report generate \

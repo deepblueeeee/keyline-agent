@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from shutil import copyfile
@@ -7,7 +8,7 @@ from typing import Any
 import pytest
 
 from evals.cost import estimate_deepseek_cost
-from evals.report import EFFICIENCY, L1, L2, L3, build_report, compare, markdown
+from evals.report import EFFICIENCY, L1, L2, L3, build_report, compare, main, markdown
 from handshake.models.protocol import ModelUsage
 
 MODEL = "deepseek-flash"
@@ -20,6 +21,26 @@ COMBINED = ModelUsage(110, 30, cache_read_tokens=10)
 def save(path: Path, data: dict[str, Any]) -> Path:
     path.write_text(json.dumps(data))
     return path
+
+
+@pytest.mark.parametrize("existing_suffix", [".json", ".md"])
+def test_comparison_does_not_clobber_either_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    existing_suffix: str,
+) -> None:
+    baseline = save(tmp_path / "baseline.json", {"sections": {}, "trials": {}})
+    current = copyfile(baseline, tmp_path / "current.json")
+    prefix = tmp_path / "comparison"
+    (existing := prefix.with_suffix(existing_suffix)).write_text("existing report\n")
+    command = ["report", "compare", str(baseline), str(current), "--output"]
+    monkeypatch.setattr(sys, "argv", [*command, str(prefix)])
+
+    with pytest.raises(SystemExit, match="2"):
+        main()
+
+    assert "already exists" in capsys.readouterr().err
+    assert existing.read_text() == "existing report\n"
+    assert list(tmp_path.glob("comparison.*")) == [existing]
 
 
 def fixtures(

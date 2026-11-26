@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -63,6 +64,21 @@ def _response(grades: list[dict]) -> ModelTurn:
     return ModelTurn(
         ({"type": "text", "text": json.dumps({"grades": grades})},), usage=ModelUsage(11, 2)
     )
+
+
+def test_existing_tool_calling_output_blocks_rescoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "tool_calling.json"
+    output.write_text("prior scores\n")
+    monkeypatch.setattr(sys, "argv", ["tool_calling", str(tmp_path), "--live"])
+    monkeypatch.setattr(tool_calling, "prepare", lambda _: pytest.fail("Output exists"))
+
+    with pytest.raises(SystemExit, match="2"):
+        tool_calling.main()
+
+    assert "already exists" in capsys.readouterr().err
+    assert output.read_text() == "prior scores\n"
 
 
 def test_tool_grading_distinguishes_choice_parameters_and_repeats(trial: Path) -> None:

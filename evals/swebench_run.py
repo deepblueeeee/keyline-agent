@@ -6,10 +6,12 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import traceback
 from collections import Counter
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
 from time import monotonic
@@ -43,6 +45,8 @@ from .tasks import DEFAULT_DATASET, Task, load_tasks, select_tasks
 from .tool_observations import visible_context
 
 MAX_OUTPUT_TOKENS = 8192
+MODEL_TIMEOUT_SECONDS = 45
+MODEL_MAX_RETRIES = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,8 +232,8 @@ def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
                 api_key=read_deepseek_api_key(),
                 model=config.model,
                 max_tokens=MAX_OUTPUT_TOKENS,
-                timeout_seconds=45,
-                max_retries=0,
+                timeout_seconds=MODEL_TIMEOUT_SECONDS,
+                max_retries=MODEL_MAX_RETRIES,
             )
 
             async def run() -> dict[str, Any]:
@@ -289,6 +293,31 @@ def run_batch(
 ) -> dict[str, Any]:
     directory.mkdir(mode=0o700, parents=True)
     started = monotonic()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    experiment = {
+        "experiment_id": directory.name,
+        "git_commit": commit.stdout.strip() or None,
+        "started_at": datetime.now(UTC).isoformat(),
+        "model": {
+            "name": DeepSeekConfig.from_environment().model,
+            "base_url": DeepSeekConfig().base_url,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "timeout_seconds": MODEL_TIMEOUT_SECONDS,
+            "max_retries": MODEL_MAX_RETRIES,
+        },
+        "tasks": [task.as_dict() for task in tasks],
+        "trials_per_task": trials,
+        "budget": asdict(budget),
+    }
+    (directory / "experiment.json").write_text(
+        json.dumps(experiment, indent=2) + "\n", encoding="utf-8"
+    )
     results: list[dict[str, Any]] = []
     interrupted = False
     try:
