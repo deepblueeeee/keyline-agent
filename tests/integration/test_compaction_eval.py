@@ -10,8 +10,8 @@ import pytest
 pytest.importorskip("docker")
 
 from evals import compaction  # noqa: E402
-from handshake.models.protocol import ModelContext, ModelTurn, ModelUsage  # noqa: E402
-from handshake.models.scripted import ScriptedModel  # noqa: E402
+from keyline_agent.models.protocol import ModelContext, ModelTurn, ModelUsage  # noqa: E402
+from keyline_agent.models.scripted import ScriptedModel  # noqa: E402
 
 
 def response(value: dict[str, Any]) -> ModelTurn:
@@ -156,8 +156,8 @@ def test_compaction_recall_and_consistency_are_independent(
 
 def test_trace_rollup_and_missing_judge_grade(tmp_path: Path) -> None:
     from evals.swebench_run import BudgetedModel
-    from handshake.context.condenser import LLMHistoryCondenser
-    from handshake.context.state import HistoryEpisode, SourceRange
+    from keyline_agent.context.condenser import LLMHistoryCondenser
+    from keyline_agent.context.state import HistoryEpisode, SourceRange
 
     artifact = tmp_path / "usage.jsonl"
     scripted = ScriptedModel(

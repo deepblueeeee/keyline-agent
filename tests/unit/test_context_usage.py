@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context import (
+from keyline_agent.context import (
     AgentContextManager,
     ContextBudgetPolicy,
     ContextPressureError,
@@ -11,19 +11,25 @@ from handshake.context import (
     SequencedMessage,
     SourceRange,
 )
-from handshake.context.budget import (
+from keyline_agent.context.budget import (
     Utf8TokenEstimator,
     compact_json,
     estimate_model_context,
     measure_model_context,
     measure_model_turn,
 )
-from handshake.models.protocol import ModelContext, ModelMessage, ModelTurn, ModelUsage, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.loop import continue_run, start_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.tools.registry import ToolRegistry
+from keyline_agent.models.protocol import (
+    ModelContext,
+    ModelMessage,
+    ModelTurn,
+    ModelUsage,
+    ToolCall,
+)
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.dependencies import resolve_text_dependency
+from keyline_agent.runtime.loop import continue_run, start_run
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.tools.registry import ToolRegistry
 from tests.history_support import TEST_AGENT_SPEC, fresh_store, ingest, run_async
 
 

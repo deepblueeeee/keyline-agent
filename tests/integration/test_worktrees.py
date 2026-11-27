@@ -15,21 +15,21 @@ from pathlib import Path
 
 import pytest
 
-from handshake import cli
-from handshake.context import ActiveContextManagers
-from handshake.context.budget import ContextBudgetPolicy
-from handshake.inputs import EphemeralSecretStore
-from handshake.models.base import ToolDefinition
-from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.agents import child_agent_specs, main_agent_spec
-from handshake.runtime.delegation import DelegationRuntime, continue_delegation
-from handshake.runtime.errors import UserCancelledError
-from handshake.runtime.loop import start_run
-from handshake.runtime.recovery import resume_run, update_paused_step_limit
-from handshake.runtime.runs import create_child_run
-from handshake.runtime.secret_dependencies import resolve_secret_dependency
-from handshake.runtime.state import (
+from keyline_agent import cli
+from keyline_agent.context import ActiveContextManagers
+from keyline_agent.context.budget import ContextBudgetPolicy
+from keyline_agent.inputs import EphemeralSecretStore
+from keyline_agent.models.base import ToolDefinition
+from keyline_agent.models.protocol import ModelContext, ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.agents import child_agent_specs, main_agent_spec
+from keyline_agent.runtime.delegation import DelegationRuntime, continue_delegation
+from keyline_agent.runtime.errors import UserCancelledError
+from keyline_agent.runtime.loop import start_run
+from keyline_agent.runtime.recovery import resume_run, update_paused_step_limit
+from keyline_agent.runtime.runs import create_child_run
+from keyline_agent.runtime.secret_dependencies import resolve_secret_dependency
+from keyline_agent.runtime.state import (
     Run,
     RunStatus,
     Session,
@@ -37,14 +37,14 @@ from handshake.runtime.state import (
     WorkspaceBinding,
     WorktreeStatus,
 )
-from handshake.runtime.workspaces import execute_worktree_operation
-from handshake.storage.errors import WorktreeUnavailableError
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry, runtime_tool_definitions
-from handshake.tools.registry import ToolBinding
-from handshake.tools.secret_command import SecretCommandRunner
-from handshake.worktrees import manager as git_worktrees
-from handshake.worktrees.manager import WorktreeError, WorktreeManager
+from keyline_agent.runtime.workspaces import execute_worktree_operation
+from keyline_agent.storage.errors import WorktreeUnavailableError
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry, runtime_tool_definitions
+from keyline_agent.tools.registry import ToolBinding
+from keyline_agent.tools.secret_command import SecretCommandRunner
+from keyline_agent.worktrees import manager as git_worktrees
+from keyline_agent.worktrees.manager import WorktreeError, WorktreeManager
 from tests.history_support import run_async
 
 
@@ -331,7 +331,7 @@ async def test_integrate_and_reconcile_interruption(
         assert first_tree.integration_commit != first_tree.saved_commit
         if interrupt_at == "legacy_before_apply":
             pinned = git(case.repo, "for-each-ref", "--format=%(refname)",
-                         "refs/handshake/integrations/")
+                         "refs/keyline/integrations/")
             git(case.repo, "update-ref", "-d", pinned)
         git(case.repo, "gc", "--prune=now")
         if interrupt_at == "before_apply":
@@ -358,7 +358,7 @@ async def test_integrate_and_reconcile_interruption(
     assert not case.results()["accept-one"]["is_error"]
     assert not case.results()["repeat"]["is_error"]
     assert git(case.repo, "status", "--porcelain") == ""
-    assert git(case.repo, "for-each-ref", "refs/handshake/integrations/") == ""
+    assert git(case.repo, "for-each-ref", "refs/keyline/integrations/") == ""
     assert not (case.repo / ".git" / "MERGE_HEAD").exists()
     second_tree = store.load_worktree(second.run_id)
     assert second_tree is not None
@@ -1044,7 +1044,7 @@ async def test_abandon_after_interruption_and_main_advance(
     assert (case.repo / "child.txt").exists() is already_applied
     assert git(case.repo, "rev-parse", "HEAD") == user_head
     assert git(case.repo, "status", "--porcelain") == ""
-    assert git(case.repo, "for-each-ref", "refs/handshake/integrations/") == ""
+    assert git(case.repo, "for-each-ref", "refs/keyline/integrations/") == ""
 
 
 @pytest.mark.parametrize("abandon", [True, False], ids=["abandon", "integrate"])

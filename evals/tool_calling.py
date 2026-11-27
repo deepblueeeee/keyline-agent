@@ -13,10 +13,10 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from handshake.config.provider import DeepSeekConfig, read_deepseek_api_key
-from handshake.models.base import ModelAdapter, close_model
-from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
-from handshake.storage.sqlite import SQLiteStateStore
+from keyline_agent.config.provider import DeepSeekConfig, read_deepseek_api_key
+from keyline_agent.models.base import ModelAdapter, close_model
+from keyline_agent.models.deepseek_anthropic import DeepSeekAnthropicModel
+from keyline_agent.storage.sqlite import SQLiteStateStore
 
 from .judge import check_judge_input, judge_json
 from .tool_observations import EXCERPT_CHARS, VISIBLE_BLOCKS

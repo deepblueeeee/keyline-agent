@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from handshake.artifacts import open_text_artifact
-from handshake.config import DeepSeekConfig
-from handshake.context import (
+from keyline_agent.artifacts import open_text_artifact
+from keyline_agent.config import DeepSeekConfig
+from keyline_agent.context import (
     AgentContextManager,
     ContextBudgetPolicy,
     ContextPressureError,
@@ -16,14 +16,14 @@ from handshake.context import (
     RawHistorySegment,
     estimate_model_context,
 )
-from handshake.models.base import ToolDefinition
-from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.loop import start_run
-from handshake.runtime.state import Run, Session, ToolResult
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools.files import read_file
-from handshake.tools.registry import ToolBinding, ToolRegistry
+from keyline_agent.models.base import ToolDefinition
+from keyline_agent.models.protocol import ModelMessage, ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.loop import start_run
+from keyline_agent.runtime.state import Run, Session, ToolResult
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools.files import read_file
+from keyline_agent.tools.registry import ToolBinding, ToolRegistry
 from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, ingest, run_async
 
 _HISTORY: dict[str, list[ModelMessage]] = {}
@@ -137,7 +137,7 @@ def _tool_round(
 def test_ingress_externalizes_every_large_result_but_preserves_raw_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "keyline-agent-home"))
     session, run = _session_run(tmp_path)
     successful = "HEAD-success-" + "x" * 1_000 + "-TAIL-success"
     failed = "HEAD-failed-" + "y" * 1_000 + "-TAIL-failed"
@@ -411,7 +411,7 @@ def test_pressure_masks_every_stale_block_in_multi_result_message(
 def test_ingress_projection_is_replaced_when_result_becomes_stale_mask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "keyline-agent-home"))
     session, run = _session_run(tmp_path)
     _messages(session).extend(_tool_round(run.run_id, "read", "read_file", "x" * 4_000))
     _messages(session).append(
@@ -509,10 +509,10 @@ async def test_loop_externalizes_large_result_but_persists_complete_result(
         ]
     )
     session, run = _session_run(tmp_path)
-    store = SQLiteStateStore(tmp_path / "handshake.db")
+    store = SQLiteStateStore(tmp_path / "keyline.db")
     store.create_session(session)
-    home = tmp_path / "handshake-home"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    home = tmp_path / "keyline-agent-home"
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     manager = AgentContextManager(
         _policy(recent_messages=8, ingress_tokens=600), CharacterTokenEstimator()
     )
@@ -538,7 +538,7 @@ async def test_loop_externalizes_large_result_but_persists_complete_result(
     assert "lines=407" in visible
     assert json.loads(persisted)["stdout"] == original
     output_reference = visible.split("path=", 1)[1].split("]", 1)[0]
-    assert output_reference.startswith("@handshake/artifacts/")
+    assert output_reference.startswith("@keyline/artifacts/")
     recovered = read_file(
         session.workspace,
         {"path": output_reference, "start_character": 1, "end_character": 10_000},
@@ -553,7 +553,7 @@ def test_new_manager_rebuilds_masking_state_from_raw_sqlite_history(
     tmp_path: Path,
 ) -> None:
     session, run = _session_run(tmp_path)
-    store = SQLiteStateStore(tmp_path / "handshake.db")
+    store = SQLiteStateStore(tmp_path / "keyline.db")
     store.create_session(session)
     manager = AgentContextManager(
         _policy(

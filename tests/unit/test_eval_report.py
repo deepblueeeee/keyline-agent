@@ -9,7 +9,7 @@ import pytest
 
 from evals.cost import estimate_deepseek_cost
 from evals.report import EFFICIENCY, L1, L2, L3, build_report, compare, main, markdown
-from handshake.models.protocol import ModelUsage
+from keyline_agent.models.protocol import ModelUsage
 
 MODEL = "deepseek-flash"
 AGENT = ModelUsage(90, 25, cache_read_tokens=10)

@@ -2,9 +2,9 @@ import json
 import sys
 from pathlib import Path
 
-from handshake.inputs import EphemeralSecretStore
-from handshake.runtime.errors import UserCancelledError
-from handshake.tools.shell import process_tool_handler
+from keyline_agent.inputs import EphemeralSecretStore
+from keyline_agent.runtime.errors import UserCancelledError
+from keyline_agent.tools.shell import process_tool_handler
 
 
 def test_process_success_and_nonzero_exit(tmp_path: Path) -> None:
@@ -121,7 +121,7 @@ def test_cancelled_approval_cannot_start_command(tmp_path: Path) -> None:
 
     import pytest
 
-    from handshake.inputs.cancellation import cancellation_scope
+    from keyline_agent.inputs.cancellation import cancellation_scope
 
     cancelled = Event()
 

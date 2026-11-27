@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.config.approval import ApprovalMode, requires_approval
+from keyline_agent.config.approval import ApprovalMode, requires_approval
 
 
 @pytest.mark.parametrize(

@@ -20,12 +20,17 @@ from evals import _swebench_tools, swebench, swebench_run, swebench_workspace  #
 from evals.swebench import dataset_snapshot  # noqa: E402
 from evals.swebench_workspace import DockerWorkspace  # noqa: E402
 from evals.tasks import load_tasks  # noqa: E402
-from handshake.artifacts import store_text_artifact  # noqa: E402
-from handshake.models.errors import ModelProviderError  # noqa: E402
-from handshake.models.protocol import ModelContext, ModelTurn, ModelUsage, ToolCall  # noqa: E402
-from handshake.models.scripted import ScriptedModel  # noqa: E402
-from handshake.runtime.recovery import resume_run, update_paused_step_limit  # noqa: E402
-from handshake.storage.sqlite import SQLiteStateStore  # noqa: E402
+from keyline_agent.artifacts import store_text_artifact  # noqa: E402
+from keyline_agent.models.errors import ModelProviderError  # noqa: E402
+from keyline_agent.models.protocol import (  # noqa: E402
+    ModelContext,
+    ModelTurn,
+    ModelUsage,
+    ToolCall,
+)
+from keyline_agent.models.scripted import ScriptedModel  # noqa: E402
+from keyline_agent.runtime.recovery import resume_run, update_paused_step_limit  # noqa: E402
+from keyline_agent.storage.sqlite import SQLiteStateStore  # noqa: E402
 
 INSTANCE_ID = "sympy__sympy-20590"
 TASK = next(task for task in load_tasks() if task.instance_id == INSTANCE_ID)
@@ -262,14 +267,14 @@ def test_trial_restores_state_directory(
     error: type[BaseException] | None,
 ) -> None:
     if previous is None:
-        monkeypatch.delenv("HANDSHAKE_HOME", raising=False)
+        monkeypatch.delenv("KEYLINE_HOME", raising=False)
     else:
-        monkeypatch.setenv("HANDSHAKE_HOME", previous)
+        monkeypatch.setenv("KEYLINE_HOME", previous)
     trial_workspace.export_patch.return_value = ""
     directory = tmp_path / "trial"
 
     def prepare() -> None:
-        assert os.environ.get("HANDSHAKE_HOME") == str(directory)
+        assert os.environ.get("KEYLINE_HOME") == str(directory)
         if error is not None:
             raise error
 
@@ -281,7 +286,7 @@ def test_trial_restores_state_directory(
         result = swebench_run.run_trial(TASK, directory, BUDGET)
         assert result["status"] == ("error" if error else "empty_patch")
     trial_workspace.close.assert_called_once_with()
-    assert os.environ.get("HANDSHAKE_HOME") == previous
+    assert os.environ.get("KEYLINE_HOME") == previous
 
 
 def test_requests_are_capped_and_usage_is_written(tmp_path: Path) -> None:
@@ -338,7 +343,7 @@ def test_unsafe_container_is_removed_before_any_tool_executes() -> None:
 
 
 @pytest.mark.skipif(
-    os.environ.get("HANDSHAKE_EVAL_DOCKER_TEST") != "1", reason="requires Docker image"
+    os.environ.get("KEYLINE_EVAL_DOCKER_TEST") != "1", reason="requires Docker image"
 )
 def test_runtime_and_docker_share_checkout_and_export_patch(
     tmp_path: Path,
@@ -346,7 +351,7 @@ def test_runtime_and_docker_share_checkout_and_export_patch(
 ) -> None:
     (task,) = load_swebench_dataset(dataset_snapshot(TASK), "test", [INSTANCE_ID])
     spec = make_test_spec(task, namespace="swebench", instance_image_tag=TASK.image_tag)
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path))
     command = """import errno, os, socket, subprocess, sympy
 from pathlib import Path
 assert sympy.__file__.startswith('/testbed/')
@@ -355,8 +360,8 @@ assert not any(x in os.environ for x in credentials)
 assert os.geteuid() != 0
 assert not Path('/var/run/docker.sock').exists()
 assert not Path('/eval.sh').exists()
-assert not os.access('/.handshake-eval/tools.pyz', os.W_OK)
-assert not os.access('/.handshake-eval/baseline.git/config', os.W_OK)
+assert not os.access('/.keyline-agent-eval/tools.pyz', os.W_OK)
+assert not os.access('/.keyline-agent-eval/baseline.git/config', os.W_OK)
 assert subprocess.check_output(['git','rev-list','--all','--count'], text=True).strip() == '1'
 s = socket.socket(); s.settimeout(1)
 assert s.connect_ex(('192.0.2.1',80)) == errno.ENETUNREACH

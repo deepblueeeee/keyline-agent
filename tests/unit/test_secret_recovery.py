@@ -1,14 +1,14 @@
 from pathlib import Path
 
-from handshake.inputs import EphemeralSecretStore
-from handshake.models.protocol import ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.loop import prepare_run_for_resume, start_run
-from handshake.runtime.secret_dependencies import (
+from keyline_agent.inputs import EphemeralSecretStore
+from keyline_agent.models.protocol import ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.dependencies import resolve_text_dependency
+from keyline_agent.runtime.loop import prepare_run_for_resume, start_run
+from keyline_agent.runtime.secret_dependencies import (
     resolve_secret_dependency,
 )
-from handshake.runtime.state import (
+from keyline_agent.runtime.state import (
     Dependency,
     DependencyStatus,
     Run,
@@ -16,9 +16,9 @@ from handshake.runtime.state import (
     SecretHandleStatus,
     Session,
 )
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry
-from handshake.tools.secret_command import SecretCommandRunner
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry
+from keyline_agent.tools.secret_command import SecretCommandRunner
 from tests.history_support import TEST_AGENT_SPEC, run_async
 
 

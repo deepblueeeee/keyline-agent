@@ -6,13 +6,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
-from handshake.context import AgentContextManager, SequencedMessage
-from handshake.models.protocol import ModelMessage
-from handshake.runtime.agents import AgentSpec
-from handshake.runtime.persistence import RunStore
-from handshake.runtime.state import Run, Session
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry, runtime_tool_definitions
+from keyline_agent.context import AgentContextManager, SequencedMessage
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.runtime.agents import AgentSpec
+from keyline_agent.runtime.persistence import RunStore
+from keyline_agent.runtime.state import Run, Session
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry, runtime_tool_definitions
 
 TEST_AGENT_SPEC = AgentSpec(
     spec_id="test",

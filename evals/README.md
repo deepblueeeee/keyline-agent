@@ -1,4 +1,4 @@
-# Handshake evaluations
+# Keyline evaluations
 
 Run the commands below from the repository root with Python 3.11+, uv and Docker.
 The evaluator and its dependencies live in the separate `evals` environment.
@@ -16,7 +16,7 @@ are pinned in `tasks.toml`.
 
 ```sh
 uv run --project evals --locked python -m evals.swebench_run --live \
-  --instance-id sympy__sympy-20590 --trials 1 --output-dir .handshake/evals
+  --instance-id sympy__sympy-20590 --trials 1 --output-dir .keyline-agent/evals
 ```
 
 Repeat `--instance-id` or select `--suite regression` or `--suite capability`.

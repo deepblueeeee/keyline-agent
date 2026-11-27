@@ -7,7 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from handshake.models.protocol import ModelUsage
+from keyline_agent.models.protocol import ModelUsage
 
 from .compaction import RECALL, read_records
 from .cost import PRICE_DATE, estimate_deepseek_cost

@@ -7,8 +7,8 @@ from threading import Event
 
 import pytest
 
-import handshake.cli_input as cli_input
-from handshake.runtime.errors import UserCancelledError
+import keyline_agent.cli_input as cli_input
+from keyline_agent.runtime.errors import UserCancelledError
 from tests.history_support import run_async
 
 

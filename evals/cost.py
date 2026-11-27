@@ -1,8 +1,8 @@
-"""Estimate DeepSeek text API cost from Handshake's recorded token counts."""
+"""Estimate DeepSeek text API cost from Keyline's recorded token counts."""
 
 from decimal import Decimal
 
-from handshake.models.protocol import ModelUsage
+from keyline_agent.models.protocol import ModelUsage
 
 # DeepSeek pricing snapshot, 2026-11-25. Peak USD per million tokens, in the
 # order uncached input, cache read, output. Off-peak rates are half of peak.

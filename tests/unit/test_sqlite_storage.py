@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context import ContextCheckpoint, HistoryEpisode, SourceRange
-from handshake.models.protocol import ModelMessage
-from handshake.runtime.persistence import RunStore
-from handshake.runtime.state import (
+from keyline_agent.context import ContextCheckpoint, HistoryEpisode, SourceRange
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.runtime.persistence import RunStore
+from keyline_agent.runtime.state import (
     Dependency,
     Run,
     RunStatus,
     Session,
 )
-from handshake.storage.errors import RunNotFoundError, StorageError
-from handshake.storage.sqlite import SQLiteStateStore
+from keyline_agent.storage.errors import RunNotFoundError, StorageError
+from keyline_agent.storage.sqlite import SQLiteStateStore
 
 
 def _waiting_run(session: Session) -> tuple[Run, list[ModelMessage]]:
@@ -70,7 +70,7 @@ def _waiting_run(session: Session) -> tuple[Run, list[ModelMessage]]:
 
 
 def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> None:
-    database = tmp_path / "state" / "handshake.db"
+    database = tmp_path / "state" / "keyline.db"
     store: RunStore = SQLiteStateStore(database)
     session = Session(workspace=tmp_path)
     store.create_session(session)
@@ -122,7 +122,7 @@ def test_schema_initialization_and_session_run_round_trip(tmp_path: Path) -> Non
 
 
 def test_messages_are_append_only_and_support_range_queries(tmp_path: Path) -> None:
-    database = tmp_path / "handshake.db"
+    database = tmp_path / "keyline.db"
     store = SQLiteStateStore(database)
     session = Session(workspace=tmp_path)
     store.create_session(session)
@@ -157,7 +157,7 @@ def test_messages_are_append_only_and_support_range_queries(tmp_path: Path) -> N
 def test_context_checkpoint_is_small_separate_metadata_with_revision_cas(
     tmp_path: Path,
 ) -> None:
-    database = tmp_path / "handshake.db"
+    database = tmp_path / "keyline.db"
     store = SQLiteStateStore(database)
     session = Session(workspace=tmp_path)
     store.create_session(session)
@@ -213,7 +213,7 @@ def test_context_checkpoint_is_small_separate_metadata_with_revision_cas(
 def test_incompatible_development_schema_is_rejected(
     tmp_path: Path, old_version: int
 ) -> None:
-    database = tmp_path / "handshake.db"
+    database = tmp_path / "keyline.db"
     with sqlite3.connect(database) as connection:
         connection.execute(f"PRAGMA user_version = {old_version}")
 
@@ -226,7 +226,7 @@ def test_environment_api_key_is_not_written_to_database(
 ) -> None:
     secret = "canary-key-that-must-not-be-persisted"
     monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
-    database = tmp_path / "handshake.db"
+    database = tmp_path / "keyline.db"
     store = SQLiteStateStore(database)
     session = Session(workspace=tmp_path)
     store.create_session(session)
@@ -237,7 +237,7 @@ def test_environment_api_key_is_not_written_to_database(
 
 
 def test_checkpoint_failure_rolls_back_the_complete_snapshot(tmp_path: Path) -> None:
-    store = SQLiteStateStore(tmp_path / "handshake.db")
+    store = SQLiteStateStore(tmp_path / "keyline.db")
     session = Session(workspace=tmp_path)
     store.create_session(session)
     run, messages = _waiting_run(session)
@@ -262,7 +262,7 @@ def test_checkpoint_failure_rolls_back_the_complete_snapshot(tmp_path: Path) -> 
 
 
 def test_run_goal_cannot_change_after_creation(tmp_path: Path) -> None:
-    store = SQLiteStateStore(tmp_path / "handshake.db")
+    store = SQLiteStateStore(tmp_path / "keyline.db")
     session = Session(workspace=tmp_path)
     store.create_session(session)
     run, messages = _waiting_run(session)

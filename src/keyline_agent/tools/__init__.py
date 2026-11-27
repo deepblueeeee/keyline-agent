@@ -1,0 +1,45 @@
+"""Composition root for workspace tools exposed to models."""
+
+from keyline_agent.models.base import ToolDefinition
+from keyline_agent.tools.delegate import DELEGATE_TOOL
+from keyline_agent.tools.files import file_tool_bindings
+from keyline_agent.tools.plan import PLAN_TOOL, handle_plan
+from keyline_agent.tools.registry import ToolRegistry
+from keyline_agent.tools.secret_command import SECRET_COMMAND_TOOL
+from keyline_agent.tools.secret_wait import SECRET_WAIT_TOOL, prepare_secret_dependency
+from keyline_agent.tools.shell import ApprovalCallback, AsyncApprovalCallback, process_tool_bindings
+from keyline_agent.tools.text_wait import TEXT_WAIT_TOOL, prepare_text_dependency
+from keyline_agent.tools.worktree import WORKTREE_TOOLS
+
+
+def create_default_registry(
+    approval: ApprovalCallback, *, async_approval: AsyncApprovalCallback | None = None
+) -> ToolRegistry:
+    """Create the explicit MVP tool registry."""
+    registry = ToolRegistry()
+    bindings = (*file_tool_bindings(), *process_tool_bindings(approval, async_approval))
+    for binding in bindings:
+        registry.register(binding)
+    return registry
+
+
+def runtime_tool_definitions() -> tuple[ToolDefinition, ...]:
+    """Return tools whose lifecycle is coordinated directly by the runtime."""
+    return (PLAN_TOOL, TEXT_WAIT_TOOL, SECRET_WAIT_TOOL, SECRET_COMMAND_TOOL, DELEGATE_TOOL,
+            *WORKTREE_TOOLS)
+
+
+__all__ = [
+    "ApprovalCallback",
+    "DELEGATE_TOOL",
+    "PLAN_TOOL",
+    "SECRET_WAIT_TOOL",
+    "SECRET_COMMAND_TOOL",
+    "TEXT_WAIT_TOOL",
+    "ToolRegistry",
+    "create_default_registry",
+    "handle_plan",
+    "prepare_secret_dependency",
+    "prepare_text_dependency",
+    "runtime_tool_definitions",
+]

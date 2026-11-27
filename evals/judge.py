@@ -6,9 +6,9 @@ import re
 from dataclasses import asdict
 from typing import Any
 
-from handshake.models.base import ModelAdapter
-from handshake.models.errors import ModelProtocolError, ModelProviderError
-from handshake.models.protocol import ModelContext, ModelMessage
+from keyline_agent.models.base import ModelAdapter
+from keyline_agent.models.errors import ModelProtocolError, ModelProviderError
+from keyline_agent.models.protocol import ModelContext, ModelMessage
 
 
 def check_judge_input(payload: str, api_key: str) -> None:

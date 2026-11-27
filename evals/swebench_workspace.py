@@ -18,15 +18,15 @@ from docker.types import LogConfig
 from requests.exceptions import ConnectionError as DockerConnectionError
 from requests.exceptions import ReadTimeout
 
-import handshake
-from handshake.runtime.state import ToolResult
-from handshake.tools.files import read_file
-from handshake.tools.shell import parse_process_arguments
+import keyline_agent
+from keyline_agent.runtime.state import ToolResult
+from keyline_agent.tools.files import read_file
+from keyline_agent.tools.shell import parse_process_arguments
 
 COMMAND_TIMEOUT_SECONDS = 60
 _TESTBED = "/testbed"
 _PATH = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
-_PRIVATE = "/.handshake-eval"
+_PRIVATE = "/.keyline-agent-eval"
 _BASELINE = f"{_PRIVATE}/baseline.git"
 _TOOL_APP = f"{_PRIVATE}/tools.pyz"
 _PYTHON = "/opt/miniconda3/bin/python"
@@ -36,7 +36,7 @@ _RETRYABLE_IMAGE_ERRORS = {408, 429, 500, 502, 503, 504}
 
 def _tool_archive() -> bytes:
     """Package the current file handlers and their standard-library dependencies."""
-    package = Path(handshake.__file__).parent
+    package = Path(keyline_agent.__file__).parent
     app = BytesIO()
     with ZipFile(app, "w", ZIP_DEFLATED) as zip_app:
         zip_app.write(Path(__file__).with_name("_swebench_tools.py"), "__main__.py")
@@ -198,7 +198,7 @@ class DockerWorkspace:
         self._check_workspace(workspace)
         path = arguments.get("path")
         if name == "read_file" and isinstance(path, str) and (
-            path == "@handshake/artifacts" or path.startswith("@handshake/artifacts/")
+            path == "@keyline/artifacts" or path.startswith("@keyline/artifacts/")
         ):
             return read_file(workspace, arguments)
         # Split JSON into argv chunks to stay below Linux's per-argument byte limit.

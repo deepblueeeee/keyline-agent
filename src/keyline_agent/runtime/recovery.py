@@ -1,0 +1,138 @@
+"""Resume a run from its last durable model and tool boundary."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from keyline_agent.context import AgentContextManager, LLMHistoryCondenser
+from keyline_agent.errors import KeylineError
+from keyline_agent.models.base import ModelAdapter
+from keyline_agent.models.protocol import ModelMessage, ToolCall
+from keyline_agent.runtime.agents import AgentSpec, model_name_for_run
+from keyline_agent.runtime.errors import AgentLoopError, UserCancelledError
+from keyline_agent.runtime.loop import (
+    EmitCallback,
+    _append_tool_results,
+    _checkpoint,
+    _execute_tool_calls,
+    _run_tail_message,
+    _run_turns,
+    _sync_context,
+    _terminate_run,
+)
+from keyline_agent.runtime.persistence import RunStore
+from keyline_agent.runtime.scheduler import CooperativeScheduler
+from keyline_agent.runtime.secret_dependencies import (
+    reissue_lost_secret_dependencies,
+    request_pending_tool_secrets,
+)
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.tools import DELEGATE_TOOL, SECRET_WAIT_TOOL, TEXT_WAIT_TOOL
+from keyline_agent.tools.registry import ToolRegistry
+from keyline_agent.tools.secret_command import SecretCommandRunner
+
+if TYPE_CHECKING:
+    from keyline_agent.runtime.delegation import DelegationRuntime
+
+
+def update_paused_step_limit(session: Session, run: Run, limit: int, *, store: RunStore) -> None:
+    """Save a new limit and make the paused run runnable if it has room to continue."""
+    if run.session_id != session.session_id or run.status is not RunStatus.PAUSED:
+        raise AgentLoopError("Only a paused run in this session can change its step limit")
+    if limit < 0:
+        raise ValueError("max_steps must be >= 0")
+    run.max_steps = limit
+    if limit == 0 or run.model_turns < limit:
+        run.transition(RunStatus.RUNNING)
+    store.checkpoint_run(session, run)
+
+
+async def resume_run(
+    session: Session,
+    run: Run,
+    model: ModelAdapter,
+    registry: ToolRegistry,
+    *,
+    store: RunStore,
+    agent_spec: AgentSpec,
+    emit: EmitCallback | None = None,
+    secret_command_runner: SecretCommandRunner | None = None,
+    context_manager: AgentContextManager | None = None,
+    delegation: DelegationRuntime | None = None,
+    scheduler: CooperativeScheduler | None = None,
+) -> Run:
+    """Resume a running run from its last durable protocol and tool boundary."""
+    scheduler = scheduler or (delegation.scheduler if delegation else CooperativeScheduler())
+    with scheduler.run_scope(run):
+        if run.status is not RunStatus.RUNNING or run.session_id != session.session_id:
+            raise AgentLoopError("Only a running run in this session can be resumed")
+        run.model_name = model_name_for_run(run, agent_spec)
+        output = emit or (lambda _message: None)
+        model = scheduler.model(model)
+        manager = context_manager or AgentContextManager(
+            policy=agent_spec.default_budget,
+            condenser=LLMHistoryCondenser(model),
+            scope_id=run.context_scope_id,
+        )
+        if isinstance(manager.condenser, LLMHistoryCondenser):
+            manager.condenser.model = scheduler.model(manager.condenser.model)
+        manager.bind_scope(run.context_scope_id)
+        _sync_context(run, store, manager)
+        message = _run_tail_message(run, store)
+        if message is None:
+            raise AgentLoopError("Running run does not own the context tail")
+        if message.role == "assistant":
+            calls: list[ToolCall] = []
+            for block in message.content:
+                if block.get("type") != "tool_use":
+                    continue
+                call_id = block.get("id")
+                name = block.get("name")
+                arguments = block.get("input")
+                if (
+                    not isinstance(call_id, str)
+                    or not isinstance(name, str)
+                    or not isinstance(arguments, dict)
+                ):
+                    raise AgentLoopError("Stored tool call is invalid")
+                calls.append(ToolCall(call_id, name, arguments))
+            if not calls or any(
+                call.name in {TEXT_WAIT_TOOL.name, SECRET_WAIT_TOOL.name, DELEGATE_TOOL.name}
+                for call in calls
+            ):
+                raise AgentLoopError("Running run has no resumable workspace tool turn")
+            if secret_command_runner is not None and request_pending_tool_secrets(
+                run, calls, secret_command_runner, allowed_tools=agent_spec.allowed_tools,
+            ):
+                store.checkpoint_run(session, run)
+                output("Secret was lost before tool execution; waiting for re-entry")
+                return run
+            pending: list[ModelMessage] = []
+            try:
+                results = await _execute_tool_calls(
+                    session, run, tuple(calls), registry, secret_command_runner,
+                    output, store, pending, scheduler,
+                    delegation.worktrees if delegation is not None else None,
+                    agent_spec.allowed_tools,
+                )
+                _append_tool_results(pending, run, tuple(calls), results)
+            except UserCancelledError as exc:
+                _terminate_run(run, RunStatus.CANCELLED, str(exc))
+                _checkpoint(session, run, store, manager, pending)
+                raise
+            except KeylineError as exc:
+                _terminate_run(run, RunStatus.FAILED, str(exc))
+                _checkpoint(session, run, store, manager, pending)
+                raise
+            _checkpoint(session, run, store, manager, pending)
+            if secret_command_runner is not None and reissue_lost_secret_dependencies(
+                run, secret_command_runner
+            ):
+                store.checkpoint_run(session, run)
+                return run
+        elif message.role != "user":
+            raise AgentLoopError("Running run has invalid model history")
+        return await _run_turns(
+            session, run, model, registry, secret_command_runner, output,
+            store, manager, agent_spec, delegation, scheduler,
+        )

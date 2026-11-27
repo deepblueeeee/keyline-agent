@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from handshake.models.protocol import ModelMessage
-from handshake.runtime.errors import AgentLoopError
-from handshake.runtime.runs import create_followup_run, create_initial_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.storage.errors import StorageError
-from handshake.storage.sqlite import SQLiteStateStore
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.runtime.errors import AgentLoopError
+from keyline_agent.runtime.runs import create_followup_run, create_initial_run
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.storage.errors import StorageError
+from keyline_agent.storage.sqlite import SQLiteStateStore
 
 
 def _completed_initial_run(session: Session) -> tuple[Run, tuple[ModelMessage, ...]]:
@@ -97,7 +97,7 @@ def test_failed_or_cancelled_run_allows_followup(
 
 
 def test_competing_followup_run_cannot_fork_session_history(tmp_path: Path) -> None:
-    store = SQLiteStateStore(tmp_path / "handshake.db")
+    store = SQLiteStateStore(tmp_path / "keyline.db")
     session = Session(workspace=tmp_path)
     store.create_session(session)
     first, messages = _completed_initial_run(session)

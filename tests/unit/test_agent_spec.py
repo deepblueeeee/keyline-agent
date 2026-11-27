@@ -1,23 +1,23 @@
 import pytest
 
-from handshake.context import AgentContextManager, ContextViewError
-from handshake.context.budget import ContextBudgetPolicy
-from handshake.models.errors import ModelProtocolError
-from handshake.models.protocol import ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.agents import (
+from keyline_agent.context import AgentContextManager, ContextViewError
+from keyline_agent.context.budget import ContextBudgetPolicy
+from keyline_agent.models.errors import ModelProtocolError
+from keyline_agent.models.protocol import ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.agents import (
     AgentSpec,
     demo_agent_spec,
     main_agent_spec,
     model_name_for_run,
 )
-from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.errors import AgentLoopError
-from handshake.runtime.loop import continue_run, start_run
-from handshake.runtime.runs import create_initial_run
-from handshake.runtime.state import RunStatus, Session
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry
+from keyline_agent.runtime.dependencies import resolve_text_dependency
+from keyline_agent.runtime.errors import AgentLoopError
+from keyline_agent.runtime.loop import continue_run, start_run
+from keyline_agent.runtime.runs import create_initial_run
+from keyline_agent.runtime.state import RunStatus, Session
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry
 from tests.history_support import run_async
 
 
@@ -53,7 +53,7 @@ def test_named_specs_define_their_own_instructions() -> None:
 
     assert main.spec_id == "main"
     assert main.instructions.startswith(
-        "You are Handshake, a local coding agent operating on one workspace."
+        "You are Keyline, a local coding agent operating on one workspace."
     )
     assert "main coding agent" not in main.instructions
     assert "delegate" not in main.instructions

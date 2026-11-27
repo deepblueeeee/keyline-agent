@@ -1,7 +1,7 @@
 import pytest
 
-from handshake.runtime.errors import InvalidStateTransitionError
-from handshake.runtime.state import (
+from keyline_agent.runtime.errors import InvalidStateTransitionError
+from keyline_agent.runtime.state import (
     Dependency,
     DependencyStatus,
     Run,

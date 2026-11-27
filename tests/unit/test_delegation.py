@@ -4,19 +4,19 @@ from pathlib import Path
 
 import pytest
 
-import handshake.runtime.delegation as runtime_delegation
-from handshake.context import ActiveContextManagers
-from handshake.context.budget import ContextBudgetPolicy
-from handshake.models.protocol import ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.agents import AgentSpec, child_agent_specs
-from handshake.runtime.delegation import DelegationRuntime, continue_delegation
-from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.loop import continue_run, start_run
-from handshake.runtime.recovery import resume_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry
+import keyline_agent.runtime.delegation as runtime_delegation
+from keyline_agent.context import ActiveContextManagers
+from keyline_agent.context.budget import ContextBudgetPolicy
+from keyline_agent.models.protocol import ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.agents import AgentSpec, child_agent_specs
+from keyline_agent.runtime.delegation import DelegationRuntime, continue_delegation
+from keyline_agent.runtime.dependencies import resolve_text_dependency
+from keyline_agent.runtime.loop import continue_run, start_run
+from keyline_agent.runtime.recovery import resume_run
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry
 from tests.history_support import run_async
 
 
@@ -903,7 +903,7 @@ async def test_storage_failure_interrupts_inflight_sibling_without_join(
 ) -> None:
     import asyncio
 
-    from handshake.storage.errors import StorageError
+    from keyline_agent.storage.errors import StorageError
 
     calls = tuple(
         ToolCall(goal, "delegate", {"agent_spec_id": "explorer", "goal": goal})
@@ -953,7 +953,7 @@ async def test_child_cleanup_failure_keeps_outcome_and_sibling_progress(
 ) -> None:
     import asyncio
 
-    from handshake.models.errors import ModelProviderError
+    from keyline_agent.models.errors import ModelProviderError
 
     calls = tuple(
         ToolCall(goal, "delegate", {"agent_spec_id": "explorer", "goal": goal})
@@ -1002,7 +1002,7 @@ async def test_child_cleanup_failure_keeps_outcome_and_sibling_progress(
 async def test_continue_delegation_cannot_reenter_a_running_parent(tmp_path: Path) -> None:
     import asyncio
 
-    from handshake.runtime.errors import AgentLoopError
+    from keyline_agent.runtime.errors import AgentLoopError
 
     call = ToolCall("child", "delegate", {"agent_spec_id": "explorer", "goal": "child"})
     setup = _setup(tmp_path, [_tool_turn(call), _final("joined")], [])

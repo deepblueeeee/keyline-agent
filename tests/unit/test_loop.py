@@ -3,30 +3,30 @@ from pathlib import Path
 
 import pytest
 
-import handshake.runtime.loop as runtime_loop
-from handshake.context import SequencedMessage
-from handshake.inputs import EphemeralSecretStore
-from handshake.models.errors import ModelProtocolError, ModelProviderError
-from handshake.models.protocol import ModelMessage, ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.errors import UserCancelledError
-from handshake.runtime.loop import continue_run, start_run
-from handshake.runtime.persistence import RunStore
-from handshake.runtime.recovery import resume_run, update_paused_step_limit
-from handshake.runtime.runs import create_followup_run
-from handshake.runtime.secret_dependencies import resolve_secret_dependency
-from handshake.runtime.state import (
+import keyline_agent.runtime.loop as runtime_loop
+from keyline_agent.context import SequencedMessage
+from keyline_agent.inputs import EphemeralSecretStore
+from keyline_agent.models.errors import ModelProtocolError, ModelProviderError
+from keyline_agent.models.protocol import ModelMessage, ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.dependencies import resolve_text_dependency
+from keyline_agent.runtime.errors import UserCancelledError
+from keyline_agent.runtime.loop import continue_run, start_run
+from keyline_agent.runtime.persistence import RunStore
+from keyline_agent.runtime.recovery import resume_run, update_paused_step_limit
+from keyline_agent.runtime.runs import create_followup_run
+from keyline_agent.runtime.secret_dependencies import resolve_secret_dependency
+from keyline_agent.runtime.state import (
     DependencyKind,
     DependencyStatus,
     Run,
     RunStatus,
     Session,
 )
-from handshake.storage.errors import StorageError
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry
-from handshake.tools.secret_command import SecretCommandRunner
+from keyline_agent.storage.errors import StorageError
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry
+from keyline_agent.tools.secret_command import SecretCommandRunner
 from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, run_async
 
 

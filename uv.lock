@@ -134,7 +134,7 @@ wheels = [
 ]
 
 [[package]]
-name = "handshake"
+name = "keyline-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

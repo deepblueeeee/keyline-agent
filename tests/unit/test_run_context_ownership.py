@@ -3,22 +3,22 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context import (
+from keyline_agent.context import (
     ActiveContextManagers,
     AgentContextManager,
     ContextBudgetPolicy,
     ContextCheckpoint,
     ContextViewError,
 )
-from handshake.models.protocol import ModelMessage
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.agents import AgentSpec
-from handshake.runtime.errors import AgentLoopError
-from handshake.runtime.loop import context_manager_for_run
-from handshake.runtime.persistence import RunStore
-from handshake.runtime.runs import create_followup_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.storage.errors import StorageError
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.agents import AgentSpec
+from keyline_agent.runtime.errors import AgentLoopError
+from keyline_agent.runtime.loop import context_manager_for_run
+from keyline_agent.runtime.persistence import RunStore
+from keyline_agent.runtime.runs import create_followup_run
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.storage.errors import StorageError
 from tests.history_support import fresh_store
 
 

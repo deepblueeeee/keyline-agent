@@ -11,9 +11,9 @@ from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
 
-import handshake.config  # noqa: F401 - Initialize config before its artifact readers.
-from handshake.runtime.state import ToolResult
-from handshake.tools import create_default_registry
+import keyline_agent.config  # noqa: F401 - Initialize config before its artifact readers.
+from keyline_agent.runtime.state import ToolResult
+from keyline_agent.tools import create_default_registry
 
 _MAX_OUTPUT = 4 * 1024 * 1024
 

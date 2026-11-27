@@ -12,15 +12,15 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from handshake.config.provider import DeepSeekConfig, read_deepseek_api_key
-from handshake.context.budget import Utf8TokenEstimator, compact_json
-from handshake.context.condenser import LLMHistoryCondenser
-from handshake.context.reduction import same_tool_round
-from handshake.context.state import SequencedMessage
-from handshake.models.base import ModelAdapter, close_model
-from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
-from handshake.models.errors import ModelProtocolError, ModelProviderError
-from handshake.models.protocol import ModelMessage
+from keyline_agent.config.provider import DeepSeekConfig, read_deepseek_api_key
+from keyline_agent.context.budget import Utf8TokenEstimator, compact_json
+from keyline_agent.context.condenser import LLMHistoryCondenser
+from keyline_agent.context.reduction import same_tool_round
+from keyline_agent.context.state import SequencedMessage
+from keyline_agent.models.base import ModelAdapter, close_model
+from keyline_agent.models.deepseek_anthropic import DeepSeekAnthropicModel
+from keyline_agent.models.errors import ModelProtocolError, ModelProviderError
+from keyline_agent.models.protocol import ModelMessage
 
 from .judge import check_judge_input, judge_json
 

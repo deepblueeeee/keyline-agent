@@ -2,11 +2,11 @@ import shutil
 import sys
 from pathlib import Path
 
-from handshake.models.protocol import ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.loop import start_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.tools import create_default_registry
+from keyline_agent.models.protocol import ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.loop import start_run
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.tools import create_default_registry
 from tests.history_support import TEST_AGENT_SPEC, fresh_store, run_async
 
 

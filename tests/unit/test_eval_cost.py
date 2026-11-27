@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 
 from evals.cost import estimate_deepseek_cost
-from handshake.models.protocol import ModelUsage
+from keyline_agent.models.protocol import ModelUsage
 
 
 @pytest.mark.parametrize(

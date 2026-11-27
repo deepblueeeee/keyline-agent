@@ -2,10 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from handshake.models.protocol import ModelMessage
-from handshake.runtime.dependencies import resolve_text_dependency
-from handshake.runtime.errors import WaitResolutionError
-from handshake.runtime.state import (
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.runtime.dependencies import resolve_text_dependency
+from keyline_agent.runtime.errors import WaitResolutionError
+from keyline_agent.runtime.state import (
     Dependency,
     DependencyStatus,
     Run,

@@ -4,14 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from handshake.config import credentials as provider_credentials
-from handshake.config import read_deepseek_api_key
-from handshake.errors import HandshakeError
+from keyline_agent.config import credentials as provider_credentials
+from keyline_agent.config import read_deepseek_api_key
+from keyline_agent.errors import KeylineError
 
 
 @pytest.fixture
 def credential_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    path = tmp_path / ".keyline-agent" / "credentials" / "deepseek_api_key"
     monkeypatch.setattr(provider_credentials, "_credential_path", lambda: path)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     return path
@@ -42,7 +42,7 @@ def test_environment_key_takes_precedence(
 def test_missing_key_gives_setup_instruction(credential_path: Path) -> None:
     assert not credential_path.exists()
 
-    with pytest.raises(HandshakeError, match="handshake config set-api-key"):
+    with pytest.raises(KeylineError, match="keyline-agent config set-api-key"):
         read_deepseek_api_key()
 
 
@@ -50,7 +50,7 @@ def test_saved_key_rejects_loose_permissions_and_symlinks(credential_path: Path)
     provider_credentials.save_deepseek_api_key("private-canary-key")
     credential_path.chmod(0o644)
 
-    with pytest.raises(HandshakeError, match="mode 0600") as captured:
+    with pytest.raises(KeylineError, match="mode 0600") as captured:
         provider_credentials.read_saved_deepseek_api_key()
     assert "private-canary-key" not in str(captured.value)
 
@@ -58,16 +58,16 @@ def test_saved_key_rejects_loose_permissions_and_symlinks(credential_path: Path)
     other = credential_path.parent / "other"
     other.write_text("other-canary-key", encoding="utf-8")
     credential_path.symlink_to(other)
-    with pytest.raises(HandshakeError, match="private regular file"):
+    with pytest.raises(KeylineError, match="private regular file"):
         provider_credentials.read_saved_deepseek_api_key()
-    with pytest.raises(HandshakeError, match="not a regular file"):
+    with pytest.raises(KeylineError, match="not a regular file"):
         provider_credentials.save_deepseek_api_key("replacement-canary-key")
     assert other.read_text(encoding="utf-8") == "other-canary-key"
 
 
 def test_invalid_input_is_not_written(credential_path: Path) -> None:
     for value in ("", " leading-space", "two\nlines"):
-        with pytest.raises(HandshakeError, match="single-line"):
+        with pytest.raises(KeylineError, match="single-line"):
             provider_credentials.save_deepseek_api_key(value)
     assert not credential_path.exists()
 
@@ -76,7 +76,7 @@ def test_private_directory_must_not_be_world_accessible(credential_path: Path) -
     provider_credentials.save_deepseek_api_key("private-canary-key")
     credential_path.parent.chmod(0o755)
 
-    with pytest.raises(HandshakeError, match="unsafe permissions"):
+    with pytest.raises(KeylineError, match="unsafe permissions"):
         provider_credentials.read_saved_deepseek_api_key()
 
 
@@ -87,6 +87,6 @@ def test_saved_key_does_not_follow_credential_directory_symlink(
     elsewhere.mkdir(parents=True, mode=0o700)
     credential_path.parent.symlink_to(elsewhere, target_is_directory=True)
 
-    with pytest.raises(HandshakeError, match="unsafe permissions"):
+    with pytest.raises(KeylineError, match="unsafe permissions"):
         provider_credentials.save_deepseek_api_key("private-canary-key")
     assert not (elsewhere / credential_path.name).exists()

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.tools.files import (
+from keyline_agent.tools.files import (
     edit_file,
     file_tool_bindings,
     list_files,
@@ -10,8 +10,8 @@ from handshake.tools.files import (
     search_files,
     write_file,
 )
-from handshake.tools.registry import ToolRegistry
-from handshake.tools.shell import process_tool_bindings
+from keyline_agent.tools.registry import ToolRegistry
+from keyline_agent.tools.shell import process_tool_bindings
 
 
 def test_file_module_owns_definition_handler_bindings() -> None:

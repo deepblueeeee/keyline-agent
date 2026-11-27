@@ -4,12 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context.condenser import LLMHistoryCondenser
-from handshake.models.protocol import ModelContext, ModelTurn
-from handshake.runtime.errors import AgentLoopError
-from handshake.runtime.scheduler import CooperativeScheduler, run_blocking
-from handshake.runtime.state import Run, RunStatus, Session, ToolResult
-from handshake.tools.registry import ToolRegistry
+from keyline_agent.context.condenser import LLMHistoryCondenser
+from keyline_agent.models.protocol import ModelContext, ModelTurn
+from keyline_agent.runtime.errors import AgentLoopError
+from keyline_agent.runtime.scheduler import CooperativeScheduler, run_blocking
+from keyline_agent.runtime.state import Run, RunStatus, Session, ToolResult
+from keyline_agent.tools.registry import ToolRegistry
 from tests.history_support import run_async
 
 
@@ -204,9 +204,9 @@ async def test_runtime_entry_claims_scope_before_mutation(
 ) -> None:
     from dataclasses import replace
 
-    from handshake.models.scripted import ScriptedModel
-    from handshake.runtime.loop import continue_run, start_run
-    from handshake.runtime.recovery import resume_run
+    from keyline_agent.models.scripted import ScriptedModel
+    from keyline_agent.runtime.loop import continue_run, start_run
+    from keyline_agent.runtime.recovery import resume_run
     from tests.history_support import TEST_AGENT_SPEC, fresh_store
 
     session = Session(workspace=tmp_path)

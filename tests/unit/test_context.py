@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context import (
+from keyline_agent.context import (
     AgentContextManager,
     ContextView,
     ContextViewError,
@@ -14,9 +14,9 @@ from handshake.context import (
     SequencedMessage,
     SourceRange,
 )
-from handshake.models.protocol import ModelMessage
-from handshake.runtime.state import Dependency, DependencyKind, Run, Session
-from handshake.tools import TEXT_WAIT_TOOL
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.runtime.state import Dependency, DependencyKind, Run, Session
+from keyline_agent.tools import TEXT_WAIT_TOOL
 from tests.history_support import ingest, run_async
 
 

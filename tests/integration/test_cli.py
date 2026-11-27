@@ -11,20 +11,20 @@ from typing import Any
 
 import pytest
 
-import handshake.cli as cli
-import handshake.runtime.loop as runtime_loop
-from handshake.config import credentials as provider_credentials
-from handshake.config.approval import ApprovalMode
-from handshake.context import AgentContextManager
-from handshake.models.protocol import ModelContext, ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.state import (
+import keyline_agent.cli as cli
+import keyline_agent.runtime.loop as runtime_loop
+from keyline_agent.config import credentials as provider_credentials
+from keyline_agent.config.approval import ApprovalMode
+from keyline_agent.context import AgentContextManager
+from keyline_agent.models.protocol import ModelContext, ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.state import (
     DependencyStatus,
     RunStatus,
     SecretHandleStatus,
 )
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools import create_default_registry
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools import create_default_registry
 from tests.history_support import history
 
 
@@ -230,7 +230,7 @@ class _SecretFlagshipModel:
 
 
 def _store(home: Path) -> SQLiteStateStore:
-    return SQLiteStateStore(home / "handshake.db")
+    return SQLiteStateStore(home / "keyline.db")
 
 
 def test_demo_runs_without_api_key(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -249,14 +249,14 @@ def test_real_run_requires_api_key(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         provider_credentials,
         "_credential_path",
-        lambda: tmp_path / ".handshake" / "credentials" / "deepseek_api_key",
+        lambda: tmp_path / ".keyline-agent" / "credentials" / "deepseek_api_key",
     )
 
     exit_code = cli.main(["run", str(tmp_path), "inspect the repository"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "handshake config set-api-key" in captured.err
+    assert "keyline-agent config set-api-key" in captured.err
 
 
 def test_config_show_displays_effective_nonsecret_settings(
@@ -265,13 +265,13 @@ def test_config_show_displays_effective_nonsecret_settings(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = tmp_path / "state"
-    config_home = Path.home() / ".handshake"
+    config_home = Path.home() / ".keyline-agent"
     config_home.mkdir(mode=0o700)
     (config_home / "config.toml").write_text(
         "[model]\nmax_tokens = 4096\n[context]\ncontext_window_tokens = 131072\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "never-print-this-key")
 
     assert cli.main(["config", "show"]) == 0
@@ -312,13 +312,13 @@ def test_run_uses_configured_provider_and_context_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "state"
-    config_home = Path.home() / ".handshake"
+    config_home = Path.home() / ".keyline-agent"
     config_home.mkdir(mode=0o700)
     (config_home / "config.toml").write_text(
         "[model]\nmax_tokens = 4096\n[context]\ncontext_window_tokens = 32768\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-provider-key")
     monkeypatch.setattr(sys, "stdin", _TTY(False))
     supplied: list[dict[str, Any]] = []
@@ -349,11 +349,11 @@ def test_resume_reloads_context_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "state"
-    config_home = Path.home() / ".handshake"
+    config_home = Path.home() / ".keyline-agent"
     config_home.mkdir(mode=0o700)
     config_path = config_home / "config.toml"
     config_path.write_text("[context]\ncontext_window_tokens = 131072\n", encoding="utf-8")
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setenv("DEEPSEEK_MODEL", "old-model")
     model_names: list[str] = []
 
@@ -396,7 +396,7 @@ def test_config_set_api_key_uses_hidden_input_without_echo_or_session(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     canary = "local-provider-canary-key"
-    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    credential_path = tmp_path / ".keyline-agent" / "credentials" / "deepseek_api_key"
     monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: canary)
@@ -408,7 +408,7 @@ def test_config_set_api_key_uses_hidden_input_without_echo_or_session(
     assert "saved" in captured.out
     assert canary not in captured.out + captured.err
     assert credential_path.read_text(encoding="utf-8") == canary
-    assert not (tmp_path / ".handshake" / "handshake.db").exists()
+    assert not (tmp_path / ".keyline-agent" / "keyline.db").exists()
 
 
 def test_config_set_api_key_rejects_noninteractive_stdin(
@@ -416,7 +416,7 @@ def test_config_set_api_key_rejects_noninteractive_stdin(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    credential_path = tmp_path / ".keyline-agent" / "credentials" / "deepseek_api_key"
     monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
     monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
 
@@ -430,7 +430,7 @@ def test_config_set_api_key_rejects_visible_getpass_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
+    credential_path = tmp_path / ".keyline-agent" / "credentials" / "deepseek_api_key"
     monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
 
@@ -456,8 +456,8 @@ def test_real_run_reads_saved_key_without_persisting_it(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     home = tmp_path / "state"
-    credential_path = tmp_path / ".handshake" / "credentials" / "deepseek_api_key"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    credential_path = tmp_path / ".keyline-agent" / "credentials" / "deepseek_api_key"
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(provider_credentials, "_credential_path", lambda: credential_path)
     monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
@@ -475,14 +475,14 @@ def test_real_run_reads_saved_key_without_persisting_it(
     assert supplied_keys == [canary]
     assert "Completed with saved credential." in captured.out
     assert canary not in captured.out + captured.err
-    assert canary.encode() not in (home / "handshake.db").read_bytes()
+    assert canary.encode() not in (home / "keyline.db").read_bytes()
 
 
 def test_run_answers_text_wait_and_finishes_in_same_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: _WaitThenFinishModel())
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     monkeypatch.setattr(
@@ -509,7 +509,7 @@ def test_cli_reopens_the_same_run_after_disabling_its_turn_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
     call = ToolCall("write", "write_file", {"path": "result.txt", "content": "first"})
     turn = ModelTurn(({
@@ -543,7 +543,7 @@ def test_multiple_waits_resume_after_partial_input_across_cli_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: _MultipleWaitThenFinishModel())
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     answers = iter(("navy", None))
@@ -580,7 +580,7 @@ def test_delegated_child_wait_resumes_parent_across_cli_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: _DelegateWaitThenFinishModel())
     monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
 
@@ -659,7 +659,7 @@ def test_batch_wait_does_not_block_sibling_and_joins_after_resume(
             )
 
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: BatchModel())
     monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
     assert cli.main(["run", str(tmp_path), "Investigate"]) == 2
@@ -694,7 +694,7 @@ def test_wait_survives_noninteractive_exit_interrupt_and_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: _WaitThenFinishModel())
     monkeypatch.setattr(cli.sys, "stdin", _TTY(False))
 
@@ -743,7 +743,7 @@ def test_interactive_session_creates_followup_run_with_full_history(
     second_model = _RecordingFinishModel("second result")
     models = iter([first_model, second_model])
     prompts = iter(["second request", "/exit"])
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: next(models))
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     monkeypatch.setattr("builtins.input", lambda _prompt: next(prompts))
@@ -809,7 +809,7 @@ with urllib.request.urlopen(request, timeout=3) as response:
     (tmp_path / "integration_check.py").write_text(integration_script, encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(
-        ["git", "-c", "user.name=Handshake", "-c", "user.email=test@example.com", "add", "."],
+        ["git", "-c", "user.name=Keyline", "-c", "user.email=test@example.com", "add", "."],
         cwd=tmp_path,
         check=True,
     )
@@ -817,7 +817,7 @@ with urllib.request.urlopen(request, timeout=3) as response:
         [
             "git",
             "-c",
-            "user.name=Handshake",
+            "user.name=Keyline",
             "-c",
             "user.email=test@example.com",
             "commit",
@@ -830,13 +830,13 @@ with urllib.request.urlopen(request, timeout=3) as response:
 
     home = tmp_path / "state"
     if approval_mode is not ApprovalMode.ALWAYS_ASK:
-        config_home = Path.home() / ".handshake"
+        config_home = Path.home() / ".keyline-agent"
         config_home.mkdir(mode=0o700)
         (config_home / "config.toml").write_text(
             f"[approval]\nmode = '{approval_mode.value}'\n", encoding="utf-8"
         )
     model = _SecretFlagshipModel(api_url)
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: model)
     monkeypatch.setattr(cli.sys, "stdin", _TTY(True))
     monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: canary)
@@ -901,12 +901,12 @@ import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
-import handshake.cli as cli
-from handshake.models.protocol import ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
+import keyline_agent.cli as cli
+from keyline_agent.models.protocol import ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
 
 workspace = Path(sys.argv[1])
-os.environ["HANDSHAKE_HOME"] = str(workspace / "state")
+os.environ["KEYLINE_HOME"] = str(workspace / "state")
 call = ToolCall("shell", "run_shell", {"argv": [
     sys.executable, "-c",
     "from pathlib import Path; Path('command-started').write_text('started')",
@@ -962,7 +962,7 @@ def test_cli_cleanup_failure_does_not_replace_success(
         async def aclose(self) -> None:
             raise RuntimeError("cleanup-sensitive-canary")
 
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(sys, "stdin", _TTY(False))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: ClosingModel("done"))
     assert cli.main(["run", str(tmp_path), "test cleanup"]) == 0
@@ -1012,7 +1012,7 @@ def test_child_answer_resumes_while_sibling_keeps_working(
         assert sibling_worked.wait(2), "Sibling tools must run while input is pending"
         return "evidence.txt"
 
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: Model())
     monkeypatch.setattr(sys, "stdin", _TTY(True))
     monkeypatch.setattr("builtins.input", answer)
@@ -1087,7 +1087,7 @@ def test_child_approval_wait_allows_sibling_tools(
         assert sibling_worked.wait(2), "Approval must not occupy the workspace execution slot"
         return decision
 
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: Model())
     monkeypatch.setattr(cli, "_agent_specs", specs)
     monkeypatch.setattr(cli, "_read_approval_answer", answer)
@@ -1163,7 +1163,7 @@ def test_text_and_approval_prompts_share_one_input_queue(
         assert text_finished.is_set(), "Approval must not read the text answer"
         return "y"
 
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(cli, "_agent_specs", specs)
     monkeypatch.setattr(cli, "requires_approval", approval_policy)
     monkeypatch.setattr(cli, "_create_real_model", lambda _name: Model())
@@ -1187,16 +1187,16 @@ def test_resume_secret_command_waiting_for_approval(
 ) -> None:
     import asyncio
 
-    from handshake.inputs import EphemeralSecretStore
-    from handshake.models.scripted import ScriptedModel
-    from handshake.runtime.loop import continue_run, start_run
-    from handshake.runtime.secret_dependencies import resolve_secret_dependency
-    from handshake.runtime.state import Run, Session, ToolRunStatus
-    from handshake.tools.secret_command import SecretCommandRunner
+    from keyline_agent.inputs import EphemeralSecretStore
+    from keyline_agent.models.scripted import ScriptedModel
+    from keyline_agent.runtime.loop import continue_run, start_run
+    from keyline_agent.runtime.secret_dependencies import resolve_secret_dependency
+    from keyline_agent.runtime.state import Run, Session, ToolRunStatus
+    from keyline_agent.tools.secret_command import SecretCommandRunner
     from tests.history_support import TEST_AGENT_SPEC
 
     home = tmp_path / "state"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
     store = _store(home)
     session = Session(workspace=tmp_path)
     store.create_session(session)

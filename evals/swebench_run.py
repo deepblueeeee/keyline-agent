@@ -1,4 +1,4 @@
-"""Run a serial batch of Handshake SWE-bench trials."""
+"""Run a serial batch of Keyline SWE-bench trials."""
 
 from __future__ import annotations
 
@@ -23,22 +23,22 @@ import docker
 from swebench.harness.test_spec.test_spec import make_test_spec
 from swebench.harness.utils import load_swebench_dataset
 
-from handshake.config.provider import DeepSeekConfig, read_deepseek_api_key
-from handshake.context.budget import ContextBudgetPolicy
-from handshake.context.errors import ContextPressureError
-from handshake.errors import HandshakeError
-from handshake.models.base import ModelAdapter, ToolDefinition, close_model
-from handshake.models.deepseek_anthropic import DeepSeekAnthropicModel
-from handshake.models.errors import ModelProviderError
-from handshake.models.protocol import ModelContext, ModelTurn
-from handshake.runtime.agents import AgentSpec, main_agent_spec
-from handshake.runtime.loop import start_run
-from handshake.runtime.progress import current_run
-from handshake.runtime.state import RunStatus, Session
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools.files import file_tool_bindings
-from handshake.tools.registry import ToolRegistry
-from handshake.tools.shell import process_tool_bindings
+from keyline_agent.config.provider import DeepSeekConfig, read_deepseek_api_key
+from keyline_agent.context.budget import ContextBudgetPolicy
+from keyline_agent.context.errors import ContextPressureError
+from keyline_agent.errors import KeylineError
+from keyline_agent.models.base import ModelAdapter, ToolDefinition, close_model
+from keyline_agent.models.deepseek_anthropic import DeepSeekAnthropicModel
+from keyline_agent.models.errors import ModelProviderError
+from keyline_agent.models.protocol import ModelContext, ModelTurn
+from keyline_agent.runtime.agents import AgentSpec, main_agent_spec
+from keyline_agent.runtime.loop import start_run
+from keyline_agent.runtime.progress import current_run
+from keyline_agent.runtime.state import RunStatus, Session
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools.files import file_tool_bindings
+from keyline_agent.tools.registry import ToolRegistry
+from keyline_agent.tools.shell import process_tool_bindings
 
 from .swebench import dataset_snapshot, evaluate
 from .swebench_workspace import COMMAND_TIMEOUT_SECONDS, DockerWorkspace
@@ -191,7 +191,7 @@ async def run_agent(
             if run.status is RunStatus.RUNNING:
                 run.transition(RunStatus.CANCELLED)
                 store.checkpoint_run(session, run)
-        except (HandshakeError, ContextPressureError) as exc:
+        except (KeylineError, ContextPressureError) as exc:
             print(str(exc), file=log)
 
     run = store.load_run(run.run_id)
@@ -220,7 +220,7 @@ async def run_agent(
 
 def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
     directory.mkdir(mode=0o700, parents=True)
-    previous_home = os.environ.get("HANDSHAKE_HOME")
+    previous_home = os.environ.get("KEYLINE_HOME")
     started = monotonic()
     report: dict[str, Any] = {
         "instance_id": task.instance_id,
@@ -233,7 +233,7 @@ def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
         "resolved": None,
     }
     try:
-        os.environ["HANDSHAKE_HOME"] = str(directory)
+        os.environ["KEYLINE_HOME"] = str(directory)
         config = DeepSeekConfig.from_environment()
         if config.base_url.rstrip("/") != DeepSeekConfig().base_url:
             raise ValueError("This live evaluation requires the approved api.deepseek.com endpoint")
@@ -304,9 +304,9 @@ def run_trial(task: Task, directory: Path, budget: Budget) -> dict[str, Any]:
         report.update(failed_stage=report["status"], status="error", error=type(exc).__name__)
     finally:
         if previous_home is None:
-            os.environ.pop("HANDSHAKE_HOME", None)
+            os.environ.pop("KEYLINE_HOME", None)
         else:
-            os.environ["HANDSHAKE_HOME"] = previous_home
+            os.environ["KEYLINE_HOME"] = previous_home
     report["elapsed_seconds"] = round(monotonic() - started, 3)
     (directory / "result.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

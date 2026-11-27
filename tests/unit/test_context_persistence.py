@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from handshake.artifacts import open_text_artifact
-from handshake.context import (
+from keyline_agent.artifacts import open_text_artifact
+from keyline_agent.context import (
     AgentContextManager,
     ContextBudgetPolicy,
     ContextCheckpoint,
@@ -15,8 +15,8 @@ from handshake.context import (
     RawHistorySegment,
     SourceRange,
 )
-from handshake.models.protocol import ModelMessage
-from handshake.runtime.state import Run, Session
+from keyline_agent.models.protocol import ModelMessage
+from keyline_agent.runtime.state import Run, Session
 from tests.history_support import fresh_store, history
 
 
@@ -80,7 +80,7 @@ def test_restore_skips_episode_sources_and_streams_incremental_suffix(
 def test_masking_checkpoint_restores_identical_view_without_changing_raw_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "keyline-agent-home"))
     session = Session(workspace=tmp_path)
     run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
@@ -137,7 +137,7 @@ def test_masking_checkpoint_restores_identical_view_without_changing_raw_history
 def test_restore_rebuilds_externalized_result_and_reuses_its_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "keyline-agent-home"))
     session = Session(workspace=tmp_path)
     run = Run(goal="inspect", session_id=session.session_id, agent_spec_id="test")
     store = fresh_store(tmp_path, session)
@@ -178,7 +178,7 @@ def test_restore_rebuilds_externalized_result_and_reuses_its_path(
     assert restored.build(session, run) == before
     marker = before.messages[1].content[0]["content"]
     reference = marker.split("path=", 1)[1].split("]", 1)[0]
-    assert reference.startswith("@handshake/artifacts/")
+    assert reference.startswith("@keyline/artifacts/")
     stream = open_text_artifact(reference)
     assert stream is not None
     with stream:

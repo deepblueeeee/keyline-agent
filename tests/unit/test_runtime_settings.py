@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from handshake.config.approval import ApprovalMode
-from handshake.config.settings import load_runtime_settings, settings_path
-from handshake.context.budget import ContextBudgetPolicy
-from handshake.errors import HandshakeError
+from keyline_agent.config.approval import ApprovalMode
+from keyline_agent.config.settings import load_runtime_settings, settings_path
+from keyline_agent.context.budget import ContextBudgetPolicy
+from keyline_agent.errors import KeylineError
 
 
 def _write_config(home: Path, content: str) -> None:
@@ -21,8 +21,8 @@ def _isolated_user_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_defaults_and_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    home = tmp_path / ".handshake"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "workspace-state"))
+    home = tmp_path / ".keyline-agent"
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "workspace-state"))
 
     settings = load_runtime_settings(model_override="chosen-model")
 
@@ -40,7 +40,7 @@ def test_defaults_and_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 def test_only_public_token_limits_override_internal_defaults(
     tmp_path: Path,
 ) -> None:
-    home = tmp_path / ".handshake"
+    home = tmp_path / ".keyline-agent"
     _write_config(
         home,
         """[model]
@@ -94,16 +94,16 @@ def test_invalid_settings_fail_before_run(
     content: str,
     message: str,
 ) -> None:
-    home = tmp_path / ".handshake"
+    home = tmp_path / ".keyline-agent"
     _write_config(home, content)
 
-    with pytest.raises(HandshakeError, match=message):
+    with pytest.raises(KeylineError, match=message):
         load_runtime_settings()
 
 
 @pytest.mark.parametrize("mode", (ApprovalMode.DANGEROUS_ONLY, ApprovalMode.ALLOW_ALL))
 def test_approval_mode_loads(tmp_path: Path, mode: ApprovalMode) -> None:
-    _write_config(tmp_path / ".handshake", f"[approval]\nmode = '{mode.value}'\n")
+    _write_config(tmp_path / ".keyline-agent", f"[approval]\nmode = '{mode.value}'\n")
 
     assert load_runtime_settings().approval_mode is mode
 
@@ -116,25 +116,25 @@ def test_config_file_must_not_be_workspace_redirect_or_symlink(
     (workspace_state / "config.toml").write_text(
         "[approval]\nmode = 'allow_all'\n", encoding="utf-8"
     )
-    monkeypatch.setenv("HANDSHAKE_HOME", str(workspace_state))
+    monkeypatch.setenv("KEYLINE_HOME", str(workspace_state))
     assert load_runtime_settings().approval_mode is ApprovalMode.ALWAYS_ASK
 
-    home = tmp_path / ".handshake"
+    home = tmp_path / ".keyline-agent"
     home.mkdir(mode=0o700)
     (home / "config.toml").symlink_to(workspace_state / "config.toml")
-    with pytest.raises(HandshakeError, match="unsafe permissions"):
+    with pytest.raises(KeylineError, match="unsafe permissions"):
         load_runtime_settings()
 
 
 def test_non_utf8_config_reports_domain_error(tmp_path: Path) -> None:
-    home = tmp_path / ".handshake"
+    home = tmp_path / ".keyline-agent"
     home.mkdir(mode=0o700)
     (home / "config.toml").write_bytes(b"\xff")
 
-    with pytest.raises(HandshakeError, match="Cannot read configuration"):
+    with pytest.raises(KeylineError, match="Cannot read configuration"):
         load_runtime_settings()
 
 
 def test_model_request_limit_is_configurable(tmp_path: Path) -> None:
-    _write_config(tmp_path / ".handshake", "[scheduler]\nmax_model_requests = 2\n")
+    _write_config(tmp_path / ".keyline-agent", "[scheduler]\nmax_model_requests = 2\n")
     assert load_runtime_settings().max_model_requests == 2

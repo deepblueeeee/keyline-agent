@@ -11,10 +11,10 @@ pytest.importorskip("jsonschema")
 
 from evals import swebench_run, tool_calling  # noqa: E402
 from evals.judge import check_judge_input  # noqa: E402
-from handshake.models.protocol import ModelTurn, ModelUsage, ToolCall  # noqa: E402
-from handshake.models.scripted import ScriptedModel  # noqa: E402
-from handshake.runtime.state import ToolResult  # noqa: E402
-from handshake.tools import create_default_registry  # noqa: E402
+from keyline_agent.models.protocol import ModelTurn, ModelUsage, ToolCall  # noqa: E402
+from keyline_agent.models.scripted import ScriptedModel  # noqa: E402
+from keyline_agent.runtime.state import ToolResult  # noqa: E402
+from keyline_agent.tools import create_default_registry  # noqa: E402
 
 
 @pytest.fixture

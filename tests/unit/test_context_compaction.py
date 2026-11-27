@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.context import (
+from keyline_agent.context import (
     AgentContextManager,
     ContextBudgetPolicy,
     ContextPressureError,
@@ -17,15 +17,15 @@ from handshake.context import (
     SequencedMessage,
     SourceRange,
 )
-from handshake.context.budget import compact_json, estimate_model_context
-from handshake.context.condenser import condenser_context, episode_data, raw_data
-from handshake.context.reduction import select_raw_candidate
-from handshake.models.errors import ModelProtocolError, ModelProviderError
-from handshake.models.protocol import ModelMessage, ModelTurn
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.loop import start_run
-from handshake.runtime.state import Run, RunStatus, Session
-from handshake.tools.registry import ToolRegistry
+from keyline_agent.context.budget import compact_json, estimate_model_context
+from keyline_agent.context.condenser import condenser_context, episode_data, raw_data
+from keyline_agent.context.reduction import select_raw_candidate
+from keyline_agent.models.errors import ModelProtocolError, ModelProviderError
+from keyline_agent.models.protocol import ModelMessage, ModelTurn
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.loop import start_run
+from keyline_agent.runtime.state import Run, RunStatus, Session
+from keyline_agent.tools.registry import ToolRegistry
 from tests.history_support import TEST_AGENT_SPEC, fresh_store, history, ingest, run_async
 
 _HISTORY: dict[str, list[ModelMessage]] = {}
@@ -182,7 +182,7 @@ def tool_round(failed: bool, text: str) -> tuple[ModelMessage, ModelMessage]:
 async def test_masked_success_and_full_failure_and_durable_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "keyline-agent-home"))
     condenser = Condenser()
     manager, session, run = setup(tmp_path, condenser, max_tool_result_tokens=600)
     _HISTORY[session.session_id] = [

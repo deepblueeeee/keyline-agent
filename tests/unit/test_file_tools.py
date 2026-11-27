@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from handshake.tools.files import edit_file, list_files, read_file, search_files, write_file
+from keyline_agent.tools.files import edit_file, list_files, read_file, search_files, write_file
 
 
 def test_read_search_and_write_file(tmp_path: Path) -> None:
@@ -39,7 +39,7 @@ def test_file_tools_accept_absolute_workspace_paths(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
 def test_path_traversal_is_rejected(tmp_path: Path, absolute: bool) -> None:
-    from handshake.tools import create_default_registry
+    from keyline_agent.tools import create_default_registry
 
     registry = create_default_registry(lambda _cwd, _argv: True)
     relative = "src/../example.txt"
@@ -51,18 +51,19 @@ def test_path_traversal_is_rejected(tmp_path: Path, absolute: bool) -> None:
 
 
 @pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+@pytest.mark.parametrize("state_dir", [".keyline-agent", ".handshake"])
 def test_workspace_tools_cannot_read_or_change_user_configuration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absolute: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absolute: bool, state_dir: str
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    private_home = tmp_path / ".handshake"
+    private_home = tmp_path / state_dir
     private_home.mkdir()
     config = private_home / "config.toml"
     config.write_text("[approval]\nmode = 'always_ask'\n", encoding="utf-8")
-    from handshake.tools import create_default_registry
+    from keyline_agent.tools import create_default_registry
 
     registry = create_default_registry(lambda _cwd, _argv: True)
-    path = str(config) if absolute else ".handshake/config.toml"
+    path = str(config) if absolute else f"{state_dir}/config.toml"
     read = registry.execute("read_file", tmp_path, {"path": path})
     write = registry.execute("write_file", tmp_path, {"path": path, "content": "changed"})
 
@@ -74,7 +75,7 @@ def test_workspace_tools_cannot_read_or_change_user_configuration(
 
 
 def test_paths_outside_the_workspace_are_rejected(tmp_path: Path) -> None:
-    from handshake.tools import create_default_registry
+    from keyline_agent.tools import create_default_registry
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -125,7 +126,7 @@ def test_read_file_defaults_to_bounded_page_with_continuation(tmp_path: Path) ->
 def test_read_file_rejects_unbounded_explicit_range(tmp_path: Path) -> None:
     (tmp_path / "large.txt").write_text("content", encoding="utf-8")
 
-    from handshake.tools import create_default_registry
+    from keyline_agent.tools import create_default_registry
 
     result = create_default_registry(lambda _cwd, _argv: True).execute(
         "read_file", tmp_path, {"path": "large.txt", "start_line": 1, "end_line": 1001}
@@ -158,7 +159,7 @@ def test_read_file_bounds_a_single_very_long_line(tmp_path: Path) -> None:
 def test_read_file_character_and_line_ranges_are_mutually_exclusive(tmp_path: Path) -> None:
     (tmp_path / "value.txt").write_text("abcdef\n", encoding="utf-8")
 
-    from handshake.tools import create_default_registry
+    from keyline_agent.tools import create_default_registry
 
     registry = create_default_registry(lambda _cwd, _argv: True)
     mixed = registry.execute(
@@ -185,15 +186,15 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    home = tmp_path / "handshake-home"
-    monkeypatch.setenv("HANDSHAKE_HOME", str(home))
+    home = tmp_path / "keyline-agent-home"
+    monkeypatch.setenv("KEYLINE_HOME", str(home))
 
-    from handshake.artifacts import open_text_artifact, store_text_artifact
-    from handshake.tools import create_default_registry
+    from keyline_agent.artifacts import open_text_artifact, store_text_artifact
+    from keyline_agent.tools import create_default_registry
 
     artifact = store_text_artifact("test-result", "recover me")
     (output,) = (home / "artifacts").glob("*/*.txt")
-    internal = home / "handshake.db"
+    internal = home / "keyline.db"
     internal.write_text("do not expose", encoding="utf-8")
 
     registry = create_default_registry(lambda _cwd, _argv: True)
@@ -201,7 +202,7 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
     absolute_rejected = registry.execute("read_file", workspace, {"path": str(output)})
     rejected = registry.execute("read_file", workspace, {"path": str(internal)})
     traversal_rejected = registry.execute(
-        "read_file", workspace, {"path": "@handshake/artifacts/../handshake.db"}
+        "read_file", workspace, {"path": "@keyline/artifacts/../keyline.db"}
     )
     write_rejected = registry.execute(
         "write_file", workspace, {"path": str(output), "content": "changed"}
@@ -212,7 +213,7 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
     assert not rejected.ok
     assert "escapes the workspace" in rejected.stderr
     assert not traversal_rejected.ok
-    assert "Invalid Handshake artifact reference" in traversal_rejected.stderr
+    assert "Invalid Keyline artifact reference" in traversal_rejected.stderr
     assert not write_rejected.ok
     artifact_stream = open_text_artifact(artifact.reference)
     assert artifact_stream is not None
@@ -223,9 +224,9 @@ def test_read_file_accepts_artifact_references_but_not_internal_absolute_paths(
 def test_artifact_ranges_preserve_crlf_and_cr_line_endings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HANDSHAKE_HOME", str(tmp_path / "handshake-home"))
+    monkeypatch.setenv("KEYLINE_HOME", str(tmp_path / "keyline-agent-home"))
 
-    from handshake.artifacts import store_text_artifact
+    from keyline_agent.artifacts import store_text_artifact
 
     content = "first\r\nsecond\rthird\n"
     artifact = store_text_artifact("mixed-newlines", content)
@@ -262,16 +263,16 @@ def test_read_file_reports_a_page_past_an_empty_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "reference",
     (
-        "@handshake/artifacts",
-        "@handshake/artifacts/",
-        "@handshake/artifacts/not-an-artifact-id",
-        f"@handshake/artifacts/{'a' * 64}/child",
+        "@keyline/artifacts",
+        "@keyline/artifacts/",
+        "@keyline/artifacts/not-an-artifact-id",
+        f"@keyline/artifacts/{'a' * 64}/child",
     ),
 )
 def test_artifact_reader_requires_one_opaque_artifact_id(
     reference: str,
 ) -> None:
-    from handshake.artifacts import ArtifactReferenceError, open_text_artifact
+    from keyline_agent.artifacts import ArtifactReferenceError, open_text_artifact
 
     with pytest.raises(ArtifactReferenceError, match="identify one artifact|Invalid"):
         open_text_artifact(reference)
@@ -372,7 +373,7 @@ def test_edit_file_does_not_change_ambiguous_match(tmp_path: Path) -> None:
     original = "header\n  same same\n" + "same\n" * 5
     path.write_text(original, encoding="utf-8")
 
-    from handshake.tools import create_default_registry
+    from keyline_agent.tools import create_default_registry
 
     result = create_default_registry(lambda _cwd, _argv: True).execute(
         "edit_file",

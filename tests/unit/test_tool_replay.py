@@ -3,16 +3,23 @@ from pathlib import Path
 
 import pytest
 
-from handshake.models.base import ToolDefinition
-from handshake.models.protocol import ModelTurn, ToolCall
-from handshake.models.scripted import ScriptedModel
-from handshake.runtime.agents import AgentSpec
-from handshake.runtime.errors import AgentLoopError, ToolOutcomeUnknownError
-from handshake.runtime.loop import start_run
-from handshake.runtime.recovery import resume_run
-from handshake.runtime.state import ReplayPolicy, Run, RunStatus, Session, ToolResult, ToolRunStatus
-from handshake.storage.sqlite import SQLiteStateStore
-from handshake.tools.registry import ToolBinding, ToolRegistry
+from keyline_agent.models.base import ToolDefinition
+from keyline_agent.models.protocol import ModelTurn, ToolCall
+from keyline_agent.models.scripted import ScriptedModel
+from keyline_agent.runtime.agents import AgentSpec
+from keyline_agent.runtime.errors import AgentLoopError, ToolOutcomeUnknownError
+from keyline_agent.runtime.loop import start_run
+from keyline_agent.runtime.recovery import resume_run
+from keyline_agent.runtime.state import (
+    ReplayPolicy,
+    Run,
+    RunStatus,
+    Session,
+    ToolResult,
+    ToolRunStatus,
+)
+from keyline_agent.storage.sqlite import SQLiteStateStore
+from keyline_agent.tools.registry import ToolBinding, ToolRegistry
 from tests.history_support import run_async
 
 
@@ -127,7 +134,7 @@ async def test_completed_tool_result_survives_interruption_before_protocol_reply
             replay_policy=ReplayPolicy.MANUAL,
         )
     )
-    import handshake.runtime.loop as runtime_loop
+    import keyline_agent.runtime.loop as runtime_loop
 
     original_append = runtime_loop._append_tool_results
 
@@ -243,7 +250,7 @@ async def test_cancelled_tool_saves_its_outcome_before_recovery(
 async def test_cancelling_queued_tool_keeps_it_pending_without_execution(tmp_path: Path) -> None:
     import asyncio
 
-    from handshake.runtime.scheduler import CooperativeScheduler
+    from keyline_agent.runtime.scheduler import CooperativeScheduler
 
     session = Session(workspace=tmp_path)
     store = SQLiteStateStore(tmp_path / "state.db")

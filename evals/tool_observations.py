@@ -3,7 +3,7 @@
 import json
 from typing import Any
 
-from handshake.models.protocol import ModelContext
+from keyline_agent.models.protocol import ModelContext
 
 VISIBLE_BLOCKS = 12
 EXCERPT_CHARS = 2000

@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
 
-from handshake.inputs import EphemeralSecretStore
-from handshake.runtime.state import (
+from keyline_agent.inputs import EphemeralSecretStore
+from keyline_agent.runtime.state import (
     Dependency,
     DependencyKind,
     DependencyStatus,
@@ -10,7 +10,7 @@ from handshake.runtime.state import (
     SecretHandle,
     SecretHandleStatus,
 )
-from handshake.tools.secret_command import SecretCommandRunner
+from keyline_agent.tools.secret_command import SecretCommandRunner
 
 
 def _available_secret(
@@ -180,8 +180,8 @@ def test_cancelled_approval_does_not_consume_secret_or_start_process(tmp_path: P
 
     import pytest
 
-    from handshake.inputs.cancellation import cancellation_scope
-    from handshake.runtime.errors import UserCancelledError
+    from keyline_agent.inputs.cancellation import cancellation_scope
+    from keyline_agent.runtime.errors import UserCancelledError
 
     run, handle, consumer, _runner = _available_secret("secret-cancellation-canary")
     cancelled = Event()

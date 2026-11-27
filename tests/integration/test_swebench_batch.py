@@ -12,9 +12,9 @@ pytest.importorskip("swebench")
 
 from evals import swebench_run  # noqa: E402
 from evals.tasks import Task, load_tasks, select_tasks  # noqa: E402
-from handshake.models.protocol import ModelTurn, ToolCall  # noqa: E402
-from handshake.models.scripted import ScriptedModel  # noqa: E402
-from handshake.storage.sqlite import SQLiteStateStore  # noqa: E402
+from keyline_agent.models.protocol import ModelTurn, ToolCall  # noqa: E402
+from keyline_agent.models.scripted import ScriptedModel  # noqa: E402
+from keyline_agent.storage.sqlite import SQLiteStateStore  # noqa: E402
 
 
 def test_dataset_selection() -> None:
@@ -97,7 +97,7 @@ def test_interrupted_batch_saves_partial_results(
 
 
 @pytest.mark.skipif(
-    os.environ.get("HANDSHAKE_EVAL_DOCKER_TEST") != "1", reason="requires Docker image"
+    os.environ.get("KEYLINE_EVAL_DOCKER_TEST") != "1", reason="requires Docker image"
 )
 def test_batch_cli_starts_each_trial_with_clean_workspace_and_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

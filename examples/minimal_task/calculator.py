@@ -1,4 +1,4 @@
-"""Tiny demo module for Handshake."""
+"""Tiny demo module for Keyline."""
 
 
 def add(left: int, right: int) -> int:

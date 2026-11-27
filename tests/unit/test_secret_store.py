@@ -1,8 +1,8 @@
 import pytest
 
-from handshake.inputs import EphemeralSecretStore
-from handshake.inputs.errors import SecretStoreError
-from handshake.tools import create_default_registry
+from keyline_agent.inputs import EphemeralSecretStore
+from keyline_agent.inputs.errors import SecretStoreError
+from keyline_agent.tools import create_default_registry
 
 
 def test_secret_store_exposes_separate_write_and_consume_capabilities() -> None:
